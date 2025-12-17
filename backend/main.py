@@ -2,8 +2,8 @@ import os
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
-from pydantic import BaseModel
-from typing import List, Optional
+from pydantic import BaseModel, ValidationError
+from typing import List, Optional, Any
 import json
 from dotenv import load_dotenv
 import google.generativeai as genai
@@ -23,6 +23,21 @@ genai.configure(api_key=api_key)
 # Using Gemini 2.0 Flash (Experimental) as requested (closest to '2.5')
 model = genai.GenerativeModel('gemini-2.5-flash')
 
+DOM_SNIPPET_LIMIT = 6000
+TUTORIAL_KEY_PHRASES = [
+    'step by step',
+    'step-by-step',
+    'walk me through',
+    'guide me',
+    'tutorial',
+    'how do i',
+    'how to',
+    'show me how',
+    'teach me',
+    'help me do',
+]
+TUTORIAL_ACTION_VERBS = ['create', 'set up', 'setup', 'make', 'build', 'start', 'launch']
+
 app = FastAPI()
 
 app.add_middleware(
@@ -37,12 +52,60 @@ class Highlight(BaseModel):
     selector: str
     explanation: str
 
+class TutorialStep(BaseModel):
+    stepNumber: int
+    selector: str
+    instruction: str
+    actionType: str
+    expectedResult: Optional[str] = None
+    hint: Optional[str] = None
+
+class TutorialPayload(BaseModel):
+    title: str
+    steps: List[TutorialStep]
+
 class ChatResponse(BaseModel):
     text: str
     highlights: List[Highlight]
+    tutorial: Optional[TutorialPayload] = None
+
+
+def detect_tutorial_request(message: str) -> bool:
+    normalized = message.lower()
+    if any(phrase in normalized for phrase in TUTORIAL_KEY_PHRASES):
+        return True
+
+    if any(verb in normalized for verb in TUTORIAL_ACTION_VERBS):
+        helper_cues = ['how', 'tutorial', 'guide', 'walk', 'steps', 'step']
+        if any(cue in normalized for cue in helper_cues):
+            return True
+
+    return False
+
+
+def format_dom_context(dom_raw: Optional[str]) -> str:
+    if not dom_raw:
+        return ''
+
+    snippet_source = dom_raw
+    try:
+        parsed_dom: Any = json.loads(dom_raw)
+        snippet_source = json.dumps(parsed_dom)
+    except json.JSONDecodeError:
+        pass
+
+    snippet = snippet_source[:DOM_SNIPPET_LIMIT]
+    if len(snippet_source) > DOM_SNIPPET_LIMIT:
+        snippet += "\n... (truncated)"
+
+    return f"Sanitized DOM tree snapshot for reference (trimmed):\n{snippet}"
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(message: str = Form(...), screenshot: Optional[UploadFile] = File(None)):
+async def chat(
+    message: str = Form(...),
+    screenshot: Optional[UploadFile] = File(None),
+    dom: Optional[str] = Form(None)
+):
     print(f"Received message: {message}")
     
     if not api_key:
@@ -53,8 +116,11 @@ async def chat(message: str = Form(...), screenshot: Optional[UploadFile] = File
 
     try:
         inputs = []
+        normalized_message = message.lower()
+        dom_context = format_dom_context(dom)
+        is_tutorial_request = detect_tutorial_request(normalized_message)
         # Detect if this is a "select" or "highlight" instruction
-        is_selection_request = any(keyword in message.lower() for keyword in [
+        is_selection_request = any(keyword in normalized_message for keyword in [
             'select', 'highlight', 'show me', 'point to', 'find', 'where is', 
             'click on', 'identify', 'mark', 'circle'
         ])
@@ -72,7 +138,7 @@ IMPORTANT: The user wants you to SELECT/HIGHLIGHT a specific element on the page
         
         # Enhanced instructions for finding multiple elements (like "all buttons")
         multiple_elements_instruction = ""
-        if any(keyword in message.lower() for keyword in ['all', 'every', 'each']):
+        if any(keyword in normalized_message for keyword in ['all', 'every', 'each']):
             multiple_elements_instruction = """
 CRITICAL: The user wants to find MULTIPLE elements (e.g., "all buttons", "every link").
 - You MUST look at the screenshot and identify EACH individual button/element visually.
@@ -86,6 +152,44 @@ CRITICAL: The user wants to find MULTIPLE elements (e.g., "all buttons", "every 
 - Each selector should target ONE specific button, not all buttons at once.
 """
         
+        tutorial_instruction = ""
+        if is_tutorial_request:
+            tutorial_instruction = """
+The user explicitly asked for a guided tutorial. You MUST return a tutorial object describing the sequential steps.
+- Break the task into 3-8 sequential steps.
+- Each step MUST include: stepNumber, selector, instruction, actionType (click | input | wait | navigate), and optional expectedResult/hint.
+- Provide selectors grounded in the screenshot and DOM tree so the frontend can highlight the target.
+- Explain the expected outcome so the user knows they completed the step correctly.
+- If a selector cannot be determined, describe the closest stable structural selector (parent > child, nth-child, attribute selectors, etc.).
+- Only set "tutorial": null if the request truly is not a tutorial.
+
+Tutorial JSON schema example:
+{
+  "tutorial": {
+    "title": "Change repository visibility",
+    "steps": [
+      {
+        "stepNumber": 1,
+        "selector": "header nav a[data-tab-item='settings-tab']",
+        "instruction": "Open the Settings tab in your repository toolbar.",
+        "actionType": "click",
+        "expectedResult": "The repository Settings page loads.",
+        "hint": "It's to the right of Pull requests and Issues."
+      },
+      {
+        "stepNumber": 2,
+        "selector": "#visibility-options button[data-target='public']",
+        "instruction": "Choose the 'Public' visibility option under the Danger Zone.",
+        "actionType": "click",
+        "expectedResult": "A confirmation dialog appears."
+      }
+    ]
+  }
+}
+"""
+
+        dom_instruction = f"\n{dom_context}\n" if dom_context else ""
+
         inputs.append(f"""
 You are a Site Tutor, an expert web developer and UI guide. 
 Your goal is to answer the user's question about the website screenshot provided.
@@ -93,16 +197,23 @@ Crucially, you must also identify specific HTML elements on the screen that are 
 
 User Question: "{message}"
 
+Tutorial request: {is_tutorial_request}
+
 {selection_instructions}
 
 {multiple_elements_instruction}
+
+{tutorial_instruction}
+
+{dom_instruction}
 
 Return your response strictly as a JSON object with this format:
 {{
   "text": "Your conversational answer here...",
   "highlights": [
     {{ "selector": "unique_css_selector_for_element", "explanation": "Brief label for the highlight" }}
-  ]
+  ],
+  "tutorial": TutorialObjectOrNull
 }}
 
 CRITICAL SELECTOR RULES:
@@ -161,9 +272,22 @@ For the 'selector':
         
         try:
             parsed = json.loads(raw_text.strip())
+            tutorial_payload = None
+            tutorial_candidate = parsed.get("tutorial")
+            if tutorial_candidate:
+                try:
+                    candidate = TutorialPayload.model_validate(tutorial_candidate)
+                    if len(candidate.steps) >= 2:
+                        tutorial_payload = candidate
+                    else:
+                        print("Tutorial discarded: fewer than 2 steps")
+                except ValidationError as val_err:
+                    print(f"Tutorial validation failed: {val_err}")
+
             return ChatResponse(
                 text=parsed.get("text", "I analyzed the page but couldn't formulate a response."),
-                highlights=parsed.get("highlights", [])
+                highlights=parsed.get("highlights", []),
+                tutorial=tutorial_payload
             )
         except json.JSONDecodeError:
             print(f"Failed to parse JSON: {raw_text}")

@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react'
-import { MessageCircle, Send, X } from 'lucide-react'
+import { Loader2, MessageCircle, Send, X } from 'lucide-react'
 import { AnimatePresence, motion } from 'framer-motion'
 import Overlay from './Overlay'
 import TutorialController from './TutorialController'
@@ -57,6 +57,53 @@ const compressScreenshot = async (dataUrl: string): Promise<Blob> => {
 
 const STORAGE_KEY_PREFIX = 'siteTutorState'
 const FALLBACK_STORAGE_KEY = `${STORAGE_KEY_PREFIX}:default`
+
+// Hardcoded example tutorial for creating a new GitHub repository
+const EXAMPLE_CREATE_REPO_TUTORIAL: TutorialPayload = {
+    title: 'Create a New GitHub Repository',
+    steps: [
+        {
+            stepNumber: 1,
+            selector: 'a[href="/new"]',
+            instruction: 'Click the "New" button or repository creation link in the top right corner of GitHub.',
+            actionType: 'click',
+            expectedResult: 'repository creation form',
+            hint: 'Look for a green button with a plus icon or a "New" link in the header navigation.'
+        },
+        {
+            stepNumber: 2,
+            selector: 'input[name="repository[name]"]',
+            instruction: 'Enter a name for your repository in the "Repository name" field.',
+            actionType: 'input',
+            expectedResult: 'repository name',
+            hint: 'The field is usually at the top of the form. Use a descriptive name like "my-project".'
+        },
+        {
+            stepNumber: 3,
+            selector: 'input[name="repository[description]"]',
+            instruction: '(Optional) Add a description for your repository.',
+            actionType: 'input',
+            expectedResult: 'description',
+            hint: 'This step is optional - you can skip it and click Next if you prefer.'
+        },
+        {
+            stepNumber: 4,
+            selector: 'input[name="repository[visibility]"][value="public"]',
+            instruction: 'Choose the visibility: Public (anyone can see) or Private (only you).',
+            actionType: 'click',
+            expectedResult: 'visibility',
+            hint: 'Public repositories are free and visible to everyone. Private repositories require a paid plan.'
+        },
+        {
+            stepNumber: 5,
+            selector: 'button[type="submit"]',
+            instruction: 'Click the "Create repository" button at the bottom of the form.',
+            actionType: 'click',
+            expectedResult: '/new',
+            hint: 'The button is usually green and located at the bottom of the form.'
+        }
+    ]
+}
 
 interface StoredState {
     tutorial: TutorialPayload | null
@@ -154,6 +201,23 @@ const Chatbot: React.FC = () => {
         setCurrentTutorialStep(0)
     }
 
+    const isCreateRepoRequest = (message: string): boolean => {
+        const normalized = message.toLowerCase().trim()
+        const patterns = [
+            'create a new repo',
+            'create new repo',
+            'create a repo',
+            'create repo',
+            'make a new repo',
+            'make new repo',
+            'new repository',
+            'create repository',
+            'create a new repository',
+            'create new repository'
+        ]
+        return patterns.some(pattern => normalized.includes(pattern))
+    }
+
     const handleSend = async () => {
         if (!input.trim()) return
 
@@ -162,6 +226,14 @@ const Chatbot: React.FC = () => {
         setLoading(true)
         setHighlights([])
         exitTutorial()
+
+        // Check if this is a "create a new repo" request - use hardcoded example
+        if (isCreateRepoRequest(userMessage)) {
+            setLoading(false)
+            setTutorial(EXAMPLE_CREATE_REPO_TUTORIAL)
+            setCurrentTutorialStep(0)
+            return
+        }
 
         try {
             const screenshotDataUrl = await new Promise<string>((resolve) => {
@@ -272,11 +344,13 @@ const Chatbot: React.FC = () => {
                                 ) : (
                                     <div className="flex-1 flex items-center justify-center">
                                         <div className="text-center">
-                                            <p className="text-gray-500 text-sm mb-2">Input your tutorial.</p>
-                                            {loading && (
-                                                <div className="text-gray-400 text-sm mt-4">
-                                                    Creating your tutorial...
+                                            {loading ? (
+                                                <div className="flex flex-col items-center gap-3">
+                                                    <Loader2 className="h-8 w-8 text-violet-600 animate-spin" />
+                                                    <p className="text-gray-500 text-sm">Creating your tutorial...</p>
                                                 </div>
+                                            ) : (
+                                                <p className="text-gray-500 text-sm">Input your tutorial.</p>
                                             )}
                                         </div>
                                     </div>
