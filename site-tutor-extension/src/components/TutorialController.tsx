@@ -168,14 +168,14 @@ const TutorialController: React.FC<TutorialControllerProps> = ({ tutorial, onClo
 
     return (
         <div className="flex flex-col gap-4 h-full">
-            <div className="flex items-start justify-between">
+            <div className="tutorial-header">
                 <div>
-                    <p className="text-xs uppercase tracking-wide text-violet-500 font-semibold">Guided Tutorial</p>
-                    <h3 className="text-lg font-semibold text-gray-900">{tutorial.title}</h3>
-                    <p className="text-sm text-gray-500">{progressLabel}</p>
+                    <p className="tutorial-badge">Guided Tutorial</p>
+                    <h3 className="tutorial-title">{tutorial.title}</h3>
+                    <p className="tutorial-progress">{progressLabel}</p>
                 </div>
                 <button
-                    className="text-gray-400 hover:text-gray-600"
+                    className="tutorial-close-btn"
                     onClick={() => {
                         verifierRef.current?.stopWatching()
                         clearAutoAdvance()
@@ -188,55 +188,55 @@ const TutorialController: React.FC<TutorialControllerProps> = ({ tutorial, onClo
             </div>
 
             {showStepAdvance && (
-                <div className="flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm font-semibold text-emerald-700 shadow-sm" aria-live="polite">
+                <div className="step-advance-notification" aria-live="polite">
                     <Sparkles size={16} />
                     <span>Step {currentStepIndex + 1} ready! Follow the on-page highlight.</span>
                 </div>
             )}
 
-            <div className="rounded-xl border border-gray-100 bg-white shadow-sm p-4 flex flex-col gap-3">
-                <div className="flex items-center gap-2 text-sm text-gray-500">
-                    <span className="inline-flex items-center gap-1 text-violet-600 font-medium">
+            <div className="step-card">
+                <div className="step-status">
+                    <span className="step-action-type">
                         <CheckCircle2 size={16} />
                         {activeStep.actionType.toUpperCase()}
                     </span>
-                    <span className="text-gray-300">•</span>
-                    <span className={status === 'timeout' ? 'text-amber-600' : 'text-gray-500'}>
+                    <span style={{ color: '#d4d4d8' }}>•</span>
+                    <span style={{ color: status === 'timeout' ? '#d97706' : '#71717a' }}>
                         {statusCopy[status]}
                     </span>
                 </div>
-                <p className="text-base font-medium text-gray-900">{activeStep.instruction}</p>
+                <p className="step-instruction">{activeStep.instruction}</p>
                 {activeStep.expectedResult && (
-                    <p className="text-sm text-gray-500">
-                        Expected result: <span className="font-medium text-gray-700">{activeStep.expectedResult}</span>
+                    <p className="step-expected">
+                        Expected result: <span className="step-expected-value">{activeStep.expectedResult}</span>
                     </p>
                 )}
-                <div className="text-xs text-gray-400">
-                    Target selector: <code className="text-violet-600">{activeStep.selector}</code>
+                <div className="step-selector">
+                    Target selector: <code>{activeStep.selector}</code>
                 </div>
             </div>
 
             {hint && (
-                <div className="flex items-start gap-2 rounded-lg bg-amber-50 border border-amber-200 p-3 text-sm text-amber-800">
-                    <Lightbulb size={16} className="mt-0.5" />
+                <div className="hint-box">
+                    <Lightbulb size={16} style={{ marginTop: '2px' }} />
                     <div>
-                        <p className="font-semibold">Need a hint?</p>
+                        <p className="hint-title">Need a hint?</p>
                         <p>{hint}</p>
                     </div>
                 </div>
             )}
 
-            <div className="mt-auto flex items-center justify-between gap-3">
+            <div className="tutorial-nav">
                 <button
                     onClick={goToPreviousStep}
                     disabled={currentStepIndex === 0}
-                    className="flex items-center gap-1 rounded-lg border border-gray-200 px-3 py-2 text-sm font-medium text-gray-600 disabled:opacity-40"
+                    className="nav-btn"
                 >
                     <ChevronLeft size={16} /> Previous
                 </button>
-                <div className="flex items-center gap-3">
+                <div className="nav-right">
                     <button
-                        className="flex items-center gap-1 rounded-lg border border-gray-200 px-3 py-2 text-sm font-medium text-gray-600"
+                        className="nav-btn"
                         onClick={() => {
                             verifierRef.current?.stopWatching()
                             startWatchingStep()
@@ -246,7 +246,7 @@ const TutorialController: React.FC<TutorialControllerProps> = ({ tutorial, onClo
                     </button>
                     <button
                         onClick={goToNextStep}
-                        className="flex items-center gap-1 rounded-lg bg-violet-600 px-4 py-2 text-sm font-semibold text-white"
+                        className="nav-btn nav-btn-primary"
                     >
                         {currentStepIndex === totalSteps - 1 ? 'Finish' : 'Next'}
                         <ChevronRight size={16} />

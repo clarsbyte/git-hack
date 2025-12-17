@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react'
-import { Loader2, MessageCircle, Send, X } from 'lucide-react'
+import { Loader2, MessageCircle, Send, X, RotateCcw } from 'lucide-react'
 import { AnimatePresence, motion } from 'framer-motion'
 import Overlay from './Overlay'
 import TutorialController from './TutorialController'
@@ -201,6 +201,13 @@ const Chatbot: React.FC = () => {
         setCurrentTutorialStep(0)
     }
 
+    const handleReset = () => {
+        exitTutorial()
+        setHighlights([])
+        setInput('')
+        setLoading(false)
+    }
+
     const isCreateRepoRequest = (message: string): boolean => {
         const normalized = message.toLowerCase().trim()
         const patterns = [
@@ -305,32 +312,48 @@ const Chatbot: React.FC = () => {
         <>
             <Overlay highlights={overlayHighlights} currentStepIndex={tutorial ? currentTutorialStep : undefined} />
 
-            <div className="fixed bottom-6 right-6 z-[99999] font-sans text-gray-800 antialiased">
+            <div className="fixed bottom-6 right-6 z-[99999] font-sans">
                 <AnimatePresence>
                     {isOpen && (
                         <motion.div
-                            initial={{ opacity: 0, scale: 0.9, y: 20 }}
+                            initial={{ opacity: 0, scale: 0.95, y: 10 }}
                             animate={{ opacity: 1, scale: 1, y: 0 }}
-                            exit={{ opacity: 0, scale: 0.9, y: 20 }}
-                            className="mb-4 w-96 rounded-2xl bg-white shadow-2xl ring-1 ring-black/5 flex flex-col overflow-hidden"
-                            style={{ height: '500px' }}
+                            exit={{ opacity: 0, scale: 0.95, y: 10 }}
+                            transition={{ duration: 0.2, ease: "easeOut" }}
+                            className="chat-container"
+                            style={{ marginBottom: '16px' }}
                         >
-                            <div className="flex items-center justify-between bg-gradient-to-r from-violet-600 to-indigo-600 px-6 py-4 text-white">
-                                <div className="flex flex-col">
-                                    <h2 className="text-lg font-semibold tracking-wide">Site Tutor</h2>
-                                    <span className="text-xs opacity-75 font-normal">v{VERSION}</span>
+                            <div className="chat-header">
+                                <div className="chat-header-left">
+                                    <div className="chat-avatar">
+                                        <MessageCircle size={14} strokeWidth={2.5} />
+                                    </div>
+                                    <div className="chat-header-info">
+                                        <span className="chat-title">Site Tutor</span>
+                                    </div>
                                 </div>
-                                <button
-                                    onClick={() => setIsOpen(false)}
-                                    className="rounded-full p-1 opacity-80 hover:bg-white/20 hover:opacity-100 transition-colors"
-                                >
-                                    <X size={20} />
-                                </button>
+                                <div style={{ display: 'flex', gap: '8px' }}>
+                                    <button
+                                        onClick={handleReset}
+                                        className="chat-close"
+                                        aria-label="Reset tutorial"
+                                        title="Reset tutorial"
+                                    >
+                                        <RotateCcw size={14} strokeWidth={2} />
+                                    </button>
+                                    <button
+                                        onClick={() => setIsOpen(false)}
+                                        className="chat-close"
+                                        aria-label="Close"
+                                    >
+                                        <X size={16} strokeWidth={2} />
+                                    </button>
+                                </div>
                             </div>
 
-                            <div className="flex-1 overflow-hidden p-4 bg-gray-50 flex flex-col gap-3">
+                            <div className="chat-body">
                                 {tutorial ? (
-                                    <div className="flex-1 overflow-y-auto rounded-2xl border border-violet-100 bg-white p-4 shadow-inner">
+                                    <div className="tutorial-container">
                                         {!isRestoring && (
                                             <TutorialController
                                                 tutorial={tutorial}
@@ -342,39 +365,39 @@ const Chatbot: React.FC = () => {
                                         )}
                                     </div>
                                 ) : (
-                                    <div className="flex-1 flex items-center justify-center">
-                                        <div className="text-center">
-                                            {loading ? (
-                                                <div className="flex flex-col items-center gap-3">
-                                                    <Loader2 className="h-8 w-8 text-violet-600 animate-spin" />
-                                                    <p className="text-gray-500 text-sm">Creating your tutorial...</p>
-                                                </div>
-                                            ) : (
-                                                <p className="text-gray-500 text-sm">Input your tutorial.</p>
-                                            )}
-                                        </div>
+                                    <div className="loading-container">
+                                        {loading ? (
+                                            <div className="loading-content">
+                                                <Loader2 className="loading-spinner" size={32} strokeWidth={2} />
+                                                <p className="loading-text">Creating your tutorial...</p>
+                                            </div>
+                                        ) : (
+                                            <p className="placeholder-text">Input your tutorial.</p>
+                                        )}
                                     </div>
                                 )}
                             </div>
 
                             {!tutorial && (
-                                <div className="p-4 border-t border-gray-100 bg-white">
-                                    <div className="relative flex items-center gap-2">
+                                <div className="chat-input-area">
+                                    <div className="chat-input-wrapper">
                                         <input
                                             type="text"
                                             value={input}
                                             onChange={(e) => setInput(e.target.value)}
                                             onKeyDown={(e) => e.key === 'Enter' && !loading && handleSend()}
-                                            placeholder="Input your tutorial."
+                                            placeholder="Message..."
                                             disabled={loading}
-                                            className="flex-1 rounded-xl bg-gray-100 px-4 py-3 text-sm focus:bg-white focus:outline-none focus:ring-2 focus:ring-violet-500 transition-all shadow-inner disabled:opacity-50"
+                                            className="chat-input"
+                                            style={{ paddingTop: '4px' }}
                                         />
                                         <button
                                             onClick={handleSend}
                                             disabled={loading || !input.trim()}
-                                            className="rounded-lg bg-violet-600 p-3 text-white hover:bg-violet-700 transition-colors shadow-md hover:shadow-lg disabled:opacity-50 disabled:cursor-not-allowed"
+                                            className="chat-action-btn chat-action-btn--send"
+                                            aria-label="Send message"
                                         >
-                                            <Send size={16} />
+                                            <Send size={16} strokeWidth={2.5} />
                                         </button>
                                     </div>
                                 </div>
@@ -383,14 +406,23 @@ const Chatbot: React.FC = () => {
                     )}
                 </AnimatePresence>
 
-                <motion.button
-                    whileHover={{ scale: 1.05 }}
-                    whileTap={{ scale: 0.95 }}
-                    onClick={() => setIsOpen(!isOpen)}
-                    className="flex h-14 w-14 items-center justify-center rounded-full bg-gradient-to-r from-violet-600 to-indigo-600 text-white shadow-xl hover:shadow-2xl hover:shadow-violet-500/30 transition-shadow"
-                >
-                    {isOpen ? <X size={24} /> : <MessageCircle size={28} />}
-                </motion.button>
+                <AnimatePresence>
+                    {!isOpen && (
+                        <motion.button
+                            initial={{ scale: 0.8, opacity: 0 }}
+                            animate={{ scale: 1, opacity: 1 }}
+                            exit={{ scale: 0.8, opacity: 0 }}
+                            whileHover={{ scale: 1.05 }}
+                            whileTap={{ scale: 0.95 }}
+                            transition={{ duration: 0.2 }}
+                            onClick={() => setIsOpen(true)}
+                            className="chat-fab"
+                            aria-label="Open Site Tutor"
+                        >
+                            <MessageCircle size={18} strokeWidth={2} />
+                        </motion.button>
+                    )}
+                </AnimatePresence>
             </div>
         </>
     )
