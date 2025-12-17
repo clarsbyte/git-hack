@@ -74,7 +74,106 @@ const Chatbot: React.FC = () => {
             const data = await response.json()
 
             setMessages(prev => [...prev, { sender: 'bot', text: data.text }])
-            setHighlights(data.highlights || [])
+
+            let newHighlights = data.highlights || []
+
+            // Check if user is asking for button highlighting - always use direct DOM detection for reliability
+            const userMessageLower = userMessage.toLowerCase()
+            const isAllButtonsRequest = (userMessageLower.includes('all') || userMessageLower.includes('every') || userMessageLower.includes('highlight')) &&
+                                       (userMessageLower.includes('button') || userMessageLower.includes('btn'))
+
+            // For button requests, ALWAYS use direct DOM detection (backend selectors are unreliable)
+            if (isAllButtonsRequest) {
+                // Clear any previous highlight markers
+                document.querySelectorAll('[data-site-tutor-id]').forEach(el => {
+                    el.removeAttribute('data-site-tutor-id')
+                })
+
+                // Find all button-like elements on the page
+                const allButtons: Highlight[] = []
+                let buttonIndex = 0
+
+                // Helper to check if element is visible
+                const isVisible = (el: Element): boolean => {
+                    const rect = el.getBoundingClientRect()
+                    const style = window.getComputedStyle(el)
+                    return rect.width > 0 && rect.height > 0 &&
+                           style.display !== 'none' &&
+                           style.visibility !== 'hidden' &&
+                           style.opacity !== '0'
+                }
+
+                // Find actual button elements
+                document.querySelectorAll('button').forEach((btn) => {
+                    if (isVisible(btn)) {
+                        const id = `btn-${buttonIndex++}`
+                        btn.setAttribute('data-site-tutor-id', id)
+                        const text = btn.textContent?.trim() || 'Button'
+                        allButtons.push({
+                            selector: `[data-site-tutor-id="${id}"]`,
+                            explanation: text.substring(0, 30) || 'Button'
+                        })
+                    }
+                })
+
+                // Find elements with role="button"
+                document.querySelectorAll('[role="button"]').forEach((el) => {
+                    if (isVisible(el) && !el.hasAttribute('data-site-tutor-id')) {
+                        const id = `btn-${buttonIndex++}`
+                        el.setAttribute('data-site-tutor-id', id)
+                        const text = el.textContent?.trim() || 'Button'
+                        allButtons.push({
+                            selector: `[data-site-tutor-id="${id}"]`,
+                            explanation: text.substring(0, 30) || 'Button'
+                        })
+                    }
+                })
+
+                // Find input buttons
+                document.querySelectorAll('input[type="button"], input[type="submit"]').forEach((input) => {
+                    if (isVisible(input)) {
+                        const id = `btn-${buttonIndex++}`
+                        input.setAttribute('data-site-tutor-id', id)
+                        const value = (input as HTMLInputElement).value || 'Submit'
+                        allButtons.push({
+                            selector: `[data-site-tutor-id="${id}"]`,
+                            explanation: value.substring(0, 30) || 'Input Button'
+                        })
+                    }
+                })
+
+                // Find anchor tags that look like buttons (have button classes or role)
+                document.querySelectorAll('a').forEach((link) => {
+                    if (link.hasAttribute('data-site-tutor-id')) return
+                    const classes = link.className?.toLowerCase() || ''
+                    const role = link.getAttribute('role')
+                    if (isVisible(link) && (classes.includes('button') || classes.includes('btn') || role === 'button')) {
+                        const id = `btn-${buttonIndex++}`
+                        link.setAttribute('data-site-tutor-id', id)
+                        const text = link.textContent?.trim() || 'Link Button'
+                        allButtons.push({
+                            selector: `[data-site-tutor-id="${id}"]`,
+                            explanation: text.substring(0, 30) || 'Link Button'
+                        })
+                    }
+                })
+
+                if (allButtons.length > 0) {
+                    console.log(`Site Tutor: Found ${allButtons.length} buttons on the page`, allButtons)
+                    newHighlights = allButtons
+                } else {
+                    console.log('Site Tutor: No buttons found on this page')
+                }
+            }
+            
+            setHighlights(newHighlights)
+            
+            // Log highlights for debugging
+            if (newHighlights.length > 0) {
+                console.log('Site Tutor: Received highlights:', newHighlights)
+            } else {
+                console.log('Site Tutor: No highlights in response')
+            }
 
         } catch (error) {
             console.error('Error:', error)
@@ -122,6 +221,11 @@ const Chatbot: React.FC = () => {
                                 {loading && (
                                     <div className="self-start bg-white border border-gray-100 p-3 rounded-2xl rounded-tl-none shadow-sm text-sm text-gray-500">
                                         Thinking...
+                                    </div>
+                                )}
+                                {highlights.length > 0 && !loading && (
+                                    <div className="self-start bg-red-50 border border-red-200 p-2 rounded-lg text-xs text-red-800">
+                                        ✨ Highlighting {highlights.length} element{highlights.length !== 1 ? 's' : ''} on the page
                                     </div>
                                 )}
                                 <div ref={messagesEndRef} />
