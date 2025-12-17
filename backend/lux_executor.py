@@ -9,6 +9,8 @@ from dataclasses import dataclass
 import uuid
 import json
 from datetime import datetime
+from PIL import ImageGrab
+from session_manager import Session
 
 
 @dataclass
@@ -24,7 +26,7 @@ class LuxExecutor:
     def __init__(self):
         self.running_tasks: Dict[str, asyncio.Task] = {}
         self.progress_queues: Dict[str, asyncio.Queue] = {}
-        self.api_key = "sk-JsdCtgsHoI-twSPY6PX140qSahConWJWQuoc6jyzAHA"
+        self.api_key = "sk-KdOREp11GDRhQsKSAYEFXyIVwyOwhXpFImsypRcJ-bE"
 
         if not self.api_key:
             print("WARNING: OAGI_API_KEY not found in environment")
@@ -34,6 +36,7 @@ class LuxExecutor:
         task_id: str,
         task_description: str,
         todos: list[str],
+        session: Optional[Session] = None,
         max_retries: int = 1
     ) -> None:
         """
@@ -63,7 +66,6 @@ class LuxExecutor:
                 try:
                     print(f"[LUX] Starting execution for task {task_id} (attempt {retry_count + 1})")
 
-                    # Initialize LUX components
                     observer = AsyncAgentObserver()
                     agent = TaskerAgent(
                         api_key=self.api_key,
@@ -73,10 +75,8 @@ class LuxExecutor:
                         temperature=0.0
                     )
 
-                    # Set task and todos
                     agent.set_task(task_description, todos)
 
-                    # Initialize action handler and screenshot maker
                     action_handler = AsyncPyautoguiActionHandler()
                     screenshot_maker = AsyncScreenshotMaker()
 
@@ -90,6 +90,15 @@ class LuxExecutor:
                         }
                     ))
 
+                    # Capture initial desktop screenshot and save to session
+                    if session:
+                        try:
+                            initial_screenshot = ImageGrab.grab()
+                            session.add_message('bot', f"[LUX Starting] {task_description}", initial_screenshot)
+                            print(f"[LUX] Saved initial screenshot to session")
+                        except Exception as e:
+                            print(f"[LUX] Failed to capture initial screenshot: {e}")
+
                     # Execute the task
                     print(f"[LUX] Executing task: {task_description}")
                     success = await agent.execute(
@@ -97,6 +106,15 @@ class LuxExecutor:
                         action_handler=action_handler,
                         image_provider=screenshot_maker
                     )
+
+                    # Capture final desktop screenshot and save to session
+                    if session:
+                        try:
+                            final_screenshot = ImageGrab.grab()
+                            session.add_message('bot', f"[LUX Completed] Task finished with status: {success}", final_screenshot)
+                            print(f"[LUX] Saved final screenshot to session")
+                        except Exception as e:
+                            print(f"[LUX] Failed to capture final screenshot: {e}")
 
                     print(f"[LUX] Task execution completed. Success: {success}")
 
@@ -179,7 +197,8 @@ class LuxExecutor:
     def start_task(
         self,
         task_description: str,
-        todos: list[str]
+        todos: list[str],
+        session: Optional[Session] = None
     ) -> str:
         """
         Start a LUX task execution in the background.
@@ -187,6 +206,7 @@ class LuxExecutor:
         Args:
             task_description: Main task description
             todos: List of step-by-step instructions
+            session: Optional session to save screenshots to
 
         Returns:
             task_id for streaming progress
@@ -199,7 +219,7 @@ class LuxExecutor:
 
         # Start background task
         task = asyncio.create_task(
-            self.execute_task(task_id, task_description, todos)
+            self.execute_task(task_id, task_description, todos, session)
         )
         self.running_tasks[task_id] = task
 
@@ -222,15 +242,12 @@ class LuxExecutor:
             yield f"event: error\ndata: {json.dumps({'error': 'Task not found'})}\n\n"
             return
 
-        print(f"[LUX] Starting SSE stream for task {task_id}")
 
         while True:
             try:
                 event = await queue.get()
 
                 if event is None:
-                    # Task completed, close stream
-                    print(f"[LUX] Stream completed for task {task_id}")
                     yield "event: done\ndata: null\n\n"
                     break
 

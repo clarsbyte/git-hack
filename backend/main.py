@@ -8,13 +8,14 @@ from typing import List, Optional
 import json
 from dotenv import load_dotenv
 import google.generativeai as genai
-from PIL import Image
+from PIL import Image, ImageGrab
 import io
 import uuid
 import asyncio
 from session_manager import SessionManager
 from lux_task_generator import LuxTaskGenerator
 from lux_executor import lux_executor
+import base64
 
 load_dotenv()
 
@@ -326,8 +327,8 @@ async def automate(request: AutomateRequest):
         print(f"[AUTOMATE] Generated task: {task_description}")
         print(f"[AUTOMATE] Generated {len(todos)} steps")
 
-        # Start LUX execution
-        task_id = lux_executor.start_task(task_description, todos)
+        # Start LUX execution with session to capture screenshots
+        task_id = lux_executor.start_task(task_description, todos, session)
 
         return AutomateResponse(
             taskId=task_id,
@@ -364,6 +365,32 @@ async def get_report(task_id: str):
         raise HTTPException(status_code=404, detail="Report not found")
 
     return FileResponse(report_path)
+
+class DesktopScreenshotResponse(BaseModel):
+    screenshot: str  # base64 encoded PNG
+
+@app.get("/capture-desktop", response_model=DesktopScreenshotResponse)
+async def capture_desktop():
+    """
+    Capture a desktop screenshot and return as base64 PNG.
+    This is used when LUX automation opens new windows that the browser extension can't capture.
+    """
+    try:
+        # Capture the entire desktop
+        screenshot = ImageGrab.grab()
+
+        # Convert to PNG bytes
+        img_byte_arr = io.BytesIO()
+        screenshot.save(img_byte_arr, format='PNG')
+        img_byte_arr.seek(0)
+
+        # Encode as base64
+        img_base64 = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
+
+        return DesktopScreenshotResponse(screenshot=img_base64)
+    except Exception as e:
+        print(f"Error capturing desktop: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to capture desktop: {str(e)}")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

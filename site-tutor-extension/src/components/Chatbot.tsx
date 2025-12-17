@@ -64,17 +64,38 @@ const Chatbot: React.FC = () => {
         setHighlights([]) // Clear previous highlights
 
         try {
-            // 1. Capture Screenshot
-            const screenshotDataUrl = await new Promise<string>((resolve) => {
-                chrome.runtime.sendMessage({ action: 'captureScreen' }, (response) => {
-                    if (chrome.runtime.lastError) {
-                        console.error(chrome.runtime.lastError)
-                        resolve('') // Proceed without screenshot if fails
-                    } else {
-                        resolve(response?.dataUrl || '')
-                    }
+            let screenshotDataUrl = ''
+
+            // Always try desktop screenshot first for better context
+            console.log('[Screenshot] Using desktop capture')
+            try {
+                const desktopResponse = await fetch('http://localhost:8000/capture-desktop')
+                if (desktopResponse.ok) {
+                    const desktopData = await desktopResponse.json()
+                    // Convert base64 to data URL
+                    screenshotDataUrl = `data:image/png;base64,${desktopData.screenshot}`
+                    console.log('[Screenshot] Desktop screenshot captured successfully')
+                } else {
+                    console.error('[Screenshot] Desktop capture failed, falling back to tab capture')
+                }
+            } catch (error) {
+                console.error('[Screenshot] Desktop capture error:', error)
+            }
+
+            // Fallback to Chrome tab capture if desktop capture failed
+            if (!screenshotDataUrl) {
+                console.log('[Screenshot] Using Chrome tab capture as fallback')
+                screenshotDataUrl = await new Promise<string>((resolve) => {
+                    chrome.runtime.sendMessage({ action: 'captureScreen' }, (response) => {
+                        if (chrome.runtime.lastError) {
+                            console.error('[Screenshot] Tab capture error:', chrome.runtime.lastError)
+                            resolve('')
+                        } else {
+                            resolve(response?.dataUrl || '')
+                        }
+                    })
                 })
-            })
+            }
 
             // 2. Prepare Form Data
             const formData = new FormData()
@@ -90,6 +111,9 @@ const Chatbot: React.FC = () => {
                 const res = await fetch(screenshotDataUrl)
                 const blob = await res.blob()
                 formData.append('screenshot', blob, 'screenshot.png')
+                console.log('[Screenshot] Screenshot attached to request')
+            } else {
+                console.warn('[Screenshot] No screenshot available to send')
             }
 
             // 3. Call Backend
