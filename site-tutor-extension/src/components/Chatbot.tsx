@@ -235,9 +235,12 @@ const Chatbot: React.FC = () => {
 
         // Check if this is a "create a new repo" request - use hardcoded example
         if (isCreateRepoRequest(userMessage)) {
-            setLoading(false)
-            setTutorial(EXAMPLE_CREATE_REPO_TUTORIAL)
-            setCurrentTutorialStep(0)
+            // Add a brief delay to show loading animation
+            setTimeout(() => {
+                setLoading(false)
+                setTutorial(EXAMPLE_CREATE_REPO_TUTORIAL)
+                setCurrentTutorialStep(0)
+            }, 2500) // 1.5 second delay to show loading animation
             return
         }
 
@@ -320,7 +323,6 @@ const Chatbot: React.FC = () => {
                             exit={{ opacity: 0, scale: 0.95, y: 10 }}
                             transition={{ duration: 0.2, ease: "easeOut" }}
                             className="chat-container"
-                            style={{ marginBottom: '16px' }}
                         >
                             <div className="chat-header">
                                 <div className="chat-header-left">

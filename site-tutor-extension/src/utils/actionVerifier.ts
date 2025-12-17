@@ -47,7 +47,60 @@ const elementMatchesSelector = (element: Element | null, selector: string): bool
 const findElementWithFallback = (selector: string): Element | null => {
     try {
         // Try direct query first
-        const matches = document.querySelectorAll(selector)
+        let matches = document.querySelectorAll(selector)
+        
+        // If no matches, try alternative selector variations
+        if (matches.length === 0) {
+            // Try escaping square brackets in attribute values
+            if (selector.includes('name=') && selector.includes('[')) {
+                // Try with escaped brackets: repository\[description\]
+                const escapedSelector = selector.replace(/\[/g, '\\[').replace(/\]/g, '\\]')
+                try {
+                    matches = document.querySelectorAll(escapedSelector)
+                    if (matches.length > 0) {
+                        console.log(`Site Tutor: Found element with escaped selector: ${escapedSelector}`)
+                    }
+                } catch (e) {
+                    // Escaped selector didn't work, continue to other fallbacks
+                }
+            }
+
+            // Try alternative attribute selector formats
+            if (matches.length === 0 && selector.includes('name=')) {
+                // Extract the name value and try different formats
+                const nameMatch = selector.match(/name=["']([^"']+)["']/)
+                if (nameMatch) {
+                    const nameValue = nameMatch[1]
+                    // Try without brackets: repository_description
+                    const altName1 = nameValue.replace(/\[/g, '_').replace(/\]/g, '')
+                    // Try with underscores: repository_description
+                    const altSelector1 = selector.replace(nameValue, altName1)
+                    try {
+                        matches = document.querySelectorAll(altSelector1)
+                        if (matches.length > 0) {
+                            console.log(`Site Tutor: Found element with alternative selector: ${altSelector1}`)
+                        }
+                    } catch (e) {
+                        // Continue
+                    }
+
+                    // Try with hyphen: repository-description
+                    if (matches.length === 0) {
+                        const altName2 = nameValue.replace(/\[/g, '-').replace(/\]/g, '')
+                        const altSelector2 = selector.replace(nameValue, altName2)
+                        try {
+                            matches = document.querySelectorAll(altSelector2)
+                            if (matches.length > 0) {
+                                console.log(`Site Tutor: Found element with alternative selector: ${altSelector2}`)
+                            }
+                        } catch (e) {
+                            // Continue
+                        }
+                    }
+                }
+            }
+        }
+        
         if (matches.length > 0) {
             // Return first visible element
             for (const el of Array.from(matches)) {
@@ -84,6 +137,35 @@ const findElementWithFallback = (selector: string): Element | null => {
             }
         } catch {
             // Continue to next fallback
+        }
+    }
+    
+    // For description fields, try searching by name attribute
+    if (selector.includes('description') || selector.includes('desc')) {
+        const allInputs = Array.from(document.querySelectorAll('input, textarea'))
+        for (const input of allInputs) {
+            const name = input.getAttribute('name')?.toLowerCase() || ''
+            const id = input.getAttribute('id')?.toLowerCase() || ''
+            const placeholder = input.getAttribute('placeholder')?.toLowerCase() || ''
+            
+            // Check if this input is related to description
+            if (name.includes('description') || name.includes('desc') ||
+                id.includes('description') || id.includes('desc') ||
+                placeholder.includes('description') || placeholder.includes('desc')) {
+                const rect = input.getBoundingClientRect()
+                const style = window.getComputedStyle(input)
+                if (rect.width > 0 && rect.height > 0 &&
+                    style.display !== 'none' &&
+                    style.visibility !== 'hidden' &&
+                    style.opacity !== '0') {
+                    console.log(`Site Tutor: Found description field by name/id/placeholder in ActionVerifier`, {
+                        name,
+                        id,
+                        placeholder
+                    })
+                    return input
+                }
+            }
         }
     }
 

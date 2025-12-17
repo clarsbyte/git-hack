@@ -37,17 +37,18 @@
   bottom: 24px;
   right: 24px;
   z-index: 2147483647;
-  width: 350px;
-  height: 400px;
+  width: 420px;
+  height: 600px;
+  max-height: calc(100vh - 48px);
   background: #ffffff;
   border: 1px solid #e4e4e7;
-  border-radius: 8px;
+  border-radius: 12px;
   box-shadow: 0 12px 24px -6px rgba(0, 0, 0, 0.12), 0 4px 8px -4px rgba(0, 0, 0, 0.04);
   display: flex;
   flex-direction: column;
   font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   font-size: 13px;
-  line-height: 1.4;
+  line-height: 1.5;
   color: #000000;
   overflow: hidden;
   transition: opacity 0.2s ease, transform 0.2s ease;
@@ -58,7 +59,7 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 10px 14px;
+  padding: 12px 16px;
   background: #ffffff;
   border-bottom: 1px solid #f4f4f5;
   flex-shrink: 0;
@@ -121,17 +122,29 @@
   background: #f4f4f5;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 14px;
+  min-height: 0;
 }
 
 /* Tutorial container */
 .tutorial-container {
   flex: 1;
   overflow-y: auto;
-  border-radius: 12px;
+  overflow-x: hidden;
+  border-radius: 10px;
   border: 1px solid #e4e4e7;
   background: #ffffff;
-  padding: 16px;
+  padding: 18px;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.tutorial-container > div {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
 }
 
 /* Scrollbar styling for tutorial container */
@@ -191,7 +204,8 @@
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  margin-bottom: 16px;
+  margin-bottom: 18px;
+  flex-shrink: 0;
 }
 
 .tutorial-badge {
@@ -204,10 +218,11 @@
 }
 
 .tutorial-title {
-  font-size: 16px;
+  font-size: 17px;
   font-weight: 600;
   color: #000000;
-  margin-bottom: 2px;
+  margin-bottom: 4px;
+  line-height: 1.4;
 }
 
 .tutorial-progress {
@@ -252,10 +267,11 @@
   border-radius: 8px;
   border: 1px solid #e4e4e7;
   background: #ffffff;
-  padding: 16px;
+  padding: 18px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 14px;
+  flex-shrink: 0;
 }
 
 .step-status {
@@ -278,7 +294,8 @@
   font-size: 14px;
   font-weight: 500;
   color: #000000;
-  line-height: 1.5;
+  line-height: 1.6;
+  margin: 0;
 }
 
 .step-expected {
@@ -294,6 +311,8 @@
 .step-selector {
   font-size: 11px;
   color: #a1a1aa;
+  word-break: break-all;
+  line-height: 1.4;
 }
 
 .step-selector code {
@@ -305,13 +324,15 @@
 .hint-box {
   display: flex;
   align-items: flex-start;
-  gap: 8px;
-  border-radius: 6px;
+  gap: 10px;
+  border-radius: 8px;
   background: #fef3c7;
   border: 1px solid #fde68a;
-  padding: 12px;
+  padding: 14px;
   font-size: 13px;
   color: #92400e;
+  flex-shrink: 0;
+  line-height: 1.5;
 }
 
 .hint-title {
@@ -326,22 +347,24 @@
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding-top: 12px;
+  padding-top: 16px;
+  flex-shrink: 0;
 }
 
 .nav-btn {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 6px;
   border-radius: 6px;
   border: 1px solid #e4e4e7;
-  padding: 8px 12px;
+  padding: 9px 14px;
   font-size: 13px;
   font-weight: 500;
   color: #52525b;
   background: transparent;
   cursor: pointer;
   transition: all 200ms ease;
+  white-space: nowrap;
 }
 
 .nav-btn:hover:not(:disabled) {
@@ -373,9 +396,10 @@
 
 /* ===== INPUT AREA ===== */
 .chat-input-area {
-  padding: 10px 14px 14px;
+  padding: 12px 16px 16px;
   background: #ffffff;
   border-top: 1px solid #f4f4f5;
+  flex-shrink: 0;
 }
 
 .chat-input-wrapper {
@@ -483,4 +507,21 @@
 
 .chat-fab:active {
   transform: scale(0.95);
+}
+
+/* ===== UTILITY CLASSES FOR TUTORIAL CONTROLLER ===== */
+.flex {
+  display: flex;
+}
+
+.flex-col {
+  flex-direction: column;
+}
+
+.gap-4 {
+  gap: 16px;
+}
+
+.h-full {
+  height: 100%;
 }

@@ -62,7 +62,10 @@ const findElementByExplanation = (explanation: string, selector: string): Elemen
         strongKeywords.push('repository name')
         keywords.push('repository', 'name', 'repo')
     }
-    if (lowerExplanation.includes('description')) keywords.push('description', 'desc')
+    if (lowerExplanation.includes('description') || lowerExplanation.includes('desc')) {
+        strongKeywords.push('description', 'desc')
+        keywords.push('description', 'desc', 'about', 'summary')
+    }
     if (lowerExplanation.includes('readme')) {
         strongKeywords.push('readme')
         keywords.push('initialize', 'init')
@@ -150,7 +153,12 @@ const findElementByExplanation = (explanation: string, selector: string): Elemen
             if (ariaLabel.includes(keyword)) score += 30
             if (value.includes(keyword)) score += 25
             if (id.includes(keyword)) score += 20
-            if (name.includes(keyword)) score += 20
+            // Name attribute matching is very important for form fields
+            if (name.includes(keyword)) score += 30
+            // Also check if name contains variations (e.g., "repository[description]" contains "description")
+            if (name.includes('description') || name.includes('desc')) {
+                if (keyword === 'description' || keyword === 'desc') score += 25
+            }
             if (nearbyText.includes(keyword)) score += 15
         })
 
@@ -458,7 +466,59 @@ const Overlay: React.FC<OverlayProps> = ({ highlights, currentStepIndex }) => {
 
         relevantHighlights.forEach(h => {
             try {
-                const matches = document.querySelectorAll(h.selector)
+                let matches = document.querySelectorAll(h.selector)
+
+                // If no matches, try alternative selector variations
+                if (matches.length === 0) {
+                    // Try escaping square brackets in attribute values
+                    if (h.selector.includes('name=') && h.selector.includes('[')) {
+                        // Try with escaped brackets: repository\[description\]
+                        const escapedSelector = h.selector.replace(/\[/g, '\\[').replace(/\]/g, '\\]')
+                        try {
+                            matches = document.querySelectorAll(escapedSelector)
+                            if (matches.length > 0) {
+                                console.log(`Site Tutor: Found element with escaped selector: ${escapedSelector}`)
+                            }
+                        } catch (e) {
+                            // Escaped selector didn't work, continue to other fallbacks
+                        }
+                    }
+
+                    // Try alternative attribute selector formats
+                    if (matches.length === 0 && h.selector.includes('name=')) {
+                        // Extract the name value and try different formats
+                        const nameMatch = h.selector.match(/name=["']([^"']+)["']/)
+                        if (nameMatch) {
+                            const nameValue = nameMatch[1]
+                            // Try without brackets: repository_description
+                            const altName1 = nameValue.replace(/\[/g, '_').replace(/\]/g, '')
+                            // Try with underscores: repository_description
+                            const altSelector1 = h.selector.replace(nameValue, altName1)
+                            try {
+                                matches = document.querySelectorAll(altSelector1)
+                                if (matches.length > 0) {
+                                    console.log(`Site Tutor: Found element with alternative selector: ${altSelector1}`)
+                                }
+                            } catch (e) {
+                                // Continue
+                            }
+
+                            // Try with hyphen: repository-description
+                            if (matches.length === 0) {
+                                const altName2 = nameValue.replace(/\[/g, '-').replace(/\]/g, '')
+                                const altSelector2 = h.selector.replace(nameValue, altName2)
+                                try {
+                                    matches = document.querySelectorAll(altSelector2)
+                                    if (matches.length > 0) {
+                                        console.log(`Site Tutor: Found element with alternative selector: ${altSelector2}`)
+                                    }
+                                } catch (e) {
+                                    // Continue
+                                }
+                            }
+                        }
+                    }
+                }
 
                 if (matches.length > 0) {
                     matches.forEach((el, idx) => {
@@ -501,6 +561,7 @@ const Overlay: React.FC<OverlayProps> = ({ highlights, currentStepIndex }) => {
                         }
                     }
 
+                    // Always try fallback for input/field elements, especially for description fields
                     if (!el && (h.explanation.toLowerCase().includes('input') ||
                                h.explanation.toLowerCase().includes('field') ||
                                h.explanation.toLowerCase().includes('enter') ||
@@ -509,13 +570,50 @@ const Overlay: React.FC<OverlayProps> = ({ highlights, currentStepIndex }) => {
                                h.explanation.toLowerCase().includes('choose') ||
                                h.explanation.toLowerCase().includes('public') ||
                                h.explanation.toLowerCase().includes('private') ||
-                               h.explanation.toLowerCase().includes('readme'))) {
-                        const element = findElementByExplanation(h.explanation, h.selector)
-                        if (element) {
-                            el = element
-                            console.log(`Site Tutor: Using fallback element finder for: ${h.explanation}`, {
-                                foundElement: el
-                            })
+                               h.explanation.toLowerCase().includes('readme') ||
+                               h.explanation.toLowerCase().includes('description') ||
+                               h.explanation.toLowerCase().includes('desc'))) {
+                        // For description fields, try direct name attribute search first
+                        if (h.explanation.toLowerCase().includes('description') || h.explanation.toLowerCase().includes('desc')) {
+                            const allInputs = Array.from(document.querySelectorAll('input, textarea'))
+                            for (const input of allInputs) {
+                                const name = input.getAttribute('name')?.toLowerCase() || ''
+                                const id = input.getAttribute('id')?.toLowerCase() || ''
+                                const placeholder = input.getAttribute('placeholder')?.toLowerCase() || ''
+                                
+                                // Check if this input is related to description
+                                if (name.includes('description') || name.includes('desc') ||
+                                    id.includes('description') || id.includes('desc') ||
+                                    placeholder.includes('description') || placeholder.includes('desc')) {
+                                    const rect = input.getBoundingClientRect()
+                                    const style = window.getComputedStyle(input)
+                                    if (rect.width > 0 && rect.height > 0 &&
+                                        style.display !== 'none' &&
+                                        style.visibility !== 'hidden' &&
+                                        style.opacity !== '0') {
+                                        el = input
+                                        console.log(`Site Tutor: Found description field by name/id/placeholder`, {
+                                            foundElement: el,
+                                            name,
+                                            id,
+                                            placeholder
+                                        })
+                                        break
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // If still not found, use the general explanation-based finder
+                        if (!el) {
+                            const element = findElementByExplanation(h.explanation, h.selector)
+                            if (element) {
+                                el = element
+                                console.log(`Site Tutor: Using fallback element finder for: ${h.explanation}`, {
+                                    foundElement: el,
+                                    selector: h.selector
+                                })
+                            }
                         }
                     }
 
