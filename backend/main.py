@@ -21,7 +21,7 @@ if not api_key:
 genai.configure(api_key=api_key)
 
 # Using Gemini 2.0 Flash (Experimental) as requested (closest to '2.5')
-model = genai.GenerativeModel('gemini-2.5-flash')
+model = genai.GenerativeModel('gemini-2.0-flash-exp') 
 
 app = FastAPI()
 
@@ -40,6 +40,29 @@ class Highlight(BaseModel):
 class ChatResponse(BaseModel):
     text: str
     highlights: List[Highlight]
+
+class TranscribeResponse(BaseModel):
+    text: str
+
+@app.post("/transcribe", response_model=TranscribeResponse)
+async def transcribe(audio: UploadFile = File(...)):
+    try:
+        # TODO: Integrate Local Whisper or other STT here
+        # For now, we just acknowledge the file was received
+        filename = audio.filename
+        
+        print(f"Received audio file: {filename}")
+        
+        # Mock response to verify pipeline works
+        # In the future, load the whisper model here:
+        # import whisper
+        # model = whisper.load_model("base")
+        # result = model.transcribe("temp_audio_path")
+        
+        return TranscribeResponse(text="[Voice Transcription Placeholder: The audio pipeline is ready. Integrate Whisper model here.]")
+    except Exception as e:
+        print(f"Transcription error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(message: str = Form(...), screenshot: Optional[UploadFile] = File(None)):
