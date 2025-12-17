@@ -18,18 +18,14 @@ from lux_executor import lux_executor
 
 load_dotenv()
 
-# Configure Gemini
 api_key = os.getenv("GEMINI_API_KEY")
 if not api_key:
-    # Just a warning, app will still start but calls will fail if not set later
     print("WARNING: GEMINI_API_KEY not found in environment variables.")
 
 genai.configure(api_key=api_key)
 
-# Using Gemini 2.0 Flash (Experimental) as requested (closest to '2.5')
 model = genai.GenerativeModel('gemini-2.5-flash')
 
-# Initialize LUX task generator
 task_generator = LuxTaskGenerator(model)
 
 app = FastAPI()
