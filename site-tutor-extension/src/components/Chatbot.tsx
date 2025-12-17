@@ -5,7 +5,6 @@ import Overlay from './Overlay'
 import TutorialController from './TutorialController'
 import type { TutorialPayload } from '../types/tutorial'
 import { getSimplifiedDom } from '../utils/domSanitizer'
-import { VERSION } from '../version'
 
 interface Highlight {
     selector: string
