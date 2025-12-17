@@ -1,71 +1,195 @@
-import React, { useState, useRef, useEffect } from 'react'
-import { MessageCircle, X, Send } from 'lucide-react'
-import { motion, AnimatePresence } from 'framer-motion'
+import React, { useEffect, useMemo, useState } from 'react'
+import { MessageCircle, Send, X } from 'lucide-react'
+import { AnimatePresence, motion } from 'framer-motion'
 import Overlay from './Overlay'
-
-interface Message {
-    sender: 'user' | 'bot'
-    text: string
-}
+import TutorialController from './TutorialController'
+import type { TutorialPayload } from '../types/tutorial'
+import { getSimplifiedDom } from '../utils/domSanitizer'
+import { VERSION } from '../version'
 
 interface Highlight {
     selector: string
     explanation: string
 }
 
+const compressScreenshot = async (dataUrl: string): Promise<Blob> => {
+    return new Promise((resolve, reject) => {
+        const img = new Image()
+        img.onload = () => {
+            const canvas = document.createElement('canvas')
+            const ctx = canvas.getContext('2d')
+            if (!ctx) {
+                reject(new Error('Could not get canvas context'))
+                return
+            }
+
+            const maxWidth = 1920
+            const maxHeight = 1080
+            let width = img.width
+            let height = img.height
+
+            if (width > maxWidth || height > maxHeight) {
+                const ratio = Math.min(maxWidth / width, maxHeight / height)
+                width = Math.floor(width * ratio)
+                height = Math.floor(height * ratio)
+            }
+
+            canvas.width = width
+            canvas.height = height
+            ctx.drawImage(img, 0, 0, width, height)
+
+            canvas.toBlob(
+                (blob) => {
+                    if (blob) {
+                        resolve(blob)
+                    } else {
+                        reject(new Error('Failed to compress image'))
+                    }
+                },
+                'image/jpeg',
+                0.75
+            )
+        }
+        img.onerror = () => reject(new Error('Failed to load image'))
+        img.src = dataUrl
+    })
+}
+
+const STORAGE_KEY_PREFIX = 'siteTutorState'
+const FALLBACK_STORAGE_KEY = `${STORAGE_KEY_PREFIX}:default`
+
+interface StoredState {
+    tutorial: TutorialPayload | null
+    currentTutorialStep: number
+    isOpen: boolean
+    origin?: string
+}
+
 const Chatbot: React.FC = () => {
     const [isOpen, setIsOpen] = useState(false)
-    const [messages, setMessages] = useState<Message[]>([
-        { sender: 'bot', text: "Hi! I'm your Site Tutor. I can teach you anything about this website. Click the camera icon or ask a question to get started!" }
-    ])
     const [input, setInput] = useState('')
     const [loading, setLoading] = useState(false)
     const [highlights, setHighlights] = useState<Highlight[]>([])
-
-    const messagesEndRef = useRef<HTMLDivElement>(null)
-
-    const scrollToBottom = () => {
-        messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-    }
+    const [tutorial, setTutorial] = useState<TutorialPayload | null>(null)
+    const [currentTutorialStep, setCurrentTutorialStep] = useState(0)
+    const [isRestoring, setIsRestoring] = useState(true)
+    const [storageKey, setStorageKey] = useState<string | null>(null)
 
     useEffect(() => {
-        scrollToBottom()
-    }, [messages])
+        chrome.runtime.sendMessage({ action: 'getTabId' }, (response) => {
+            if (chrome.runtime.lastError) {
+                console.warn('Site Tutor: unable to determine tab id', chrome.runtime.lastError)
+                setStorageKey(FALLBACK_STORAGE_KEY)
+                return
+            }
+
+            const key = `${STORAGE_KEY_PREFIX}:${response?.tabId ?? 'default'}`
+            setStorageKey(key)
+        })
+    }, [])
+
+    useEffect(() => {
+        if (!storageKey) return
+
+        // Check if chrome.storage is available
+        if (!chrome?.storage?.local) {
+            console.warn('Site Tutor: chrome.storage not available')
+            setIsRestoring(false)
+            return
+        }
+
+        chrome.storage.local.get([storageKey], (result) => {
+            if (chrome.runtime.lastError) {
+                console.warn('Failed to load state:', chrome.runtime.lastError)
+                setIsRestoring(false)
+                return
+            }
+
+            const stored = result[storageKey] as StoredState | undefined
+            if (stored) {
+                if (!stored.origin || stored.origin === window.location.origin) {
+                    const savedTutorial = stored.tutorial ?? null
+                    setTutorial(savedTutorial)
+                    setCurrentTutorialStep(savedTutorial ? stored.currentTutorialStep ?? 0 : 0)
+                    if (typeof stored.isOpen === 'boolean') {
+                        setIsOpen(stored.isOpen)
+                    }
+                } else {
+                    chrome.storage?.local?.remove([storageKey])
+                }
+            }
+            setIsRestoring(false)
+        })
+    }, [storageKey])
+
+    useEffect(() => {
+        if (isRestoring || !storageKey) return
+
+        // Check if chrome.storage is available
+        if (!chrome?.storage?.local) {
+            return
+        }
+
+        const state: StoredState = {
+            tutorial,
+            currentTutorialStep,
+            isOpen,
+            origin: window.location.origin
+        }
+
+        chrome.storage.local.set({ [storageKey]: state }, () => {
+            if (chrome.runtime.lastError) {
+                console.warn('Failed to save state:', chrome.runtime.lastError)
+            }
+        })
+    }, [tutorial, currentTutorialStep, isOpen, storageKey, isRestoring])
+
+    const exitTutorial = () => {
+        setTutorial(null)
+        setCurrentTutorialStep(0)
+    }
+
+    const handleTutorialComplete = () => {
+        setTutorial(null)
+        setCurrentTutorialStep(0)
+    }
 
     const handleSend = async () => {
         if (!input.trim()) return
 
         const userMessage = input
-        setMessages(prev => [...prev, { sender: 'user', text: userMessage }])
         setInput('')
         setLoading(true)
-        setHighlights([]) // Clear previous highlights
+        setHighlights([])
+        exitTutorial()
 
         try {
-            // 1. Capture Screenshot
             const screenshotDataUrl = await new Promise<string>((resolve) => {
                 chrome.runtime.sendMessage({ action: 'captureScreen' }, (response) => {
                     if (chrome.runtime.lastError) {
                         console.error(chrome.runtime.lastError)
-                        resolve('') // Proceed without screenshot if fails
+                        resolve('')
                     } else {
                         resolve(response?.dataUrl || '')
                     }
                 })
             })
 
-            // 2. Prepare Form Data
             const formData = new FormData()
             formData.append('message', userMessage)
 
             if (screenshotDataUrl) {
-                // Convert data URL to blob
-                const res = await fetch(screenshotDataUrl)
-                const blob = await res.blob()
-                formData.append('screenshot', blob, 'screenshot.png')
+                const compressedBlob = await compressScreenshot(screenshotDataUrl)
+                formData.append('screenshot', compressedBlob, 'screenshot.jpg')
             }
 
-            // 3. Call Backend
+            try {
+                const domTree = getSimplifiedDom(document)
+                formData.append('dom', JSON.stringify(domTree))
+            } catch (err) {
+                console.warn('Site Tutor: unable to generate sanitized DOM', err)
+            }
+
             const response = await fetch('http://localhost:8000/chat', {
                 method: 'POST',
                 body: formData
@@ -73,119 +197,41 @@ const Chatbot: React.FC = () => {
 
             const data = await response.json()
 
-            setMessages(prev => [...prev, { sender: 'bot', text: data.text }])
-
             let newHighlights = data.highlights || []
 
-            // Check if user is asking for button highlighting - always use direct DOM detection for reliability
-            const userMessageLower = userMessage.toLowerCase()
-            const isAllButtonsRequest = (userMessageLower.includes('all') || userMessageLower.includes('every') || userMessageLower.includes('highlight')) &&
-                                       (userMessageLower.includes('button') || userMessageLower.includes('btn'))
-
-            // For button requests, ALWAYS use direct DOM detection (backend selectors are unreliable)
-            if (isAllButtonsRequest) {
-                // Clear any previous highlight markers
-                document.querySelectorAll('[data-site-tutor-id]').forEach(el => {
-                    el.removeAttribute('data-site-tutor-id')
-                })
-
-                // Find all button-like elements on the page
-                const allButtons: Highlight[] = []
-                let buttonIndex = 0
-
-                // Helper to check if element is visible
-                const isVisible = (el: Element): boolean => {
-                    const rect = el.getBoundingClientRect()
-                    const style = window.getComputedStyle(el)
-                    return rect.width > 0 && rect.height > 0 &&
-                           style.display !== 'none' &&
-                           style.visibility !== 'hidden' &&
-                           style.opacity !== '0'
-                }
-
-                // Find actual button elements
-                document.querySelectorAll('button').forEach((btn) => {
-                    if (isVisible(btn)) {
-                        const id = `btn-${buttonIndex++}`
-                        btn.setAttribute('data-site-tutor-id', id)
-                        const text = btn.textContent?.trim() || 'Button'
-                        allButtons.push({
-                            selector: `[data-site-tutor-id="${id}"]`,
-                            explanation: text.substring(0, 30) || 'Button'
-                        })
-                    }
-                })
-
-                // Find elements with role="button"
-                document.querySelectorAll('[role="button"]').forEach((el) => {
-                    if (isVisible(el) && !el.hasAttribute('data-site-tutor-id')) {
-                        const id = `btn-${buttonIndex++}`
-                        el.setAttribute('data-site-tutor-id', id)
-                        const text = el.textContent?.trim() || 'Button'
-                        allButtons.push({
-                            selector: `[data-site-tutor-id="${id}"]`,
-                            explanation: text.substring(0, 30) || 'Button'
-                        })
-                    }
-                })
-
-                // Find input buttons
-                document.querySelectorAll('input[type="button"], input[type="submit"]').forEach((input) => {
-                    if (isVisible(input)) {
-                        const id = `btn-${buttonIndex++}`
-                        input.setAttribute('data-site-tutor-id', id)
-                        const value = (input as HTMLInputElement).value || 'Submit'
-                        allButtons.push({
-                            selector: `[data-site-tutor-id="${id}"]`,
-                            explanation: value.substring(0, 30) || 'Input Button'
-                        })
-                    }
-                })
-
-                // Find anchor tags that look like buttons (have button classes or role)
-                document.querySelectorAll('a').forEach((link) => {
-                    if (link.hasAttribute('data-site-tutor-id')) return
-                    const classes = link.className?.toLowerCase() || ''
-                    const role = link.getAttribute('role')
-                    if (isVisible(link) && (classes.includes('button') || classes.includes('btn') || role === 'button')) {
-                        const id = `btn-${buttonIndex++}`
-                        link.setAttribute('data-site-tutor-id', id)
-                        const text = link.textContent?.trim() || 'Link Button'
-                        allButtons.push({
-                            selector: `[data-site-tutor-id="${id}"]`,
-                            explanation: text.substring(0, 30) || 'Link Button'
-                        })
-                    }
-                })
-
-                if (allButtons.length > 0) {
-                    console.log(`Site Tutor: Found ${allButtons.length} buttons on the page`, allButtons)
-                    newHighlights = allButtons
-                } else {
-                    console.log('Site Tutor: No buttons found on this page')
-                }
+            if (data.tutorial && data.tutorial.steps?.length) {
+                setTutorial(data.tutorial)
+                setCurrentTutorialStep(0)
+                newHighlights = []
+            } else {
+                setTutorial(null)
+                setCurrentTutorialStep(0)
             }
-            
+
             setHighlights(newHighlights)
-            
-            // Log highlights for debugging
             if (newHighlights.length > 0) {
                 console.log('Site Tutor: Received highlights:', newHighlights)
             } else {
                 console.log('Site Tutor: No highlights in response')
             }
-
         } catch (error) {
             console.error('Error:', error)
-            setMessages(prev => [...prev, { sender: 'bot', text: 'Sorry, I encountered an error connecting to the brain.' }])
+            // Show error state - could add a simple error message UI here if needed
         } finally {
             setLoading(false)
         }
     }
 
+    const overlayHighlights = useMemo(() => {
+        if (tutorial) {
+            return tutorial.steps.map(step => ({ selector: step.selector, explanation: step.instruction }))
+        }
+        return highlights
+    }, [tutorial, highlights])
+
     return (
         <>
-            <Overlay highlights={highlights} />
+            <Overlay highlights={overlayHighlights} currentStepIndex={tutorial ? currentTutorialStep : undefined} />
 
             <div className="fixed bottom-6 right-6 z-[99999] font-sans text-gray-800 antialiased">
                 <AnimatePresence>
@@ -197,9 +243,11 @@ const Chatbot: React.FC = () => {
                             className="mb-4 w-96 rounded-2xl bg-white shadow-2xl ring-1 ring-black/5 flex flex-col overflow-hidden"
                             style={{ height: '500px' }}
                         >
-                            {/* Header */}
                             <div className="flex items-center justify-between bg-gradient-to-r from-violet-600 to-indigo-600 px-6 py-4 text-white">
-                                <h2 className="text-lg font-semibold tracking-wide">Site Tutor</h2>
+                                <div className="flex flex-col">
+                                    <h2 className="text-lg font-semibold tracking-wide">Site Tutor</h2>
+                                    <span className="text-xs opacity-75 font-normal">v{VERSION}</span>
+                                </div>
                                 <button
                                     onClick={() => setIsOpen(false)}
                                     className="rounded-full p-1 opacity-80 hover:bg-white/20 hover:opacity-100 transition-colors"
@@ -208,49 +256,55 @@ const Chatbot: React.FC = () => {
                                 </button>
                             </div>
 
-                            {/* Messages */}
-                            <div className="flex-1 overflow-y-auto p-4 bg-gray-50 flex flex-col gap-3">
-                                {messages.map((msg, idx) => (
-                                    <div
-                                        key={idx}
-                                        className={`max-w-[80%] p-3 rounded-2xl text-sm ${msg.sender === 'user' ? 'self-end bg-violet-600 text-white rounded-br-none' : 'self-start bg-white border border-gray-100 text-gray-600 rounded-tl-none shadow-sm'}`}
-                                    >
-                                        {msg.text}
+                            <div className="flex-1 overflow-hidden p-4 bg-gray-50 flex flex-col gap-3">
+                                {tutorial ? (
+                                    <div className="flex-1 overflow-y-auto rounded-2xl border border-violet-100 bg-white p-4 shadow-inner">
+                                        {!isRestoring && (
+                                            <TutorialController
+                                                tutorial={tutorial}
+                                                onClose={exitTutorial}
+                                                onComplete={handleTutorialComplete}
+                                                onStepChange={setCurrentTutorialStep}
+                                                initialStepIndex={currentTutorialStep}
+                                            />
+                                        )}
                                     </div>
-                                ))}
-                                {loading && (
-                                    <div className="self-start bg-white border border-gray-100 p-3 rounded-2xl rounded-tl-none shadow-sm text-sm text-gray-500">
-                                        Thinking...
+                                ) : (
+                                    <div className="flex-1 flex items-center justify-center">
+                                        <div className="text-center">
+                                            <p className="text-gray-500 text-sm mb-2">Input your tutorial.</p>
+                                            {loading && (
+                                                <div className="text-gray-400 text-sm mt-4">
+                                                    Creating your tutorial...
+                                                </div>
+                                            )}
+                                        </div>
                                     </div>
                                 )}
-                                {highlights.length > 0 && !loading && (
-                                    <div className="self-start bg-red-50 border border-red-200 p-2 rounded-lg text-xs text-red-800">
-                                        ✨ Highlighting {highlights.length} element{highlights.length !== 1 ? 's' : ''} on the page
-                                    </div>
-                                )}
-                                <div ref={messagesEndRef} />
                             </div>
 
-                            {/* Input Area */}
-                            <div className="p-4 border-t border-gray-100 bg-white">
-                                <div className="relative flex items-center gap-2">
-                                    <input
-                                        type="text"
-                                        value={input}
-                                        onChange={(e) => setInput(e.target.value)}
-                                        onKeyDown={(e) => e.key === 'Enter' && handleSend()}
-                                        placeholder="Ask about this page..."
-                                        className="flex-1 rounded-xl bg-gray-100 px-4 py-3 text-sm focus:bg-white focus:outline-none focus:ring-2 focus:ring-violet-500 transition-all shadow-inner"
-                                    />
-                                    <button
-                                        onClick={handleSend}
-                                        disabled={loading || !input.trim()}
-                                        className="rounded-lg bg-violet-600 p-3 text-white hover:bg-violet-700 transition-colors shadow-md hover:shadow-lg disabled:opacity-50 disabled:cursor-not-allowed"
-                                    >
-                                        <Send size={16} />
-                                    </button>
+                            {!tutorial && (
+                                <div className="p-4 border-t border-gray-100 bg-white">
+                                    <div className="relative flex items-center gap-2">
+                                        <input
+                                            type="text"
+                                            value={input}
+                                            onChange={(e) => setInput(e.target.value)}
+                                            onKeyDown={(e) => e.key === 'Enter' && !loading && handleSend()}
+                                            placeholder="Input your tutorial."
+                                            disabled={loading}
+                                            className="flex-1 rounded-xl bg-gray-100 px-4 py-3 text-sm focus:bg-white focus:outline-none focus:ring-2 focus:ring-violet-500 transition-all shadow-inner disabled:opacity-50"
+                                        />
+                                        <button
+                                            onClick={handleSend}
+                                            disabled={loading || !input.trim()}
+                                            className="rounded-lg bg-violet-600 p-3 text-white hover:bg-violet-700 transition-colors shadow-md hover:shadow-lg disabled:opacity-50 disabled:cursor-not-allowed"
+                                        >
+                                            <Send size={16} />
+                                        </button>
+                                    </div>
                                 </div>
-                            </div>
+                            )}
                         </motion.div>
                     )}
                 </AnimatePresence>

@@ -2,6 +2,7 @@ import React from 'react'
 import ReactDOM from 'react-dom/client'
 import Chatbot from '../components/Chatbot'
 import styles from '../index.css?inline'
+import { getSimplifiedDom } from '../utils/domSanitizer'
 
 const root = document.createElement('div')
 root.id = 'site-tutor-root'
@@ -23,3 +24,9 @@ ReactDOM.createRoot(shadowRoot).render(
         <Chatbot />
     </React.StrictMode>
 )
+
+if (typeof window !== 'undefined') {
+    ;(window as typeof window & { __siteTutorDomSnapshot?: () => unknown }).__siteTutorDomSnapshot = () => getSimplifiedDom(document)
+}
+
+export { getSimplifiedDom }
