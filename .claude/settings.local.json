@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run build:*)",
+      "Bash(git pull:*)",
+      "Bash(git reset:*)",
+      "WebFetch(domain:developer.agiopen.org)",
+      "Bash(pip show:*)",
+      "Bash(python -c:*)",
+      "WebFetch(domain:github.com)",
+      "WebSearch"
+    ]
+  }
+}

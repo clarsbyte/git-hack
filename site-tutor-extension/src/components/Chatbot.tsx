@@ -13,6 +13,13 @@ interface Highlight {
     explanation: string
 }
 
+interface AutomationAction {
+    type: string
+    url?: string
+    selector?: string
+    taskId?: string
+}
+
 const Chatbot: React.FC = () => {
     const [isOpen, setIsOpen] = useState(false)
     const [messages, setMessages] = useState<Message[]>([
@@ -21,6 +28,12 @@ const Chatbot: React.FC = () => {
     const [input, setInput] = useState('')
     const [loading, setLoading] = useState(false)
     const [highlights, setHighlights] = useState<Highlight[]>([])
+
+    // Session and automation state
+    const [sessionId, setSessionId] = useState<string | null>(null)
+    const [automationStatus, setAutomationStatus] = useState<'idle' | 'running' | 'success' | 'error'>('idle')
+    const [automationProgress, setAutomationProgress] = useState<string[]>([])
+    const [luxEventSource, setLuxEventSource] = useState<EventSource | null>(null)
 
     const messagesEndRef = useRef<HTMLDivElement>(null)
 
@@ -31,6 +44,15 @@ const Chatbot: React.FC = () => {
     useEffect(() => {
         scrollToBottom()
     }, [messages])
+
+    // Cleanup EventSource on unmount
+    useEffect(() => {
+        return () => {
+            if (luxEventSource) {
+                luxEventSource.close()
+            }
+        }
+    }, [luxEventSource])
 
     const handleSend = async () => {
         if (!input.trim()) return
@@ -58,6 +80,11 @@ const Chatbot: React.FC = () => {
             const formData = new FormData()
             formData.append('message', userMessage)
 
+            // Include session ID if we have one
+            if (sessionId) {
+                formData.append('sessionId', sessionId)
+            }
+
             if (screenshotDataUrl) {
                 // Convert data URL to blob
                 const res = await fetch(screenshotDataUrl)
@@ -73,7 +100,35 @@ const Chatbot: React.FC = () => {
 
             const data = await response.json()
 
+            // Store session ID from response
+            if (data.sessionId && !sessionId) {
+                setSessionId(data.sessionId)
+                console.log('Session ID received:', data.sessionId)
+            }
+
             setMessages(prev => [...prev, { sender: 'bot', text: data.text }])
+
+            // Handle automation actions
+            if (data.automation) {
+                const automation: AutomationAction = data.automation
+                if (automation.type === 'lux' && automation.taskId) {
+                    // Trigger LUX automation
+                    handleLuxAutomation(userMessage, data.sessionId || sessionId)
+                } else if (automation.type === 'navigate' && automation.url) {
+                    // Give user a moment to read the message, then navigate
+                    setTimeout(() => {
+                        window.location.href = automation.url!
+                    }, 1500)
+                } else if (automation.type === 'click' && automation.selector) {
+                    // Auto-click the specified element
+                    setTimeout(() => {
+                        const element = document.querySelector(automation.selector!)
+                        if (element && element instanceof HTMLElement) {
+                            element.click()
+                        }
+                    }, 1000)
+                }
+            }
 
             let newHighlights = data.highlights || []
 
@@ -183,6 +238,135 @@ const Chatbot: React.FC = () => {
         }
     }
 
+    const handleLuxAutomation = async (userMessage: string, currentSessionId: string | null) => {
+        if (!currentSessionId) {
+            console.error('No session ID available for LUX automation')
+            setMessages(prev => [...prev, { sender: 'bot', text: 'Error: Session not initialized' }])
+            return
+        }
+
+        try {
+            // Extract user intent from "I give up on X" pattern
+            const intent = userMessage.replace(/i give up on/i, '').trim() ||
+                          userMessage.replace(/just do it for me/i, 'this task').trim() ||
+                          userMessage.replace(/you do it/i, 'this task').trim() ||
+                          userMessage.replace(/i give up/i, 'this task').trim()
+
+            console.log('[LUX] Starting automation for intent:', intent)
+
+            // Show automation starting message
+            setMessages(prev => [...prev, {
+                sender: 'bot',
+                text: `🤖 Starting automated execution... I'll take control of your computer to complete: ${intent}`
+            }])
+
+            setAutomationStatus('running')
+            setAutomationProgress([])
+
+            // Call automate endpoint
+            const response = await fetch('http://localhost:8000/automate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    sessionId: currentSessionId,
+                    userIntent: intent
+                })
+            })
+
+            if (!response.ok) {
+                throw new Error(`Automation request failed: ${response.statusText}`)
+            }
+
+            const data = await response.json()
+            console.log('[LUX] Automation started:', data)
+
+            // Connect to SSE stream
+            const eventSource = new EventSource(`http://localhost:8000${data.streamUrl}`)
+            setLuxEventSource(eventSource)
+
+            eventSource.addEventListener('task_generated', (e: Event) => {
+                const taskData = JSON.parse((e as MessageEvent).data)
+                console.log('[LUX] Task generated:', taskData)
+                setMessages(prev => [...prev, {
+                    sender: 'bot',
+                    text: `📋 Task Plan:\n${taskData.task}\n\nSteps:\n${taskData.todos.map((t: string, i: number) => `${i + 1}. ${t}`).join('\n')}`
+                }])
+            })
+
+            eventSource.addEventListener('step', (e: Event) => {
+                const stepData = JSON.parse((e as MessageEvent).data)
+                console.log('[LUX] Step:', stepData)
+                setAutomationProgress(prev => [...prev, `Step ${stepData.step}: ${stepData.description}`])
+            })
+
+            eventSource.addEventListener('action', (e: Event) => {
+                const actionData = JSON.parse((e as MessageEvent).data)
+                console.log('[LUX] Action:', actionData)
+                setAutomationProgress(prev => [...prev, `Action: ${actionData.actions}`])
+            })
+
+            eventSource.addEventListener('retry', (e: Event) => {
+                const retryData = JSON.parse((e as MessageEvent).data)
+                console.log('[LUX] Retry:', retryData)
+                setMessages(prev => [...prev, {
+                    sender: 'bot',
+                    text: `🔄 Retrying (attempt ${retryData.attempt}): ${retryData.reason}`
+                }])
+            })
+
+            eventSource.addEventListener('error', (e: Event) => {
+                const errorData = JSON.parse((e as MessageEvent).data)
+                console.error('[LUX] Error:', errorData)
+                setAutomationStatus('error')
+                setMessages(prev => [...prev, {
+                    sender: 'bot',
+                    text: `❌ Error during automation: ${errorData.error}`
+                }])
+                eventSource.close()
+                setLuxEventSource(null)
+            })
+
+            eventSource.addEventListener('complete', (e: Event) => {
+                const completeData = JSON.parse((e as MessageEvent).data)
+                console.log('[LUX] Complete:', completeData)
+                setAutomationStatus(completeData.success ? 'success' : 'error')
+                setMessages(prev => [...prev, {
+                    sender: 'bot',
+                    text: completeData.success
+                        ? `✅ Automation completed successfully!\n\n${completeData.summary}\n\n[View detailed report](http://localhost:8000${completeData.htmlReport})`
+                        : `❌ Automation failed: ${completeData.summary}`
+                }])
+                eventSource.close()
+                setLuxEventSource(null)
+            })
+
+            eventSource.addEventListener('done', () => {
+                console.log('[LUX] Stream done')
+                eventSource.close()
+                setLuxEventSource(null)
+            })
+
+            eventSource.onerror = (error) => {
+                console.error('[LUX] SSE Error:', error)
+                setAutomationStatus('error')
+                setMessages(prev => [...prev, {
+                    sender: 'bot',
+                    text: '❌ Lost connection to automation stream'
+                }])
+                eventSource.close()
+                setLuxEventSource(null)
+            }
+
+        } catch (error) {
+            console.error('[LUX] Automation error:', error)
+            setAutomationStatus('error')
+            setMessages(prev => [...prev, {
+                sender: 'bot',
+                text: `❌ Failed to start automation: ${error}`
+            }])
+        }
+    }
+
     return (
         <>
             <Overlay highlights={highlights} />
@@ -221,6 +405,14 @@ const Chatbot: React.FC = () => {
                                 {loading && (
                                     <div className="self-start bg-white border border-gray-100 p-3 rounded-2xl rounded-tl-none shadow-sm text-sm text-gray-500">
                                         Thinking...
+                                    </div>
+                                )}
+                                {automationStatus === 'running' && automationProgress.length > 0 && (
+                                    <div className="self-start bg-blue-50 border border-blue-200 p-3 rounded-lg text-xs text-blue-800 max-w-[80%]">
+                                        <div className="font-bold mb-1">🤖 Automation Progress:</div>
+                                        {automationProgress.slice(-3).map((progress, idx) => (
+                                            <div key={idx} className="text-xs">{progress}</div>
+                                        ))}
                                     </div>
                                 )}
                                 {highlights.length > 0 && !loading && (
