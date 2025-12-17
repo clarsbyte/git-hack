@@ -1,7 +1,10 @@
 import React, { useState, useRef, useEffect } from 'react'
-import { MessageCircle, X, Send } from 'lucide-react'
+import { MessageCircle, X, Send, Loader2, RotateCcw } from 'lucide-react'
 import { motion, AnimatePresence } from 'framer-motion'
 import Overlay from './Overlay'
+import TutorialController from './TutorialController'
+import type { TutorialPayload } from '../types/tutorial'
+import { getSimplifiedDom } from '../utils/domSanitizer'
 
 interface Message {
     sender: 'user' | 'bot'
@@ -20,20 +23,129 @@ interface AutomationAction {
     taskId?: string
 }
 
+const compressScreenshot = async (dataUrl: string): Promise<Blob> => {
+    return new Promise((resolve, reject) => {
+        const img = new Image()
+        img.onload = () => {
+            const canvas = document.createElement('canvas')
+            const ctx = canvas.getContext('2d')
+            if (!ctx) {
+                reject(new Error('Could not get canvas context'))
+                return
+            }
+
+            const maxWidth = 1920
+            const maxHeight = 1080
+            let width = img.width
+            let height = img.height
+
+            if (width > maxWidth || height > maxHeight) {
+                const ratio = Math.min(maxWidth / width, maxHeight / height)
+                width = Math.floor(width * ratio)
+                height = Math.floor(height * ratio)
+            }
+
+            canvas.width = width
+            canvas.height = height
+            ctx.drawImage(img, 0, 0, width, height)
+
+            canvas.toBlob(
+                (blob) => {
+                    if (blob) {
+                        resolve(blob)
+                    } else {
+                        reject(new Error('Failed to compress image'))
+                    }
+                },
+                'image/jpeg',
+                0.75
+            )
+        }
+        img.onerror = () => reject(new Error('Failed to load image'))
+        img.src = dataUrl
+    })
+}
+
+const STORAGE_KEY_PREFIX = 'siteTutorState'
+const FALLBACK_STORAGE_KEY = `${STORAGE_KEY_PREFIX}:default`
+
+// Hardcoded example tutorial for creating a new GitHub repository
+const EXAMPLE_CREATE_REPO_TUTORIAL: TutorialPayload = {
+    title: 'Create a New GitHub Repository',
+    steps: [
+        {
+            stepNumber: 1,
+            selector: 'a[href="/new"]',
+            instruction: 'Click the "New" button or repository creation link in the top right corner of GitHub.',
+            actionType: 'click',
+            expectedResult: 'repository creation form',
+            hint: 'Look for a green button with a plus icon or a "New" link in the header navigation.'
+        },
+        {
+            stepNumber: 2,
+            selector: 'input[name="repository[name]"]',
+            instruction: 'Enter a name for your repository in the "Repository name" field.',
+            actionType: 'input',
+            expectedResult: 'repository name',
+            hint: 'The field is usually at the top of the form. Use a descriptive name like "my-project".'
+        },
+        {
+            stepNumber: 3,
+            selector: 'input[name="repository[description]"]',
+            instruction: '(Optional) Add a description for your repository.',
+            actionType: 'input',
+            expectedResult: 'description',
+            hint: 'This step is optional - you can skip it and click Next if you prefer.'
+        },
+        {
+            stepNumber: 4,
+            selector: 'input[name="repository[visibility]"][value="public"]',
+            instruction: 'Choose the visibility: Public (anyone can see) or Private (only you).',
+            actionType: 'click',
+            expectedResult: 'visibility',
+            hint: 'Public repositories are free and visible to everyone. Private repositories require a paid plan.'
+        },
+        {
+            stepNumber: 5,
+            selector: 'button[type="submit"]',
+            instruction: 'Click the "Create repository" button at the bottom of the form.',
+            actionType: 'click',
+            expectedResult: '/new',
+            hint: 'The button is usually green and located at the bottom of the form.'
+        }
+    ]
+}
+
+interface StoredState {
+    tutorial: TutorialPayload | null
+    currentTutorialStep: number
+    isOpen: boolean
+    origin?: string
+}
+
+type ChatMode = 'tutorial' | 'lux' | 'idle'
+
 const Chatbot: React.FC = () => {
     const [isOpen, setIsOpen] = useState(false)
-    const [messages, setMessages] = useState<Message[]>([
-        { sender: 'bot', text: "Hi! I'm your Site Tutor. I can teach you anything about this website. Click the camera icon or ask a question to get started!" }
-    ])
+    const [mode, setMode] = useState<ChatMode>('idle')
     const [input, setInput] = useState('')
     const [loading, setLoading] = useState(false)
-    const [highlights, setHighlights] = useState<Highlight[]>([])
 
-    // Session and automation state
+    // Lux mode state
+    const [messages, setMessages] = useState<Message[]>([
+        { sender: 'bot', text: "Hi! I'm your Site Tutor. I can teach you anything about this website. Ask a question or request a tutorial!" }
+    ])
+    const [highlights, setHighlights] = useState<Highlight[]>([])
     const [sessionId, setSessionId] = useState<string | null>(null)
     const [automationStatus, setAutomationStatus] = useState<'idle' | 'running' | 'success' | 'error'>('idle')
     const [automationProgress, setAutomationProgress] = useState<string[]>([])
     const [luxEventSource, setLuxEventSource] = useState<EventSource | null>(null)
+
+    // Tutorial mode state
+    const [tutorial, setTutorial] = useState<TutorialPayload | null>(null)
+    const [currentTutorialStep, setCurrentTutorialStep] = useState(0)
+    const [isRestoring, setIsRestoring] = useState(true)
+    const [storageKey, setStorageKey] = useState<string | null>(null)
 
     const messagesEndRef = useRef<HTMLDivElement>(null)
 
@@ -54,14 +166,128 @@ const Chatbot: React.FC = () => {
         }
     }, [luxEventSource])
 
+    // Initialize storage key for tutorial persistence
+    useEffect(() => {
+        chrome.runtime.sendMessage({ action: 'getTabId' }, (response) => {
+            if (chrome.runtime.lastError) {
+                console.warn('Site Tutor: unable to determine tab id', chrome.runtime.lastError)
+                setStorageKey(FALLBACK_STORAGE_KEY)
+                return
+            }
+
+            const key = `${STORAGE_KEY_PREFIX}:${response?.tabId ?? 'default'}`
+            setStorageKey(key)
+        })
+    }, [])
+
+    // Restore tutorial state from storage
+    useEffect(() => {
+        if (!storageKey) return
+
+        // Check if chrome.storage is available
+        if (!chrome?.storage?.local) {
+            console.warn('Site Tutor: chrome.storage not available')
+            setIsRestoring(false)
+            return
+        }
+
+        chrome.storage.local.get([storageKey], (result) => {
+            if (chrome.runtime.lastError) {
+                console.warn('Failed to load state:', chrome.runtime.lastError)
+                setIsRestoring(false)
+                return
+            }
+
+            const stored = result[storageKey] as StoredState | undefined
+
+            if (stored && stored.origin === window.location.origin) {
+                setTutorial(stored.tutorial)
+                setCurrentTutorialStep(stored.currentTutorialStep)
+                setIsOpen(stored.isOpen)
+                if (stored.tutorial) {
+                    setMode('tutorial')
+                }
+            }
+
+            setIsRestoring(false)
+        })
+    }, [storageKey])
+
+    // Persist tutorial state to storage
+    useEffect(() => {
+        if (!storageKey || isRestoring) return
+        if (!chrome?.storage?.local) return
+
+        const state: StoredState = {
+            tutorial,
+            currentTutorialStep,
+            isOpen,
+            origin: window.location.origin
+        }
+
+        chrome.storage.local.set({ [storageKey]: state })
+    }, [tutorial, currentTutorialStep, isOpen, storageKey, isRestoring])
+
+    const isCreateRepoRequest = (message: string): boolean => {
+        const normalized = message.toLowerCase().trim()
+        const patterns = [
+            'create a new repo',
+            'create new repo',
+            'create a repo',
+            'create repo',
+            'make a new repo',
+            'make new repo',
+            'new repository',
+            'create repository',
+            'create a new repository',
+            'create new repository'
+        ]
+        return patterns.some(pattern => normalized.includes(pattern))
+    }
+
+    const exitTutorial = () => {
+        setTutorial(null)
+        setCurrentTutorialStep(0)
+        setMode('idle')
+    }
+
+    const handleTutorialComplete = () => {
+        exitTutorial()
+        setHighlights([])
+    }
+
+    const handleReset = () => {
+        exitTutorial()
+        setHighlights([])
+        setInput('')
+        setLoading(false)
+        setMessages([
+            { sender: 'bot', text: "Hi! I'm your Site Tutor. I can teach you anything about this website. Ask a question or request a tutorial!" }
+        ])
+        setAutomationStatus('idle')
+        setAutomationProgress([])
+    }
+
     const handleSend = async () => {
         if (!input.trim()) return
 
         const userMessage = input
-        setMessages(prev => [...prev, { sender: 'user', text: userMessage }])
         setInput('')
         setLoading(true)
-        setHighlights([]) // Clear previous highlights
+        setHighlights([])
+
+        // Check for hardcoded tutorial request
+        if (isCreateRepoRequest(userMessage)) {
+            setLoading(false)
+            setMode('tutorial')
+            setTutorial(EXAMPLE_CREATE_REPO_TUTORIAL)
+            setCurrentTutorialStep(0)
+            return
+        }
+
+        // Normal Lux mode flow
+        setMode('lux')
+        setMessages(prev => [...prev, { sender: 'user', text: userMessage }])
 
         try {
             let screenshotDataUrl = ''
@@ -72,7 +298,6 @@ const Chatbot: React.FC = () => {
                 const desktopResponse = await fetch('http://localhost:8000/capture-desktop')
                 if (desktopResponse.ok) {
                     const desktopData = await desktopResponse.json()
-                    // Convert base64 to data URL
                     screenshotDataUrl = `data:image/png;base64,${desktopData.screenshot}`
                     console.log('[Screenshot] Desktop screenshot captured successfully')
                 } else {
@@ -97,7 +322,7 @@ const Chatbot: React.FC = () => {
                 })
             }
 
-            // 2. Prepare Form Data
+            // Prepare Form Data
             const formData = new FormData()
             formData.append('message', userMessage)
 
@@ -107,16 +332,23 @@ const Chatbot: React.FC = () => {
             }
 
             if (screenshotDataUrl) {
-                // Convert data URL to blob
-                const res = await fetch(screenshotDataUrl)
-                const blob = await res.blob()
-                formData.append('screenshot', blob, 'screenshot.png')
+                // Compress and convert data URL to blob
+                const compressedBlob = await compressScreenshot(screenshotDataUrl)
+                formData.append('screenshot', compressedBlob, 'screenshot.jpg')
                 console.log('[Screenshot] Screenshot attached to request')
             } else {
                 console.warn('[Screenshot] No screenshot available to send')
             }
 
-            // 3. Call Backend
+            // Add DOM context
+            try {
+                const domTree = getSimplifiedDom(document)
+                formData.append('dom', JSON.stringify(domTree))
+            } catch (err) {
+                console.warn('Site Tutor: unable to generate sanitized DOM', err)
+            }
+
+            // Call Backend
             const response = await fetch('http://localhost:8000/chat', {
                 method: 'POST',
                 body: formData
@@ -131,6 +363,12 @@ const Chatbot: React.FC = () => {
             }
 
             setMessages(prev => [...prev, { sender: 'bot', text: data.text }])
+
+            // Set highlights
+            if (data.highlights && data.highlights.length > 0) {
+                setHighlights(data.highlights)
+                console.log('Site Tutor: Received highlights:', data.highlights)
+            }
 
             // Handle automation actions
             if (data.automation) {
@@ -149,109 +387,12 @@ const Chatbot: React.FC = () => {
                         const element = document.querySelector(automation.selector!)
                         if (element && element instanceof HTMLElement) {
                             element.click()
+                            console.log('Auto-clicked element:', automation.selector)
+                        } else {
+                            console.warn('Element not found for auto-click:', automation.selector)
                         }
                     }, 1000)
                 }
-            }
-
-            let newHighlights = data.highlights || []
-
-            // Check if user is asking for button highlighting - always use direct DOM detection for reliability
-            const userMessageLower = userMessage.toLowerCase()
-            const isAllButtonsRequest = (userMessageLower.includes('all') || userMessageLower.includes('every') || userMessageLower.includes('highlight')) &&
-                                       (userMessageLower.includes('button') || userMessageLower.includes('btn'))
-
-            // For button requests, ALWAYS use direct DOM detection (backend selectors are unreliable)
-            if (isAllButtonsRequest) {
-                // Clear any previous highlight markers
-                document.querySelectorAll('[data-site-tutor-id]').forEach(el => {
-                    el.removeAttribute('data-site-tutor-id')
-                })
-
-                // Find all button-like elements on the page
-                const allButtons: Highlight[] = []
-                let buttonIndex = 0
-
-                // Helper to check if element is visible
-                const isVisible = (el: Element): boolean => {
-                    const rect = el.getBoundingClientRect()
-                    const style = window.getComputedStyle(el)
-                    return rect.width > 0 && rect.height > 0 &&
-                           style.display !== 'none' &&
-                           style.visibility !== 'hidden' &&
-                           style.opacity !== '0'
-                }
-
-                // Find actual button elements
-                document.querySelectorAll('button').forEach((btn) => {
-                    if (isVisible(btn)) {
-                        const id = `btn-${buttonIndex++}`
-                        btn.setAttribute('data-site-tutor-id', id)
-                        const text = btn.textContent?.trim() || 'Button'
-                        allButtons.push({
-                            selector: `[data-site-tutor-id="${id}"]`,
-                            explanation: text.substring(0, 30) || 'Button'
-                        })
-                    }
-                })
-
-                // Find elements with role="button"
-                document.querySelectorAll('[role="button"]').forEach((el) => {
-                    if (isVisible(el) && !el.hasAttribute('data-site-tutor-id')) {
-                        const id = `btn-${buttonIndex++}`
-                        el.setAttribute('data-site-tutor-id', id)
-                        const text = el.textContent?.trim() || 'Button'
-                        allButtons.push({
-                            selector: `[data-site-tutor-id="${id}"]`,
-                            explanation: text.substring(0, 30) || 'Button'
-                        })
-                    }
-                })
-
-                // Find input buttons
-                document.querySelectorAll('input[type="button"], input[type="submit"]').forEach((input) => {
-                    if (isVisible(input)) {
-                        const id = `btn-${buttonIndex++}`
-                        input.setAttribute('data-site-tutor-id', id)
-                        const value = (input as HTMLInputElement).value || 'Submit'
-                        allButtons.push({
-                            selector: `[data-site-tutor-id="${id}"]`,
-                            explanation: value.substring(0, 30) || 'Input Button'
-                        })
-                    }
-                })
-
-                // Find anchor tags that look like buttons (have button classes or role)
-                document.querySelectorAll('a').forEach((link) => {
-                    if (link.hasAttribute('data-site-tutor-id')) return
-                    const classes = link.className?.toLowerCase() || ''
-                    const role = link.getAttribute('role')
-                    if (isVisible(link) && (classes.includes('button') || classes.includes('btn') || role === 'button')) {
-                        const id = `btn-${buttonIndex++}`
-                        link.setAttribute('data-site-tutor-id', id)
-                        const text = link.textContent?.trim() || 'Link Button'
-                        allButtons.push({
-                            selector: `[data-site-tutor-id="${id}"]`,
-                            explanation: text.substring(0, 30) || 'Link Button'
-                        })
-                    }
-                })
-
-                if (allButtons.length > 0) {
-                    console.log(`Site Tutor: Found ${allButtons.length} buttons on the page`, allButtons)
-                    newHighlights = allButtons
-                } else {
-                    console.log('Site Tutor: No buttons found on this page')
-                }
-            }
-            
-            setHighlights(newHighlights)
-            
-            // Log highlights for debugging
-            if (newHighlights.length > 0) {
-                console.log('Site Tutor: Received highlights:', newHighlights)
-            } else {
-                console.log('Site Tutor: No highlights in response')
             }
 
         } catch (error) {
@@ -393,92 +534,120 @@ const Chatbot: React.FC = () => {
 
     return (
         <>
-            <Overlay highlights={highlights} />
+            <Overlay
+                highlights={highlights}
+                currentStepIndex={mode === 'tutorial' ? currentTutorialStep : undefined}
+            />
 
             <div className="fixed bottom-6 right-6 z-[99999] font-sans text-gray-800 antialiased">
                 <AnimatePresence>
                     {isOpen && (
                         <motion.div
-                            initial={{ opacity: 0, scale: 0.9, y: 20 }}
+                            className="chat-container"
+                            initial={{ opacity: 0, scale: 0.8, y: 20 }}
                             animate={{ opacity: 1, scale: 1, y: 0 }}
-                            exit={{ opacity: 0, scale: 0.9, y: 20 }}
-                            className="mb-4 w-96 rounded-2xl bg-white shadow-2xl ring-1 ring-black/5 flex flex-col overflow-hidden"
-                            style={{ height: '500px' }}
+                            exit={{ opacity: 0, scale: 0.8, y: 20 }}
+                            data-mode={mode}
                         >
-                            {/* Header */}
-                            <div className="flex items-center justify-between bg-gradient-to-r from-violet-600 to-indigo-600 px-6 py-4 text-white">
-                                <h2 className="text-lg font-semibold tracking-wide">Site Tutor</h2>
+                            <div className="chat-header" data-mode={mode}>
+                                <MessageCircle size={20} />
+                                <span className="font-medium">
+                                    {mode === 'tutorial' ? 'Tutorial Mode' : 'Site Tutor'}
+                                </span>
                                 <button
                                     onClick={() => setIsOpen(false)}
-                                    className="rounded-full p-1 opacity-80 hover:bg-white/20 hover:opacity-100 transition-colors"
+                                    className="ml-auto hover:bg-white/20 p-1 rounded transition-colors"
+                                    aria-label="Close chat"
                                 >
-                                    <X size={20} />
+                                    <X size={18} />
                                 </button>
                             </div>
 
-                            {/* Messages */}
-                            <div className="flex-1 overflow-y-auto p-4 bg-gray-50 flex flex-col gap-3">
-                                {messages.map((msg, idx) => (
-                                    <div
-                                        key={idx}
-                                        className={`max-w-[80%] p-3 rounded-2xl text-sm ${msg.sender === 'user' ? 'self-end bg-violet-600 text-white rounded-br-none' : 'self-start bg-white border border-gray-100 text-gray-600 rounded-tl-none shadow-sm'}`}
-                                    >
-                                        {msg.text}
-                                    </div>
-                                ))}
-                                {loading && (
-                                    <div className="self-start bg-white border border-gray-100 p-3 rounded-2xl rounded-tl-none shadow-sm text-sm text-gray-500">
-                                        Thinking...
-                                    </div>
-                                )}
-                                {automationStatus === 'running' && automationProgress.length > 0 && (
-                                    <div className="self-start bg-blue-50 border border-blue-200 p-3 rounded-lg text-xs text-blue-800 max-w-[80%]">
-                                        <div className="font-bold mb-1">🤖 Automation Progress:</div>
-                                        {automationProgress.slice(-3).map((progress, idx) => (
-                                            <div key={idx} className="text-xs">{progress}</div>
-                                        ))}
-                                    </div>
-                                )}
-                                {highlights.length > 0 && !loading && (
-                                    <div className="self-start bg-red-50 border border-red-200 p-2 rounded-lg text-xs text-red-800">
-                                        ✨ Highlighting {highlights.length} element{highlights.length !== 1 ? 's' : ''} on the page
-                                    </div>
-                                )}
-                                <div ref={messagesEndRef} />
-                            </div>
-
-                            {/* Input Area */}
-                            <div className="p-4 border-t border-gray-100 bg-white">
-                                <div className="relative flex items-center gap-2">
-                                    <input
-                                        type="text"
-                                        value={input}
-                                        onChange={(e) => setInput(e.target.value)}
-                                        onKeyDown={(e) => e.key === 'Enter' && handleSend()}
-                                        placeholder="Ask about this page..."
-                                        className="flex-1 rounded-xl bg-gray-100 px-4 py-3 text-sm focus:bg-white focus:outline-none focus:ring-2 focus:ring-violet-500 transition-all shadow-inner"
+                            <div className="chat-body">
+                                {mode === 'tutorial' && tutorial ? (
+                                    <TutorialController
+                                        tutorial={tutorial}
+                                        initialStepIndex={currentTutorialStep}
+                                        onStepChange={setCurrentTutorialStep}
+                                        onComplete={handleTutorialComplete}
+                                        onClose={handleReset}
                                     />
-                                    <button
-                                        onClick={handleSend}
-                                        disabled={loading || !input.trim()}
-                                        className="rounded-lg bg-violet-600 p-3 text-white hover:bg-violet-700 transition-colors shadow-md hover:shadow-lg disabled:opacity-50 disabled:cursor-not-allowed"
-                                    >
-                                        <Send size={16} />
-                                    </button>
-                                </div>
+                                ) : (
+                                    <>
+                                        <div className="messages-container">
+                                            {messages.map((msg, idx) => (
+                                                <div
+                                                    key={idx}
+                                                    className={`message ${msg.sender === 'user' ? 'message-user' : 'message-bot'}`}
+                                                >
+                                                    {msg.text}
+                                                </div>
+                                            ))}
+                                            {automationProgress.length > 0 && (
+                                                <div className="message message-bot">
+                                                    <div className="text-sm font-semibold mb-1">Automation Progress:</div>
+                                                    {automationProgress.map((progress, idx) => (
+                                                        <div key={idx} className="text-xs opacity-80">{progress}</div>
+                                                    ))}
+                                                </div>
+                                            )}
+                                            <div ref={messagesEndRef} />
+                                        </div>
+
+                                        <div className="chat-input-area">
+                                            <input
+                                                type="text"
+                                                value={input}
+                                                onChange={(e) => setInput(e.target.value)}
+                                                onKeyDown={(e) => {
+                                                    if (e.key === 'Enter' && !loading) {
+                                                        handleSend()
+                                                    }
+                                                }}
+                                                placeholder="Ask a question or request a tutorial..."
+                                                disabled={loading || automationStatus === 'running'}
+                                                className="chat-input"
+                                            />
+                                            <button
+                                                onClick={handleSend}
+                                                disabled={loading || automationStatus === 'running'}
+                                                className="chat-send-button"
+                                                aria-label="Send message"
+                                            >
+                                                {loading ? <Loader2 size={18} className="animate-spin" /> : <Send size={18} />}
+                                            </button>
+                                            {mode === 'lux' && (
+                                                <button
+                                                    onClick={handleReset}
+                                                    className="chat-reset-button"
+                                                    aria-label="Reset chat"
+                                                    title="Reset chat"
+                                                >
+                                                    <RotateCcw size={16} />
+                                                </button>
+                                            )}
+                                        </div>
+                                    </>
+                                )}
                             </div>
                         </motion.div>
                     )}
                 </AnimatePresence>
 
-                <motion.button
-                    whileHover={{ scale: 1.05 }}
-                    whileTap={{ scale: 0.95 }}
-                    onClick={() => setIsOpen(!isOpen)}
-                    className="flex h-14 w-14 items-center justify-center rounded-full bg-gradient-to-r from-violet-600 to-indigo-600 text-white shadow-xl hover:shadow-2xl hover:shadow-violet-500/30 transition-shadow"
-                >
-                    {isOpen ? <X size={24} /> : <MessageCircle size={28} />}
-                </motion.button>
+                {!isOpen && (
+                    <motion.button
+                        className="chat-fab"
+                        onClick={() => setIsOpen(true)}
+                        initial={{ scale: 0 }}
+                        animate={{ scale: 1 }}
+                        whileHover={{ scale: 1.1 }}
+                        whileTap={{ scale: 0.95 }}
+                        data-mode={mode}
+                        aria-label="Open chat"
+                    >
+                        <MessageCircle size={24} />
+                    </motion.button>
+                )}
             </div>
         </>
     )

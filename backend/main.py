@@ -71,7 +71,8 @@ class ChatResponse(BaseModel):
 async def chat(
     message: str = Form(...),
     screenshot: Optional[UploadFile] = File(None),
-    sessionId: Optional[str] = Form(None)
+    sessionId: Optional[str] = Form(None),
+    dom: Optional[str] = Form(None)
 ):
     print(f"Received message: {message}")
 
