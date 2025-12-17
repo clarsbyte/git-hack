@@ -1,0 +1,29 @@
+# Environment
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Temporary files
+temp/*
+!temp/.gitkeep
+
+# Logs
+*.log
+whisper_service.log
+
+# Model cache (Whisper downloads models to ~/.cache/whisper)
+.cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

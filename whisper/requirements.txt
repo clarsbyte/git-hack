@@ -1,0 +1,19 @@
+# Core FastAPI dependencies
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.20
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+
+# Whisper and ML
+openai-whisper>=20231117
+torch>=2.0.0
+torchaudio>=2.0.0
+numpy>=1.24.0
+
+# Audio processing
+ffmpeg-python>=0.2.0
+
+# Utilities
+python-dotenv>=1.0.0
+aiofiles>=23.0.0
