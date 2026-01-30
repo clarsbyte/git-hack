@@ -284,39 +284,39 @@ If you cannot find an element index, you may include a "selector" field as a CSS
             else:
                 raise
 
-            bot_response_text = parsed.get("text", "I analyzed the page but couldn't formulate a response.")
+        bot_response_text = parsed.get("text", "I analyzed the page but couldn't formulate a response.")
 
-            # Store bot message in session
-            session.add_message('bot', bot_response_text)
+        # Store bot message in session
+        session.add_message('bot', bot_response_text)
 
-            # Parse automation if present
-            automation_data = parsed.get("automation")
-            automation = None
+        # Parse automation if present
+        automation_data = parsed.get("automation")
+        automation = None
 
-            # Override with LUX automation if trigger detected
-            if is_lux_trigger:
-                automation = AutomationAction(
-                    type="lux",
-                    taskId=str(uuid.uuid4())
-                )
-            elif automation_data and isinstance(automation_data, dict):
-                automation = AutomationAction(**automation_data)
-
-            return ChatResponse(
-                text=bot_response_text,
-                highlights=parsed.get("highlights", []),
-                automation=automation,
-                sessionId=session.id
+        # Override with LUX automation if trigger detected
+        if is_lux_trigger:
+            automation = AutomationAction(
+                type="lux",
+                taskId=str(uuid.uuid4())
             )
-        except json.JSONDecodeError:
-            print(f"Failed to parse JSON: {raw_text}")
-            # Try to salvage text if possible, or just fail gracefully
-            return ChatResponse(
-                 text=raw_text,
-                 highlights=[],
-                 automation=None,
-                 sessionId=session.id
-            )
+        elif automation_data and isinstance(automation_data, dict):
+            automation = AutomationAction(**automation_data)
+
+        return ChatResponse(
+            text=bot_response_text,
+            highlights=parsed.get("highlights", []),
+            automation=automation,
+            sessionId=session.id
+        )
+    except json.JSONDecodeError:
+        print(f"Failed to parse JSON: {raw_text}")
+        # Try to salvage text if possible, or just fail gracefully
+        return ChatResponse(
+             text=raw_text,
+             highlights=[],
+             automation=None,
+             sessionId=session.id
+        )
 
     except Exception as e:
         print(f"Error calling Claude: {e}")
