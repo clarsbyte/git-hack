@@ -1,14 +1,37 @@
-import google.generativeai as genai
+from anthropic import Anthropic
 from typing import Tuple, List
 from session_manager import Session
 import json
+import io
+import base64
 
 
 class LuxTaskGenerator:
     """Generates detailed LUX automation tasks from conversation history"""
 
-    def __init__(self, model: genai.GenerativeModel):
-        self.model = model
+    def __init__(self, client: Anthropic, model_name: str, max_output_tokens: int):
+        self.client = client
+        self.model_name = model_name
+        self.max_output_tokens = max_output_tokens
+
+    @staticmethod
+    def _extract_json_object(raw_text: str) -> str | None:
+        start = None
+        depth = 0
+        last_end = None
+        for i, ch in enumerate(raw_text):
+            if ch == '{':
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == '}':
+                if depth > 0:
+                    depth -= 1
+                    if depth == 0 and start is not None:
+                        last_end = i + 1
+        if start is not None and last_end is not None:
+            return raw_text[start:last_end]
+        return None
 
     async def generate_task_from_history(
         self,
@@ -98,17 +121,33 @@ Return your response as JSON:
 }}
 """
 
-        inputs = [prompt]
+        content_blocks = [{"type": "text", "text": prompt}]
         if latest_screenshot:
-            inputs.append(latest_screenshot)
+            img_bytes = io.BytesIO()
+            latest_screenshot.save(img_bytes, format="PNG")
+            img_bytes.seek(0)
+            content_blocks.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": base64.b64encode(img_bytes.getvalue()).decode("utf-8")
+                }
+            })
 
-        response = self.model.generate_content(
-            inputs,
-            generation_config={"response_mime_type": "application/json"}
+        response = self.client.messages.create(
+            model=self.model_name,
+            max_tokens=self.max_output_tokens,
+            messages=[{"role": "user", "content": content_blocks}],
         )
 
         # Parse response
-        raw_text = response.text.strip()
+        raw_text = ""
+        for block in response.content:
+            text_value = getattr(block, "text", None)
+            if text_value:
+                raw_text += text_value
+        raw_text = raw_text.strip()
         if raw_text.startswith("```json"):
             raw_text = raw_text[7:]
         if raw_text.startswith("```"):
@@ -116,6 +155,13 @@ Return your response as JSON:
         if raw_text.endswith("```"):
             raw_text = raw_text[:-3]
 
-        parsed = json.loads(raw_text.strip())
+        try:
+            parsed = json.loads(raw_text.strip())
+        except json.JSONDecodeError:
+            extracted = self._extract_json_object(raw_text)
+            if extracted:
+                parsed = json.loads(extracted.strip())
+            else:
+                raise
 
         return (parsed["task"], parsed["todos"])

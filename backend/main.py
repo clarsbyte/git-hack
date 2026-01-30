@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 import json
 from dotenv import load_dotenv
-import google.generativeai as genai
+from anthropic import Anthropic
 from PIL import Image, ImageGrab
 import io
 import uuid
@@ -19,15 +19,33 @@ import base64
 
 load_dotenv()
 
-api_key = os.getenv("GEMINI_API_KEY")
+def extract_json_object(raw_text: str) -> Optional[str]:
+    start = None
+    depth = 0
+    last_end = None
+    for i, ch in enumerate(raw_text):
+        if ch == '{':
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == '}':
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    last_end = i + 1
+    if start is not None and last_end is not None:
+        return raw_text[start:last_end]
+    return None
+
+api_key = os.getenv("ANTHROPIC_API_KEY")
 if not api_key:
-    print("WARNING: GEMINI_API_KEY not found in environment variables.")
+    print("WARNING: ANTHROPIC_API_KEY not found in environment variables.")
 
-genai.configure(api_key=api_key)
+client = Anthropic(api_key=api_key)
+model_name = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+max_output_tokens = int(os.getenv("CLAUDE_MAX_TOKENS", "2048"))
 
-model = genai.GenerativeModel('gemini-2.5-flash')
-
-task_generator = LuxTaskGenerator(model)
+task_generator = LuxTaskGenerator(client, model_name, max_output_tokens)
 
 app = FastAPI()
 
@@ -52,8 +70,9 @@ async def startup_event():
     asyncio.create_task(cleanup_task())
 
 class Highlight(BaseModel):
-    selector: str
+    selector: str = ""
     explanation: str
+    elementIndex: Optional[int] = None
 
 class AutomationAction(BaseModel):
     type: str  # "navigate", "click", "lux"
@@ -72,7 +91,9 @@ async def chat(
     message: str = Form(...),
     screenshot: Optional[UploadFile] = File(None),
     sessionId: Optional[str] = Form(None),
-    dom: Optional[str] = Form(None)
+    dom: Optional[str] = Form(None),
+    completionHistory: Optional[str] = Form(None),
+    tutorialContext: Optional[str] = Form(None)
 ):
     print(f"Received message: {message}")
 
@@ -82,7 +103,7 @@ async def chat(
 
     if not api_key:
          return ChatResponse(
-             text="Please set your GEMINI_API_KEY in the backend/.env file to enable the AI agent.",
+             text="Please set your ANTHROPIC_API_KEY in the backend/.env file to enable the AI agent.",
              highlights=[],
              automation=None,
              sessionId=session.id
@@ -99,7 +120,7 @@ async def chat(
         # Store user message in session
         session.add_message('user', message, screenshot_image)
 
-        inputs = []
+        prompt_text = ""
         # Detect if this is a "select" or "highlight" instruction
         is_selection_request = any(keyword in message.lower() for keyword in [
             'select', 'highlight', 'show me', 'point to', 'find', 'where is',
@@ -116,33 +137,52 @@ async def chat(
         if is_selection_request:
             selection_instructions = """
 IMPORTANT: The user wants you to SELECT/HIGHLIGHT a specific element on the page.
-- You MUST return at least one highlight with a precise CSS selector.
-- Look carefully at the screenshot to identify the exact element the user is referring to.
-- If the user says "select the login button", find the actual login button in the image and generate a selector for it.
-- If the user says "select the search bar", find the search input field and generate a selector.
-- Be as specific as possible - prefer unique identifiers like IDs, or combine multiple attributes for precision.
+- You MUST return at least one highlight with the element's numeric index from the indexed element list below.
+- Cross-reference the screenshot with the indexed element list to find the correct element index.
 """
-        
+
         # Enhanced instructions for finding multiple elements (like "all buttons")
         multiple_elements_instruction = ""
         if any(keyword in message.lower() for keyword in ['all', 'every', 'each']):
             multiple_elements_instruction = """
-CRITICAL: The user wants to find MULTIPLE elements (e.g., "all buttons", "every link").
-- You MUST look at the screenshot and identify EACH individual button/element visually.
-- Generate a SEPARATE highlight entry for EACH distinct element you can see.
-- DO NOT use generic selectors like 'button' or 'a.btn' that match everything.
-- Instead, create specific selectors for each button you can identify:
-  * Look for unique text content, positions, or nearby elements
-  * Use structural selectors like 'nav button:first-child', 'header a:nth-child(2)'
-  * Combine element type with parent context: 'header > nav > button', 'footer a[href*="about"]'
-- If you see 5 buttons, return 5 separate highlight entries, each with a unique selector.
-- Each selector should target ONE specific button, not all buttons at once.
+CRITICAL: The user wants to find MULTIPLE elements. Generate a SEPARATE highlight entry for EACH distinct element you can identify from the indexed list.
 """
-        
-        inputs.append(f"""
+
+        # Include indexed DOM if provided
+        dom_context = ""
+        if dom:
+            dom_context = f"""
+INDEXED ELEMENTS ON THIS PAGE:
+Each interactive element has been assigned a numeric index. Reference elements by their index number.
+The list below shows: [index] tagName "visible text" key-attributes
+
+{dom}
+"""
+
+        # Include completion history if provided
+        history_context = ""
+        if completionHistory:
+            history_context = f"""
+PRIOR LEARNING HISTORY:
+The user has previously completed these tutorials on this site:
+{completionHistory}
+You can skip basics they already know and build on prior knowledge.
+"""
+
+        # Include tutorial context if provided
+        tutorial_context = ""
+        if tutorialContext:
+            tutorial_context = f"""
+CURRENT TUTORIAL CONTEXT:
+The user is currently in a step-by-step tutorial. Use this to avoid restarting from step 1.
+{tutorialContext}
+If the user asks a question while mid-tutorial, continue from the current step and reference the next best action.
+"""
+
+        prompt_text = f"""
 You are a Site Tutor, an expert web developer and UI guide.
 Your goal is to answer the user's question about the website screenshot provided.
-Crucially, you must also identify specific HTML elements on the screen that are relevant to your answer so we can highlight them.
+You must also identify specific HTML elements on the screen that are relevant to your answer so we can highlight them.
 
 User Question: "{message}"
 
@@ -150,98 +190,82 @@ User Question: "{message}"
 
 {multiple_elements_instruction}
 
+{dom_context}
+
+{history_context}
+
+{tutorial_context}
+
 AUTOMATION CAPABILITY:
 You have the ability to automate actions for the user. When the user expresses frustration, gives up, or asks you to do something for them, you can take control and automate the task.
 
-Detect phrases like:
-- "I give up"
-- "Just do it for me"
-- "Can you do it"
-- "You do it"
-- "Help me do this"
-- Or any expression of wanting you to take over
+Detect phrases like "I give up", "Just do it for me", "Can you do it", "You do it", "Help me do this", or any expression of wanting you to take over.
 
 When automation is appropriate, analyze what the user is trying to do and generate the correct automation action:
+1. **Navigate to a URL** - Use when user wants to go to a specific page
+2. **Click an element** - Use when user wants to click something on the current page
 
-1. **Navigate to a URL** - Use when user wants to go to a specific page:
-   - Creating a repository → "https://github.com/new"
-   - Creating a gist → "https://gist.github.com/"
-   - Account settings → Look for settings URL patterns
-   - Documentation pages → Navigate to docs
-   - Any other page they're trying to reach
+IMPORTANT: Only provide automation when the user clearly wants you to take over.
 
-2. **Click an element** - Use when user wants to click something on the current page:
-   - Generate a CSS selector for the button/link they want to click
-   - Examples: login button, submit button, menu item, etc.
-
-IMPORTANT: Only provide automation when the user clearly wants you to take over. Don't automate simple questions or when they're just asking for information.
+ELEMENT REFERENCING:
+- Each element in the indexed list has a numeric index (e.g. [0], [1], [2]).
+- When identifying elements, use the "elementIndex" field with the numeric index from the list.
+- Cross-reference the screenshot with the indexed element list to pick the correct index.
+- If the indexed list is not available, fall back to a CSS selector in the "selector" field.
 
 Return your response strictly as a JSON object with this format:
 {{
   "text": "Your conversational answer here...",
   "highlights": [
-    {{ "selector": "unique_css_selector_for_element", "explanation": "Brief label for the highlight" }}
+    {{ "elementIndex": 5, "explanation": "Brief label for the highlight" }}
   ],
+  "automation": null
+}}
+
+OR for automation:
+{{
+  "text": "Your conversational answer here...",
+  "highlights": [],
   "automation": {{
     "type": "navigate",
     "url": "https://example.com/path"
   }}
 }}
 
-OR for click automation:
-{{
-  "text": "Your conversational answer here...",
-  "highlights": [],
-  "automation": {{
-    "type": "click",
-    "selector": "button.submit-btn"
-  }}
-}}
+If no automation is needed, set "automation": null.
+If you cannot find an element index, you may include a "selector" field as a CSS selector fallback.
+"""
 
-If no automation is needed, set "automation": null
+        if not screenshot_image:
+            prompt_text += "\n(No screenshot provided, answer based on general web knowledge if possible)"
 
-CRITICAL SELECTOR RULES:
-- You MUST analyze the screenshot carefully to identify ACTUAL elements visible on THIS specific page.
-- DO NOT generate generic selectors that might work on any page (like 'button', 'a.btn', '.primary-button').
-- You MUST look at the screenshot and identify what's actually there, then generate selectors that match THOSE specific elements.
-
-For the 'selector':
-- You MUST identify visual elements mentioned in your text or requested by the user.
-- Use CSS selectors that are likely to work on THIS SPECIFIC PAGE based on what you see in the screenshot.
-- Priority order for selector generation:
-  1. ID attributes: '#element-id' (most reliable if visible)
-  2. Stable attributes: '[data-testid="..."]', '[aria-label="..."]', '[name="..."]'
-  3. Structural selectors with parent context: 'header button', 'nav > a:first-child', 'footer a[href="/about"]'
-  4. Element type with text content context: Look for nearby text or labels in the screenshot
-  5. Nth-child selectors: 'nav a:nth-child(2)', 'div.buttons button:first-child'
-  6. Class names combined with element type AND parent: 'header button.primary', 'nav a.nav-link'
-  7. Attribute selectors: 'input[type="text"]', 'a[href*="/login"]', 'button[type="submit"]'
-- Examples of GOOD selectors: 
-  - 'header nav button' (structural, specific to header nav)
-  - 'nav > a[href="/docs"]' (structural with href)
-  - 'div.hero-section button:first-child' (parent class + position)
-  - 'footer a:nth-child(2)' (structural position)
-- Examples of BAD selectors (too generic):
-  - 'button' (matches all buttons)
-  - 'a.btn, a.button' (generic, might not exist)
-  - '.primary-button' (class might not exist)
-- If the user asks to "select" or "highlight" something, you MUST include it in highlights.
-- If asking for "all buttons", identify EACH button individually with separate selectors.
-- For each element, look at its position, nearby text, parent elements, and generate a selector that uniquely identifies THAT element.
-- If you cannot find a precise selector, use structural selectors based on position (nth-child, first-child, etc.) combined with parent context.
-""")
-        
+        # Generate content with Claude
+        content_blocks = [{"type": "text", "text": prompt_text}]
         if screenshot_image:
-            inputs.append(screenshot_image)
-        else:
-            inputs.append("\n(No screenshot provided, answer based on general web knowledge if possible)")
+            img_bytes = io.BytesIO()
+            screenshot_image.save(img_bytes, format="PNG")
+            img_bytes.seek(0)
+            content_blocks.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": base64.b64encode(img_bytes.getvalue()).decode("utf-8")
+                }
+            })
 
-        # Generate content
-        # Note: 'response_mime_type': 'application/json' is powerful but sometimes requires cleaning
-        response = model.generate_content(inputs, generation_config={"response_mime_type": "application/json"})
-        
-        raw_text = response.text
-        print(f"Gemini raw response: {raw_text}") 
+        response = client.messages.create(
+            model=model_name,
+            max_tokens=max_output_tokens,
+            messages=[{"role": "user", "content": content_blocks}],
+        )
+
+        raw_text = ""
+        for block in response.content:
+            text_value = getattr(block, "text", None)
+            if text_value:
+                raw_text += text_value
+        print(f"Claude raw response: {raw_text}")
         
         # Clean potential markdown code blocks
         if raw_text.startswith("```json"):
@@ -253,6 +277,12 @@ For the 'selector':
         
         try:
             parsed = json.loads(raw_text.strip())
+        except json.JSONDecodeError:
+            extracted = extract_json_object(raw_text)
+            if extracted:
+                parsed = json.loads(extracted.strip())
+            else:
+                raise
 
             bot_response_text = parsed.get("text", "I analyzed the page but couldn't formulate a response.")
 
@@ -289,7 +319,7 @@ For the 'selector':
             )
 
     except Exception as e:
-        print(f"Error calling Gemini: {e}")
+        print(f"Error calling Claude: {e}")
         return ChatResponse(
             text=f"I encountered an error analyzing the page: {str(e)}",
             highlights=[],

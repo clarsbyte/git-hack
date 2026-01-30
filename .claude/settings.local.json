@@ -5,7 +5,11 @@
       "Bash(curl:*)",
       "Bash(git checkout:*)",
       "Bash(npm install:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(python:*)"
     ]
-  }
+  },
+  "disabledMcpjsonServers": [
+    "washedmcp"
+  ]
 }

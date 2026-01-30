@@ -1,10 +1,19 @@
 import React, { useState, useRef, useEffect } from 'react'
-import { MessageCircle, X, Send, Loader2, RotateCcw } from 'lucide-react'
+import { MessageCircle, X, Send, Loader2 } from 'lucide-react'
 import { motion, AnimatePresence } from 'framer-motion'
 import Overlay from './Overlay'
 import TutorialController from './TutorialController'
-import type { TutorialPayload } from '../types/tutorial'
-import { getSimplifiedDom } from '../utils/domSanitizer'
+import type { TutorialActionType, TutorialPayload } from '../types/tutorial'
+import { ElementIndexer } from '../utils/elementIndexer'
+import {
+    generateFingerprint,
+    saveTutorialRecord,
+    loadTutorialRecord,
+    findMatchingTutorial,
+    markStepCompleted,
+    getCompletionHistory,
+    type TutorialRecord,
+} from '../utils/tutorialMemory'
 
 interface Message {
     sender: 'user' | 'bot'
@@ -14,6 +23,7 @@ interface Message {
 interface Highlight {
     selector: string
     explanation: string
+    elementIndex?: number
 }
 
 interface AutomationAction {
@@ -21,6 +31,14 @@ interface AutomationAction {
     url?: string
     selector?: string
     taskId?: string
+}
+
+const getIndexer = (): ElementIndexer => {
+    const win = window as typeof window & { __siteTutorElementIndexer?: ElementIndexer }
+    if (!win.__siteTutorElementIndexer) {
+        win.__siteTutorElementIndexer = new ElementIndexer()
+    }
+    return win.__siteTutorElementIndexer
 }
 
 const compressScreenshot = async (dataUrl: string): Promise<Blob> => {
@@ -68,6 +86,151 @@ const compressScreenshot = async (dataUrl: string): Promise<Blob> => {
 
 const STORAGE_KEY_PREFIX = 'siteTutorState'
 const FALLBACK_STORAGE_KEY = `${STORAGE_KEY_PREFIX}:default`
+const extractNumberedSteps = (text: string): string[] | null => {
+    const lines = text.split(/\r?\n/).map(line => line.trim())
+    const steps: string[] = []
+    let current = ''
+
+    lines.forEach(line => {
+        if (!line) return
+        const match = line.match(/^\s*\d+(?:\.|\))\s+(.*)$/)
+        if (match) {
+            if (current.length > 0) {
+                steps.push(current.trim())
+            }
+            current = match[1].trim()
+            return
+        }
+
+        if (current.length > 0) {
+            current += ` ${line}`
+        }
+    })
+
+    if (current.length > 0) {
+        steps.push(current.trim())
+    }
+
+    return steps.length >= 2 ? steps : null
+}
+
+const inferActionType = (text: string): TutorialActionType => {
+    const lower = text.toLowerCase()
+    if (lower.includes('type') || lower.includes('enter') || lower.includes('fill')) {
+        return 'input'
+    }
+    if (lower.includes('go to') || lower.includes('navigate') || lower.includes('open')) {
+        return 'navigate'
+    }
+    return 'click'
+}
+
+const buildTutorialFromSteps = (steps: string[], highlights?: Highlight[]): TutorialPayload => {
+    return {
+        title: 'Step-by-step guide',
+        steps: steps.map((instruction, index) => ({
+            stepNumber: index + 1,
+            selector: highlights?.[index]?.selector ?? '',
+            instruction,
+            actionType: inferActionType(instruction),
+            expectedResult: undefined,
+            elementIndex: highlights?.[index]?.elementIndex
+        }))
+    }
+}
+
+const buildHighlightsFromSteps = (steps: TutorialPayload['steps'], highlights?: Highlight[]): Highlight[] => {
+    return steps.map((step, index) => ({
+        selector: highlights?.[index]?.selector ?? step.selector ?? '',
+        explanation: step.instruction,
+        elementIndex: highlights?.[index]?.elementIndex ?? step.elementIndex
+    }))
+}
+
+const SESSION_STORE_KEY = `${STORAGE_KEY_PREFIX}:sessions`
+
+const escapeHtml = (text: string): string =>
+    text
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;')
+
+const applyInlineMarkdown = (text: string): string => {
+    let output = text
+    output = output.replace(/`([^`]+)`/g, '<code>$1</code>')
+    output = output.replace(/\*\*\*([^*]+)\*\*\*/g, '<strong>$1</strong>')
+    output = output.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    output = output.replace(/__([^_]+)__/g, '<strong>$1</strong>')
+    output = output.replace(/\*([^*]+)\*/g, '<em>$1</em>')
+    output = output.replace(/_([^_]+)_/g, '<em>$1</em>')
+    return output
+}
+
+const renderMarkdown = (raw: string): string => {
+    const lines = escapeHtml(raw).split(/\r?\n/)
+    let html = ''
+    let paragraph: string[] = []
+    let listType: 'ol' | 'ul' | null = null
+    let listItems: string[] = []
+
+    const flushParagraph = () => {
+        if (paragraph.length === 0) return
+        const content = paragraph.join('<br />')
+        html += `<p>${applyInlineMarkdown(content)}</p>`
+        paragraph = []
+    }
+
+    const flushList = () => {
+        if (!listType || listItems.length === 0) return
+        const itemsHtml = listItems.map(item => `<li>${applyInlineMarkdown(item)}</li>`).join('')
+        html += `<${listType}>${itemsHtml}</${listType}>`
+        listType = null
+        listItems = []
+    }
+
+    lines.forEach(line => {
+        const trimmed = line.trim()
+        if (!trimmed) {
+            flushParagraph()
+            flushList()
+            return
+        }
+
+        const orderedMatch = trimmed.match(/^(\d+)[.)]\s+(.*)$/)
+        if (orderedMatch) {
+            flushParagraph()
+            if (listType && listType !== 'ol') {
+                flushList()
+            }
+            listType = 'ol'
+            listItems.push(orderedMatch[2])
+            return
+        }
+
+        const unorderedMatch = trimmed.match(/^[-*]\s+(.*)$/)
+        if (unorderedMatch) {
+            flushParagraph()
+            if (listType && listType !== 'ul') {
+                flushList()
+            }
+            listType = 'ul'
+            listItems.push(unorderedMatch[1])
+            return
+        }
+
+        if (listType) {
+            flushList()
+        }
+        paragraph.push(trimmed)
+    })
+
+    flushParagraph()
+    flushList()
+
+    return html
+}
 
 // Hardcoded example tutorial for creating a new GitHub repository
 const EXAMPLE_CREATE_REPO_TUTORIAL: TutorialPayload = {
@@ -123,7 +286,18 @@ interface StoredState {
     origin?: string
 }
 
-type ChatMode = 'tutorial' | 'lux' | 'idle'
+interface SessionSnapshot {
+    tutorial: TutorialPayload | null
+    currentTutorialStep: number
+    isOpen: boolean
+    origin: string
+    lastUrl: string
+    updatedAt: number
+}
+
+type SessionStore = Record<string, SessionSnapshot>
+
+type ChatMode = 'tutorial' | 'idle'
 
 const Chatbot: React.FC = () => {
     const [isOpen, setIsOpen] = useState(false)
@@ -131,7 +305,7 @@ const Chatbot: React.FC = () => {
     const [input, setInput] = useState('')
     const [loading, setLoading] = useState(false)
 
-    // Lux mode state
+    // Chat state
     const [messages, setMessages] = useState<Message[]>([
         { sender: 'bot', text: "Hi! I'm your Site Tutor. I can teach you anything about this website. Ask a question or request a tutorial!" }
     ])
@@ -139,13 +313,14 @@ const Chatbot: React.FC = () => {
     const [sessionId, setSessionId] = useState<string | null>(null)
     const [automationStatus, setAutomationStatus] = useState<'idle' | 'running' | 'success' | 'error'>('idle')
     const [automationProgress, setAutomationProgress] = useState<string[]>([])
-    const [luxEventSource, setLuxEventSource] = useState<EventSource | null>(null)
 
     // Tutorial mode state
     const [tutorial, setTutorial] = useState<TutorialPayload | null>(null)
     const [currentTutorialStep, setCurrentTutorialStep] = useState(0)
     const [isRestoring, setIsRestoring] = useState(true)
     const [storageKey, setStorageKey] = useState<string | null>(null)
+    const [tabId, setTabId] = useState<number | null>(null)
+    const [tutorialFingerprint, setTutorialFingerprint] = useState<string | null>(null)
 
     const messagesEndRef = useRef<HTMLDivElement>(null)
 
@@ -157,15 +332,6 @@ const Chatbot: React.FC = () => {
         scrollToBottom()
     }, [messages])
 
-    // Cleanup EventSource on unmount
-    useEffect(() => {
-        return () => {
-            if (luxEventSource) {
-                luxEventSource.close()
-            }
-        }
-    }, [luxEventSource])
-
     // Initialize storage key for tutorial persistence
     useEffect(() => {
         chrome.runtime.sendMessage({ action: 'getTabId' }, (response) => {
@@ -176,6 +342,7 @@ const Chatbot: React.FC = () => {
             }
 
             const key = `${STORAGE_KEY_PREFIX}:${response?.tabId ?? 'default'}`
+            setTabId(typeof response?.tabId === 'number' ? response.tabId : null)
             setStorageKey(key)
         })
     }, [])
@@ -191,7 +358,7 @@ const Chatbot: React.FC = () => {
             return
         }
 
-        chrome.storage.local.get([storageKey], (result) => {
+        chrome.storage.local.get([storageKey, SESSION_STORE_KEY], (result) => {
             if (chrome.runtime.lastError) {
                 console.warn('Failed to load state:', chrome.runtime.lastError)
                 setIsRestoring(false)
@@ -199,6 +366,8 @@ const Chatbot: React.FC = () => {
             }
 
             const stored = result[storageKey] as StoredState | undefined
+            const sessionStore = result[SESSION_STORE_KEY] as SessionStore | undefined
+            const session = tabId !== null ? sessionStore?.[String(tabId)] : undefined
 
             if (stored && stored.origin === window.location.origin) {
                 setTutorial(stored.tutorial)
@@ -206,12 +375,29 @@ const Chatbot: React.FC = () => {
                 setIsOpen(stored.isOpen)
                 if (stored.tutorial) {
                     setMode('tutorial')
+                    setHighlights(buildHighlightsFromSteps(stored.tutorial.steps))
+                } else {
+                    setHighlights([])
+                }
+            } else if (session && session.origin === window.location.origin) {
+                const nextStepIndex = session.lastUrl !== window.location.href && session.tutorial
+                    ? Math.min(session.currentTutorialStep + 1, session.tutorial.steps.length - 1)
+                    : session.currentTutorialStep
+
+                setTutorial(session.tutorial)
+                setCurrentTutorialStep(nextStepIndex)
+                setIsOpen(session.isOpen)
+                if (session.tutorial) {
+                    setMode('tutorial')
+                    setHighlights(buildHighlightsFromSteps(session.tutorial.steps))
+                } else {
+                    setHighlights([])
                 }
             }
 
             setIsRestoring(false)
         })
-    }, [storageKey])
+    }, [storageKey, tabId])
 
     // Persist tutorial state to storage
     useEffect(() => {
@@ -227,6 +413,31 @@ const Chatbot: React.FC = () => {
 
         chrome.storage.local.set({ [storageKey]: state })
     }, [tutorial, currentTutorialStep, isOpen, storageKey, isRestoring])
+
+    useEffect(() => {
+        if (tabId === null || isRestoring) return
+        if (!chrome?.storage?.local) return
+
+        const snapshot: SessionSnapshot = {
+            tutorial,
+            currentTutorialStep,
+            isOpen,
+            origin: window.location.origin,
+            lastUrl: window.location.href,
+            updatedAt: Date.now()
+        }
+
+        chrome.storage.local.get([SESSION_STORE_KEY], (result) => {
+            if (chrome.runtime.lastError) {
+                console.warn('Failed to load session store:', chrome.runtime.lastError)
+                return
+            }
+
+            const store = (result[SESSION_STORE_KEY] as SessionStore | undefined) ?? {}
+            store[String(tabId)] = snapshot
+            chrome.storage.local.set({ [SESSION_STORE_KEY]: store })
+        })
+    }, [tutorial, currentTutorialStep, isOpen, tabId, isRestoring])
 
     const isCreateRepoRequest = (message: string): boolean => {
         const normalized = message.toLowerCase().trim()
@@ -252,6 +463,14 @@ const Chatbot: React.FC = () => {
     }
 
     const handleTutorialComplete = () => {
+        if (tutorialFingerprint) {
+            // Mark all steps completed
+            const stepCount = tutorial?.steps.length ?? 0
+            for (let i = 0; i < stepCount; i++) {
+                markStepCompleted(tutorialFingerprint, i).catch(() => {})
+            }
+        }
+        setTutorialFingerprint(null)
         exitTutorial()
         setHighlights([])
     }
@@ -281,12 +500,13 @@ const Chatbot: React.FC = () => {
             setLoading(false)
             setMode('tutorial')
             setTutorial(EXAMPLE_CREATE_REPO_TUTORIAL)
+            setHighlights(buildHighlightsFromSteps(EXAMPLE_CREATE_REPO_TUTORIAL.steps))
             setCurrentTutorialStep(0)
             return
         }
 
-        // Normal Lux mode flow
-        setMode('lux')
+        // Lux mode disabled: keep standard chat flow
+        setMode('idle')
         setMessages(prev => [...prev, { sender: 'user', text: userMessage }])
 
         try {
@@ -331,6 +551,17 @@ const Chatbot: React.FC = () => {
                 formData.append('sessionId', sessionId)
             }
 
+            if (tutorial && mode === 'tutorial') {
+                const tutorialContext = {
+                    title: tutorial.title,
+                    currentStepIndex: currentTutorialStep,
+                    totalSteps: tutorial.steps.length,
+                    currentStep: tutorial.steps[currentTutorialStep]?.instruction ?? '',
+                    steps: tutorial.steps.map(step => step.instruction),
+                }
+                formData.append('tutorialContext', JSON.stringify(tutorialContext))
+            }
+
             if (screenshotDataUrl) {
                 // Compress and convert data URL to blob
                 const compressedBlob = await compressScreenshot(screenshotDataUrl)
@@ -340,12 +571,25 @@ const Chatbot: React.FC = () => {
                 console.warn('[Screenshot] No screenshot available to send')
             }
 
-            // Add DOM context
+            // Add indexed DOM context
             try {
-                const domTree = getSimplifiedDom(document)
-                formData.append('dom', JSON.stringify(domTree))
+                const indexer = getIndexer()
+                indexer.indexPage(document)
+                const domText = indexer.toTextRepresentation()
+                formData.append('dom', domText)
             } catch (err) {
-                console.warn('Site Tutor: unable to generate sanitized DOM', err)
+                console.warn('Site Tutor: unable to generate indexed DOM', err)
+            }
+
+            // Add completion history
+            try {
+                const history = await getCompletionHistory(window.location.origin)
+                if (history.length > 0) {
+                    const summary = history.map(h => `- ${h.title}`).join('\n')
+                    formData.append('completionHistory', summary)
+                }
+            } catch (err) {
+                console.warn('Site Tutor: unable to load completion history', err)
             }
 
             // Call Backend
@@ -362,21 +606,68 @@ const Chatbot: React.FC = () => {
                 console.log('Session ID received:', data.sessionId)
             }
 
-            setMessages(prev => [...prev, { sender: 'bot', text: data.text }])
+            const parsedSteps = extractNumberedSteps(data.text || '')
+            if (parsedSteps) {
+                const tutorialPayload = buildTutorialFromSteps(parsedSteps, data.highlights)
 
-            // Set highlights
-            if (data.highlights && data.highlights.length > 0) {
-                setHighlights(data.highlights)
-                console.log('Site Tutor: Received highlights:', data.highlights)
+                // Check for prior progress on this tutorial
+                const fp = generateFingerprint(
+                    window.location.origin,
+                    tutorialPayload.title,
+                    tutorialPayload.steps.map(s => s.instruction)
+                )
+                setTutorialFingerprint(fp)
+
+                let resumeStep = 0
+                try {
+                    const existing = await loadTutorialRecord(fp)
+                    if (existing) {
+                        // Resume from where they left off
+                        const nextIncomplete = existing.steps.findIndex(s => !s.completed)
+                        resumeStep = nextIncomplete >= 0 ? nextIncomplete : 0
+                    } else {
+                        // Check for similar tutorial
+                        const match = await findMatchingTutorial(window.location.origin, userMessage)
+                        if (match && match.completedAt) {
+                            setMessages(prev => [...prev, { sender: 'bot', text: `You've completed a similar tutorial ("${match.title}") before. Starting fresh but building on what you know!` }])
+                        }
+                    }
+
+                    // Save new record
+                    const record: TutorialRecord = {
+                        fingerprint: fp,
+                        origin: window.location.origin,
+                        title: tutorialPayload.title,
+                        query: userMessage,
+                        steps: tutorialPayload.steps.map(s => ({ instruction: s.instruction, completed: false })),
+                        startedAt: Date.now(),
+                        lastAccessedAt: Date.now(),
+                        currentStepIndex: resumeStep,
+                    }
+                    await saveTutorialRecord(record)
+                } catch (err) {
+                    console.warn('Site Tutor: memory error', err)
+                }
+
+                setMode('tutorial')
+                setTutorial(tutorialPayload)
+                setCurrentTutorialStep(resumeStep)
+                setHighlights(buildHighlightsFromSteps(tutorialPayload.steps, data.highlights))
+                setMessages(prev => [...prev, { sender: 'bot', text: resumeStep > 0 ? `Resuming tutorial from step ${resumeStep + 1}.` : 'Starting step-by-step tutorial. Use Next to move through each step.' }])
+            } else {
+                setMessages(prev => [...prev, { sender: 'bot', text: data.text }])
+
+                // Set highlights
+                if (data.highlights && data.highlights.length > 0) {
+                    setHighlights(data.highlights)
+                    console.log('Site Tutor: Received highlights:', data.highlights)
+                }
             }
 
             // Handle automation actions
             if (data.automation) {
                 const automation: AutomationAction = data.automation
-                if (automation.type === 'lux' && automation.taskId) {
-                    // Trigger LUX automation
-                    handleLuxAutomation(userMessage, data.sessionId || sessionId)
-                } else if (automation.type === 'navigate' && automation.url) {
+                if (automation.type === 'navigate' && automation.url) {
                     // Give user a moment to read the message, then navigate
                     setTimeout(() => {
                         window.location.href = automation.url!
@@ -403,134 +694,6 @@ const Chatbot: React.FC = () => {
         }
     }
 
-    const handleLuxAutomation = async (userMessage: string, currentSessionId: string | null) => {
-        if (!currentSessionId) {
-            console.error('No session ID available for LUX automation')
-            setMessages(prev => [...prev, { sender: 'bot', text: 'Error: Session not initialized' }])
-            return
-        }
-
-        try {
-            // Extract user intent from "I give up on X" pattern
-            const intent = userMessage.replace(/i give up on/i, '').trim() ||
-                          userMessage.replace(/just do it for me/i, 'this task').trim() ||
-                          userMessage.replace(/you do it/i, 'this task').trim() ||
-                          userMessage.replace(/i give up/i, 'this task').trim()
-
-            console.log('[LUX] Starting automation for intent:', intent)
-
-            // Show automation starting message
-            setMessages(prev => [...prev, {
-                sender: 'bot',
-                text: `🤖 Starting automated execution... I'll take control of your computer to complete: ${intent}`
-            }])
-
-            setAutomationStatus('running')
-            setAutomationProgress([])
-
-            // Call automate endpoint
-            const response = await fetch('http://localhost:8000/automate', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    sessionId: currentSessionId,
-                    userIntent: intent
-                })
-            })
-
-            if (!response.ok) {
-                throw new Error(`Automation request failed: ${response.statusText}`)
-            }
-
-            const data = await response.json()
-            console.log('[LUX] Automation started:', data)
-
-            // Connect to SSE stream
-            const eventSource = new EventSource(`http://localhost:8000${data.streamUrl}`)
-            setLuxEventSource(eventSource)
-
-            eventSource.addEventListener('task_generated', (e: Event) => {
-                const taskData = JSON.parse((e as MessageEvent).data)
-                console.log('[LUX] Task generated:', taskData)
-                setMessages(prev => [...prev, {
-                    sender: 'bot',
-                    text: `📋 Task Plan:\n${taskData.task}\n\nSteps:\n${taskData.todos.map((t: string, i: number) => `${i + 1}. ${t}`).join('\n')}`
-                }])
-            })
-
-            eventSource.addEventListener('step', (e: Event) => {
-                const stepData = JSON.parse((e as MessageEvent).data)
-                console.log('[LUX] Step:', stepData)
-                setAutomationProgress(prev => [...prev, `Step ${stepData.step}: ${stepData.description}`])
-            })
-
-            eventSource.addEventListener('action', (e: Event) => {
-                const actionData = JSON.parse((e as MessageEvent).data)
-                console.log('[LUX] Action:', actionData)
-                setAutomationProgress(prev => [...prev, `Action: ${actionData.actions}`])
-            })
-
-            eventSource.addEventListener('retry', (e: Event) => {
-                const retryData = JSON.parse((e as MessageEvent).data)
-                console.log('[LUX] Retry:', retryData)
-                setMessages(prev => [...prev, {
-                    sender: 'bot',
-                    text: `🔄 Retrying (attempt ${retryData.attempt}): ${retryData.reason}`
-                }])
-            })
-
-            eventSource.addEventListener('error', (e: Event) => {
-                const errorData = JSON.parse((e as MessageEvent).data)
-                console.error('[LUX] Error:', errorData)
-                setAutomationStatus('error')
-                setMessages(prev => [...prev, {
-                    sender: 'bot',
-                    text: `❌ Error during automation: ${errorData.error}`
-                }])
-                eventSource.close()
-                setLuxEventSource(null)
-            })
-
-            eventSource.addEventListener('complete', (e: Event) => {
-                const completeData = JSON.parse((e as MessageEvent).data)
-                console.log('[LUX] Complete:', completeData)
-                setAutomationStatus(completeData.success ? 'success' : 'error')
-                setMessages(prev => [...prev, {
-                    sender: 'bot',
-                    text: completeData.success
-                        ? `✅ Automation completed successfully!\n\n${completeData.summary}\n\n[View detailed report](http://localhost:8000${completeData.htmlReport})`
-                        : `❌ Automation failed: ${completeData.summary}`
-                }])
-                eventSource.close()
-                setLuxEventSource(null)
-            })
-
-            eventSource.addEventListener('done', () => {
-                console.log('[LUX] Stream done')
-                eventSource.close()
-                setLuxEventSource(null)
-            })
-
-            eventSource.onerror = (error) => {
-                console.error('[LUX] SSE Error:', error)
-                setAutomationStatus('error')
-                setMessages(prev => [...prev, {
-                    sender: 'bot',
-                    text: '❌ Lost connection to automation stream'
-                }])
-                eventSource.close()
-                setLuxEventSource(null)
-            }
-
-        } catch (error) {
-            console.error('[LUX] Automation error:', error)
-            setAutomationStatus('error')
-            setMessages(prev => [...prev, {
-                sender: 'bot',
-                text: `❌ Failed to start automation: ${error}`
-            }])
-        }
-    }
 
     return (
         <>
@@ -539,11 +702,11 @@ const Chatbot: React.FC = () => {
                 currentStepIndex={mode === 'tutorial' ? currentTutorialStep : undefined}
             />
 
-            <div className="fixed bottom-6 right-6 z-[99999] font-sans text-gray-800 antialiased">
+            <div className="fixed bottom-6 right-6 z-[99999] font-sans text-gray-800 antialiased pointer-events-auto">
                 <AnimatePresence>
                     {isOpen && (
                         <motion.div
-                            className="chat-container"
+                            className="chat-container pointer-events-auto"
                             initial={{ opacity: 0, scale: 0.8, y: 20 }}
                             animate={{ opacity: 1, scale: 1, y: 0 }}
                             exit={{ opacity: 0, scale: 0.8, y: 20 }}
@@ -568,7 +731,13 @@ const Chatbot: React.FC = () => {
                                     <TutorialController
                                         tutorial={tutorial}
                                         initialStepIndex={currentTutorialStep}
-                                        onStepChange={setCurrentTutorialStep}
+                                        onStepChange={(index) => {
+                                            // Mark previous step as completed when advancing
+                                            if (index > currentTutorialStep && tutorialFingerprint) {
+                                                markStepCompleted(tutorialFingerprint, currentTutorialStep).catch(() => {})
+                                            }
+                                            setCurrentTutorialStep(index)
+                                        }}
                                         onComplete={handleTutorialComplete}
                                         onClose={handleReset}
                                     />
@@ -580,7 +749,10 @@ const Chatbot: React.FC = () => {
                                                     key={idx}
                                                     className={`message ${msg.sender === 'user' ? 'message-user' : 'message-bot'}`}
                                                 >
-                                                    {msg.text}
+                                                    <div
+                                                        className="message-content"
+                                                        dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.text) }}
+                                                    />
                                                 </div>
                                             ))}
                                             {automationProgress.length > 0 && (
@@ -600,7 +772,9 @@ const Chatbot: React.FC = () => {
                                                 value={input}
                                                 onChange={(e) => setInput(e.target.value)}
                                                 onKeyDown={(e) => {
+                                                    e.stopPropagation()
                                                     if (e.key === 'Enter' && !loading) {
+                                                        e.preventDefault()
                                                         handleSend()
                                                     }
                                                 }}
@@ -616,16 +790,6 @@ const Chatbot: React.FC = () => {
                                             >
                                                 {loading ? <Loader2 size={18} className="animate-spin" /> : <Send size={18} />}
                                             </button>
-                                            {mode === 'lux' && (
-                                                <button
-                                                    onClick={handleReset}
-                                                    className="chat-reset-button"
-                                                    aria-label="Reset chat"
-                                                    title="Reset chat"
-                                                >
-                                                    <RotateCcw size={16} />
-                                                </button>
-                                            )}
                                         </div>
                                     </>
                                 )}
@@ -636,7 +800,7 @@ const Chatbot: React.FC = () => {
 
                 {!isOpen && (
                     <motion.button
-                        className="chat-fab"
+                        className="chat-fab pointer-events-auto"
                         onClick={() => setIsOpen(true)}
                         initial={{ scale: 0 }}
                         animate={{ scale: 1 }}

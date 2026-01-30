@@ -1,15 +1,18 @@
 import type { TutorialStep } from '../types/tutorial'
+import type { ElementIndexer } from './elementIndexer'
 
 type MatchHandler = () => void
 
-type WatchOptions = {
-    timeoutMs?: number
+export type WatchOptions = {
+    hintDelayMs?: number
     onMatch: MatchHandler
-    onTimeout?: () => void
+    onHintReady?: () => void
 }
 
-const DEFAULT_TIMEOUT = 20000
+const DEFAULT_HINT_DELAY = 15000
 const NAVIGATION_EVENT = 'siteTutor:navigation'
+const DEBOUNCE_MS = 200
+const PAGE_STATE_INTERVAL = 2000
 
 const ensureHistoryEventsPatched = () => {
     const globalWindow = window as typeof window & { __siteTutorHistoryPatched?: boolean }
@@ -31,8 +34,12 @@ const ensureHistoryEventsPatched = () => {
     globalWindow.__siteTutorHistoryPatched = true
 }
 
+const getIndexer = (): ElementIndexer | undefined => {
+    return (window as typeof window & { __siteTutorElementIndexer?: ElementIndexer }).__siteTutorElementIndexer
+}
+
 const elementMatchesSelector = (element: Element | null, selector: string): boolean => {
-    if (!element) return false
+    if (!element || !selector) return false
     try {
         if (element.matches(selector)) return true
         const closest = element.closest(selector)
@@ -43,85 +50,58 @@ const elementMatchesSelector = (element: Element | null, selector: string): bool
     return false
 }
 
-// Try to find an element using various fallback strategies
-const findElementWithFallback = (selector: string): Element | null => {
+// Resolve element by index first, then selector fallback
+const resolveElement = (step: TutorialStep): Element | null => {
+    // Primary: element index
+    if (step.elementIndex != null) {
+        const indexer = getIndexer()
+        if (indexer) {
+            const el = indexer.getElement(step.elementIndex)
+            if (el) return el
+        }
+    }
+
+    // Fallback: CSS selector
+    if (!step.selector) return null
     try {
-        // Try direct query first
-        const matches = document.querySelectorAll(selector)
-        if (matches.length > 0) {
-            // Return first visible element
-            for (const el of Array.from(matches)) {
-                const rect = el.getBoundingClientRect()
-                const style = window.getComputedStyle(el)
-                if (rect.width > 0 && rect.height > 0 &&
-                    style.display !== 'none' &&
-                    style.visibility !== 'hidden' &&
-                    style.opacity !== '0') {
-                    return el
-                }
+        const matches = document.querySelectorAll(step.selector)
+        for (const el of Array.from(matches)) {
+            const rect = el.getBoundingClientRect()
+            const style = window.getComputedStyle(el)
+            if (rect.width > 0 && rect.height > 0 &&
+                style.display !== 'none' &&
+                style.visibility !== 'hidden' &&
+                style.opacity !== '0') {
+                return el
             }
         }
     } catch {
-        // Invalid selector, continue to fallbacks
+        // Invalid selector
     }
 
-    // Try simplified selector (remove pseudo-selectors)
-    if (selector.includes(':') || selector.includes('::')) {
-        const simplifiedSelector = selector.split(/[:]/)[0]
+    // Simplified selector
+    if (step.selector.includes(':') || step.selector.includes('::')) {
+        const simplified = step.selector.split(/[:]/)[0]
         try {
-            const matches = document.querySelectorAll(simplifiedSelector)
-            if (matches.length > 0) {
-                for (const el of Array.from(matches)) {
-                    const rect = el.getBoundingClientRect()
-                    const style = window.getComputedStyle(el)
-                    if (rect.width > 0 && rect.height > 0 &&
-                        style.display !== 'none' &&
-                        style.visibility !== 'hidden' &&
-                        style.opacity !== '0') {
-                        return el
-                    }
-                }
-            }
-        } catch {
-            // Continue to next fallback
-        }
-    }
-
-    // If looking for an input (checkbox/radio), also search for toggle switches
-    if (selector.includes('input#') || selector.includes('input[')) {
-        try {
-            // Modern UIs often use toggle switches instead of checkboxes
-            const toggles = document.querySelectorAll('button[aria-pressed], [role="switch"]')
-            for (const el of Array.from(toggles)) {
-                const rect = el.getBoundingClientRect()
-                const style = window.getComputedStyle(el)
-                if (rect.width > 0 && rect.height > 0 &&
-                    style.display !== 'none' &&
-                    style.visibility !== 'hidden' &&
-                    style.opacity !== '0') {
-                    // Return first visible toggle switch as a fallback
-                    console.log('Site Tutor: Using toggle switch as fallback for input selector', { selector, toggle: el })
-                    return el
-                }
-            }
-        } catch {
-            // Continue
-        }
+            const matches = document.querySelectorAll(simplified)
+            if (matches.length > 0) return matches[0]
+        } catch { /* ignore */ }
     }
 
     return null
 }
 
 export class ActionVerifier {
-    private timeoutId: ReturnType<typeof window.setTimeout> | null = null
+    private hintTimeoutId: ReturnType<typeof window.setTimeout> | null = null
     private intervalId: ReturnType<typeof window.setInterval> | null = null
     private cleanupFns: Array<() => void> = []
     private initialUrl = ''
+    private matched = false
 
     stopWatching(): void {
-        if (this.timeoutId) {
-            window.clearTimeout(this.timeoutId)
-            this.timeoutId = null
+        if (this.hintTimeoutId) {
+            window.clearTimeout(this.hintTimeoutId)
+            this.hintTimeoutId = null
         }
         if (this.intervalId) {
             window.clearInterval(this.intervalId)
@@ -129,84 +109,102 @@ export class ActionVerifier {
         }
         this.cleanupFns.forEach(fn => fn())
         this.cleanupFns = []
+        this.matched = false
     }
 
     watchStep(step: TutorialStep, options: WatchOptions): void {
         this.stopWatching()
-        const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT
+        this.matched = false
 
-        if (timeoutMs > 0) {
-            this.timeoutId = window.setTimeout(() => {
-                this.stopWatching()
-                options.onTimeout?.()
-            }, timeoutMs)
+        const hintDelayMs = options.hintDelayMs ?? DEFAULT_HINT_DELAY
+
+        // Hint timer — fires once but does NOT stop watching
+        if (hintDelayMs > 0 && options.onHintReady) {
+            this.hintTimeoutId = window.setTimeout(() => {
+                if (!this.matched) {
+                    options.onHintReady?.()
+                }
+            }, hintDelayMs)
         }
 
         const handleMatch = () => {
+            if (this.matched) return
+            this.matched = true
             this.stopWatching()
             options.onMatch()
         }
 
         switch (step.actionType) {
             case 'click':
-                this.attachClickListener(step.selector, handleMatch, step.expectedResult)
+                this.attachClickListener(step, handleMatch, step.expectedResult)
                 break
             case 'input':
-                this.attachInputListener(step.selector, handleMatch, step.expectedResult)
+                this.attachInputListener(step, handleMatch, step.expectedResult)
                 break
             case 'navigate':
                 this.attachNavigationListener(handleMatch, step.expectedResult)
                 break
             case 'wait':
             default: {
-                // Wait steps resolve automatically but still honor timeout
                 const autoComplete = window.setTimeout(handleMatch, 600)
                 this.cleanupFns.push(() => window.clearTimeout(autoComplete))
                 break
             }
         }
+
+        // Attach outcome observer for expectedResult (MutationObserver-based)
+        if (step.expectedResult) {
+            this.attachOutcomeObserver(step.expectedResult, handleMatch)
+        }
+
+        // Periodic page state check (URL, title, headings) — no API calls
+        this.attachPageStateChecker(step.expectedResult, handleMatch)
     }
 
-    private attachClickListener(selector: string, handler: MatchHandler, expectedResult?: string) {
+    private attachClickListener(step: TutorialStep, handler: MatchHandler, expectedResult?: string) {
         let clickDetected = false
+        const initialUrl = window.location.href
 
-        // Try to find the target element to validate selector works
-        const targetExists = findElementWithFallback(selector)
-        if (!targetExists) {
-            console.warn('Site Tutor: Target element not found for click listener', { selector })
+        const targetElement = resolveElement(step)
+        if (!targetElement) {
+            console.warn('Site Tutor: Target element not found for click listener', { selector: step.selector, elementIndex: step.elementIndex })
         }
 
         const listener = (event: MouseEvent) => {
+            if (this.matched) return
             if (!(event.target instanceof Element)) return
 
-            // Try exact match first
-            let matches = elementMatchesSelector(event.target, selector)
+            let matches = false
 
-            // If selector doesn't match, check if clicked element could reasonably be what we're looking for
-            if (!matches && targetExists) {
-                // Check if clicked element is the target or contains it
-                matches = event.target === targetExists || event.target.contains(targetExists) || targetExists.contains(event.target)
+            // Primary: match against indexed element
+            if (targetElement) {
+                matches = event.target === targetElement ||
+                          event.target.contains(targetElement) ||
+                          targetElement.contains(event.target)
+            }
+
+            // Fallback: CSS selector
+            if (!matches && step.selector) {
+                matches = elementMatchesSelector(event.target, step.selector)
             }
 
             if (!matches) return
 
-            console.log('Site Tutor: Click detected on target element', { selector })
+            console.log('Site Tutor: Click detected on target element')
 
-            // If expectedResult is provided, verify it before completing step
             if (expectedResult) {
                 clickDetected = true
-                // Wait a bit for DOM to update after click, then check
                 setTimeout(() => {
-                    const resultMatches = this.verifyExpectedResult(expectedResult)
-                    if (resultMatches) {
-                        console.log('Site Tutor: Click action verified - expected result found', { expectedResult })
+                    if (this.matched) return
+                    if (this.verifyExpectedResult(expectedResult)) {
                         handler()
-                    } else {
-                        console.log('Site Tutor: Click detected but expected result not found yet', { expectedResult })
+                        return
+                    }
+                    if (window.location.href !== initialUrl) {
+                        handler()
                     }
                 }, 300)
             } else {
-                // No expected result - complete immediately on click
                 handler()
             }
         }
@@ -214,35 +212,36 @@ export class ActionVerifier {
         document.addEventListener('click', listener, true)
         this.cleanupFns.push(() => document.removeEventListener('click', listener, true))
 
-        // If expected result is specified, also periodically check for it after click
         if (expectedResult) {
             const checkInterval = window.setInterval(() => {
-                if (clickDetected && this.verifyExpectedResult(expectedResult)) {
-                    console.log('Site Tutor: Expected result found via periodic check', { expectedResult })
+                if (this.matched) return
+                if (!clickDetected) return
+                if (this.verifyExpectedResult(expectedResult) || window.location.href !== initialUrl) {
                     handler()
                 }
             }, 500)
-
             this.cleanupFns.push(() => window.clearInterval(checkInterval))
         }
     }
 
-    private attachInputListener(selector: string, handler: MatchHandler, expectedResult?: string) {
-        // Try to find the target element to validate selector works
-        const targetExists = findElementWithFallback(selector)
-        if (!targetExists) {
-            console.warn('Site Tutor: Target element not found for input listener', { selector })
+    private attachInputListener(step: TutorialStep, handler: MatchHandler, expectedResult?: string) {
+        const targetElement = resolveElement(step)
+        if (!targetElement) {
+            console.warn('Site Tutor: Target element not found for input listener', { selector: step.selector, elementIndex: step.elementIndex })
         }
 
         const listener = (event: Event) => {
+            if (this.matched) return
             if (!(event.target instanceof Element)) return
 
-            // Try exact match first
-            let matches = elementMatchesSelector(event.target, selector)
+            let matches = false
 
-            // If selector doesn't match, check if input element could reasonably be what we're looking for
-            if (!matches && targetExists) {
-                matches = event.target === targetExists
+            if (targetElement) {
+                matches = event.target === targetElement
+            }
+
+            if (!matches && step.selector) {
+                matches = elementMatchesSelector(event.target, step.selector)
             }
 
             if (!matches) return
@@ -250,29 +249,16 @@ export class ActionVerifier {
             if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) {
                 if (event.target.value.trim().length === 0) return
 
-                console.log('Site Tutor: Input detected', {
-                    selector,
-                    value: event.target.value,
-                    expectedResult
-                })
-
-                // If expectedResult is provided, verify the input value
                 if (expectedResult) {
                     const inputValue = event.target.value.toLowerCase()
                     const expectedLower = expectedResult.toLowerCase()
-
                     if (inputValue.includes(expectedLower) || expectedLower.includes(inputValue)) {
-                        console.log('Site Tutor: Input matched expected result', { expectedResult })
                         handler()
-                    } else {
-                        console.log('Site Tutor: Input detected but does not match expected result yet')
                     }
                 } else {
-                    // No expected result - complete on any non-empty input
                     handler()
                 }
             } else {
-                // Non-text input element (checkbox, radio, etc)
                 handler()
             }
         }
@@ -290,39 +276,19 @@ export class ActionVerifier {
         ensureHistoryEventsPatched()
 
         const checkUrlChange = () => {
+            if (this.matched) return
             const currentUrl = window.location.href
-
-            // Check if URL changed
             if (currentUrl === this.initialUrl) return
 
-            // If expectedResult is provided, validate against it
             if (expectedResult) {
-                // Try to match as URL pattern
-                const urlMatches = this.urlMatchesPattern(currentUrl, expectedResult)
-
-                if (urlMatches) {
-                    console.log('Site Tutor: Navigation matched expected URL pattern', {
-                        current: currentUrl,
-                        expected: expectedResult
-                    })
+                if (this.urlMatchesPattern(currentUrl, expectedResult)) {
                     handler()
                     return
                 }
-
-                // If URL doesn't match, check if expected element appears in DOM
-                const elementAppeared = this.checkExpectedElementAppears(expectedResult)
-                if (elementAppeared) {
-                    console.log('Site Tutor: Navigation matched - expected element appeared', {
-                        expectedResult
-                    })
+                if (this.checkExpectedElementAppears(expectedResult)) {
                     handler()
                 }
             } else {
-                // No expected result - just verify URL changed
-                console.log('Site Tutor: Navigation detected (URL changed)', {
-                    from: this.initialUrl,
-                    to: currentUrl
-                })
                 handler()
             }
         }
@@ -343,24 +309,103 @@ export class ActionVerifier {
         this.intervalId = window.setInterval(checkUrlChange, 750)
     }
 
-    private urlMatchesPattern(currentUrl: string, pattern: string): boolean {
-        // Check for exact match
-        if (currentUrl === pattern) return true
+    private attachOutcomeObserver(expectedResult: string, handler: MatchHandler) {
+        // Check immediately in case outcome already exists
+        if (this.verifyExpectedResult(expectedResult)) {
+            // Defer to avoid sync issues
+            setTimeout(() => {
+                if (!this.matched) handler()
+            }, 0)
+            return
+        }
 
-        // Check if pattern is contained in URL
+        let debounceTimer: ReturnType<typeof setTimeout> | null = null
+
+        const observer = new MutationObserver(() => {
+            if (this.matched) return
+            if (debounceTimer) clearTimeout(debounceTimer)
+            debounceTimer = setTimeout(() => {
+                if (this.matched) return
+                if (this.verifyExpectedResult(expectedResult)) {
+                    handler()
+                }
+            }, DEBOUNCE_MS)
+        })
+
+        observer.observe(document.body, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            characterData: true,
+        })
+
+        this.cleanupFns.push(() => {
+            observer.disconnect()
+            if (debounceTimer) clearTimeout(debounceTimer)
+        })
+    }
+
+    private attachPageStateChecker(expectedResult: string | undefined, handler: MatchHandler) {
+        let lastUrl = window.location.href
+        let lastTitle = document.title
+
+        const check = () => {
+            if (this.matched) return
+
+            const currentUrl = window.location.href
+            const currentTitle = document.title
+
+            // Detect URL change
+            if (currentUrl !== lastUrl) {
+                lastUrl = currentUrl
+                if (expectedResult && this.urlMatchesPattern(currentUrl, expectedResult)) {
+                    handler()
+                    return
+                }
+            }
+
+            // Detect title change
+            if (currentTitle !== lastTitle) {
+                lastTitle = currentTitle
+                if (expectedResult) {
+                    const expectedLower = expectedResult.toLowerCase()
+                    if (currentTitle.toLowerCase().includes(expectedLower)) {
+                        handler()
+                        return
+                    }
+                }
+            }
+
+            // Check headings for expectedResult
+            if (expectedResult) {
+                const headings = document.querySelectorAll('h1, h2, h3')
+                for (const h of Array.from(headings)) {
+                    const text = h.textContent?.toLowerCase() || ''
+                    if (text.includes(expectedResult.toLowerCase())) {
+                        handler()
+                        return
+                    }
+                }
+            }
+        }
+
+        const interval = window.setInterval(check, PAGE_STATE_INTERVAL)
+        this.cleanupFns.push(() => window.clearInterval(interval))
+    }
+
+    private urlMatchesPattern(currentUrl: string, pattern: string): boolean {
+        if (currentUrl === pattern) return true
         if (currentUrl.includes(pattern)) return true
 
-        // Check if pattern matches path (ignore query params and hash)
         const currentPath = new URL(currentUrl).pathname
         const patternLower = pattern.toLowerCase()
         if (currentPath.toLowerCase().includes(patternLower)) return true
 
-        // Check if pattern is a regex-like pattern
         try {
             const regex = new RegExp(pattern)
             if (regex.test(currentUrl)) return true
         } catch {
-            // Not a valid regex, ignore
+            // Not a valid regex
         }
 
         return false
@@ -376,17 +421,14 @@ export class ActionVerifier {
     }
 
     private verifyExpectedResult(expectedResult: string): boolean {
-        // Try URL matching first
         if (this.urlMatchesPattern(window.location.href, expectedResult)) {
             return true
         }
 
-        // Try DOM selector matching
         if (this.checkExpectedElementAppears(expectedResult)) {
             return true
         }
 
-        // Try checking if expected text appears in document
         const bodyText = document.body.textContent?.toLowerCase() || ''
         const expectedLower = expectedResult.toLowerCase()
         if (bodyText.includes(expectedLower)) {

@@ -7,6 +7,7 @@ export interface TutorialStep {
     actionType: TutorialActionType
     expectedResult?: string
     hint?: string
+    elementIndex?: number
 }
 
 export interface TutorialPayload {

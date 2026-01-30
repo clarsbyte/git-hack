@@ -1,9 +1,11 @@
 import React, { useCallback, useEffect, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
+import type { ElementIndexer } from '../utils/elementIndexer'
 
 interface Highlight {
     selector: string
     explanation: string
+    elementIndex?: number
 }
 
 interface OverlayProps {
@@ -55,6 +57,22 @@ const findElementByExplanation = (explanation: string, selector: string): Elemen
     const quotedMatches = explanation.match(/['"]([^'"]+)['"]/g)
     if (quotedMatches) {
         strongKeywords.push(...quotedMatches.map(m => m.replace(/['"]/g, '').toLowerCase()))
+    }
+
+    if (strongKeywords.length === 0) {
+        const stopWords = new Set([
+            'click', 'button', 'buttons', 'press', 'select', 'choose', 'field', 'input',
+            'enter', 'type', 'the', 'a', 'an', 'to', 'for', 'on', 'of', 'and', 'or',
+            'with', 'this', 'that', 'it', 'its', 'your', 'you', 'from', 'in', 'new'
+        ])
+        const tokens = lowerExplanation.match(/[a-z0-9]+/g) || []
+        const tokenSet = new Set<string>()
+        tokens.forEach(token => {
+            if (token.length >= 3 && !stopWords.has(token)) {
+                tokenSet.add(token)
+            }
+        })
+        keywords.push(...Array.from(tokenSet))
     }
 
     // Common field name patterns
@@ -456,32 +474,50 @@ const Overlay: React.FC<OverlayProps> = ({ highlights, currentStepIndex }) => {
                 : []
             : highlights
 
+        // Get shared element indexer
+        const indexer = (window as typeof window & { __siteTutorElementIndexer?: ElementIndexer }).__siteTutorElementIndexer
+
         relevantHighlights.forEach(h => {
             try {
-                const matches = document.querySelectorAll(h.selector)
+                let el: Element | null = null
 
-                if (matches.length > 0) {
-                    matches.forEach((el, idx) => {
-                        // Find the best element to highlight (container for inputs, element itself for buttons/headings)
-                        const targetElement = findContainerElement(el)
-                        const rect = targetElement.getBoundingClientRect()
-                        const style = window.getComputedStyle(targetElement)
-                        if (rect.width > 0 && rect.height > 0 &&
-                            style.display !== 'none' &&
-                            style.visibility !== 'hidden' &&
-                            style.opacity !== '0') {
-                            newExpandedHighlights.push({
-                                highlight: {
-                                    ...h,
-                                    explanation: matches.length > 1 ? `${h.explanation} (${idx + 1})` : h.explanation
-                                },
-                                rect
-                            })
-                        }
-                    })
-                } else {
-                    let el: Element | null = null
+                // Primary path: look up by element index
+                if (h.elementIndex != null && indexer) {
+                    el = indexer.getElement(h.elementIndex)
+                    if (el) {
+                        console.log(`Site Tutor: Found element by index ${h.elementIndex}`, { element: el })
+                    }
+                }
 
+                // Fallback: CSS selector matching
+                if (!el && h.selector && h.selector.trim()) {
+                    const matches = document.querySelectorAll(h.selector)
+                    if (matches.length > 0) {
+                        const isGuidedStep = typeof currentStepIndex === 'number'
+                        const elements = isGuidedStep ? [matches[0]] : Array.from(matches)
+                        elements.forEach((matchEl, idx) => {
+                            const targetElement = findContainerElement(matchEl)
+                            const rect = targetElement.getBoundingClientRect()
+                            const style = window.getComputedStyle(targetElement)
+                            if (rect.width > 0 && rect.height > 0 &&
+                                style.display !== 'none' &&
+                                style.visibility !== 'hidden' &&
+                                style.opacity !== '0') {
+                                newExpandedHighlights.push({
+                                    highlight: {
+                                        ...h,
+                                        explanation: (!isGuidedStep && matches.length > 1)
+                                            ? `${h.explanation} (${idx + 1})`
+                                            : h.explanation
+                                    },
+                                    rect
+                                })
+                            }
+                        })
+                        return // Already added highlights via selector
+                    }
+
+                    // Simplified selector fallback
                     if (h.selector.includes(':') || h.selector.includes('::')) {
                         const simplifiedSelector = h.selector.split(/[:]/)[0]
                         const simplifiedMatches = document.querySelectorAll(simplifiedSelector)
@@ -489,57 +525,43 @@ const Overlay: React.FC<OverlayProps> = ({ highlights, currentStepIndex }) => {
                             el = simplifiedMatches[0]
                         }
                     }
+                }
 
-                    if (!el && (h.explanation.toLowerCase().includes('button') || h.explanation.toLowerCase().includes('btn'))) {
+                // Explanation-based fallback
+                if (!el) {
+                    if (h.explanation.toLowerCase().includes('button') || h.explanation.toLowerCase().includes('btn')) {
                         const buttonElements = findButtonLikeElements(h.explanation)
                         if (buttonElements.length > 0) {
                             el = buttonElements[0]
-                            console.log(`Site Tutor: Using fallback button finder for: ${h.explanation}`, {
-                                foundElement: el,
-                                totalButtonsFound: buttonElements.length
-                            })
                         }
-                    }
-
-                    if (!el && (h.explanation.toLowerCase().includes('input') ||
-                               h.explanation.toLowerCase().includes('field') ||
-                               h.explanation.toLowerCase().includes('enter') ||
-                               h.explanation.toLowerCase().includes('check') ||
-                               h.explanation.toLowerCase().includes('select') ||
-                               h.explanation.toLowerCase().includes('choose') ||
-                               h.explanation.toLowerCase().includes('public') ||
-                               h.explanation.toLowerCase().includes('private') ||
-                               h.explanation.toLowerCase().includes('readme'))) {
-                        const element = findElementByExplanation(h.explanation, h.selector)
-                        if (element) {
-                            el = element
-                            console.log(`Site Tutor: Using fallback element finder for: ${h.explanation}`, {
-                                foundElement: el
-                            })
-                        }
-                    }
-
-                    if (el) {
-                        // Find the best element to highlight (container for inputs, element itself for buttons/headings)
-                        const targetElement = findContainerElement(el)
-                        const rect = targetElement.getBoundingClientRect()
-                        const style = window.getComputedStyle(targetElement)
-                        if (rect.width > 0 && rect.height > 0 &&
-                            style.display !== 'none' &&
-                            style.visibility !== 'hidden') {
-                            newExpandedHighlights.push({ highlight: h, rect })
-                        }
-                    } else {
-                        console.warn(`Site Tutor: Could not find element for selector: ${h.selector}`, {
-                            explanation: h.explanation,
-                            selector: h.selector,
-                            pageUrl: window.location.href,
-                            currentStepIndex
-                        })
                     }
                 }
+
+                if (!el) {
+                    const found = findElementByExplanation(h.explanation, h.selector || '')
+                    if (found) el = found
+                }
+
+                if (el) {
+                    const targetElement = findContainerElement(el)
+                    const rect = targetElement.getBoundingClientRect()
+                    const style = window.getComputedStyle(targetElement)
+                    if (rect.width > 0 && rect.height > 0 &&
+                        style.display !== 'none' &&
+                        style.visibility !== 'hidden') {
+                        newExpandedHighlights.push({ highlight: h, rect })
+                    }
+                } else {
+                    console.warn(`Site Tutor: Could not find element`, {
+                        explanation: h.explanation,
+                        selector: h.selector,
+                        elementIndex: h.elementIndex,
+                        pageUrl: window.location.href,
+                        currentStepIndex
+                    })
+                }
             } catch (e) {
-                console.error(`Site Tutor: Invalid selector ${h.selector}`, e)
+                console.error(`Site Tutor: Error finding element`, e)
             }
         })
 
@@ -569,13 +591,21 @@ const Overlay: React.FC<OverlayProps> = ({ highlights, currentStepIndex }) => {
     }, [updateRects])
 
     return (
-        <div className="fixed inset-0 pointer-events-none z-[99998] overflow-hidden">
+        <div className="fixed inset-0 pointer-events-none z-[2147483646] overflow-hidden">
             <AnimatePresence>
                 {expandedHighlights.map(({ highlight, rect }, i) => {
                     if (rect.width === 0 || rect.height === 0) return null
 
                     const isGuidedStep = typeof currentStepIndex === 'number'
                     const stepLabel = isGuidedStep ? `Step ${currentStepIndex + 1}` : null
+                    const viewportWidth = typeof window !== 'undefined' ? window.innerWidth : 0
+                    const viewportHeight = typeof window !== 'undefined' ? window.innerHeight : 0
+                    const labelMaxWidth = Math.min(360, Math.max(200, viewportWidth - 16))
+                    const labelLeft = Math.min(Math.max(8, rect.left), Math.max(8, viewportWidth - labelMaxWidth - 8))
+                    const labelTopPreferred = rect.top - 40
+                    const labelTopFallback = rect.bottom + 8
+                    const labelTop = labelTopPreferred < 8 ? labelTopFallback : labelTopPreferred
+                    const clampedLabelTop = Math.min(Math.max(8, labelTop), Math.max(8, viewportHeight - 40))
 
                     return (
                         <motion.div
@@ -583,7 +613,7 @@ const Overlay: React.FC<OverlayProps> = ({ highlights, currentStepIndex }) => {
                             initial={{ opacity: 0, scale: 0.8 }}
                             animate={{ opacity: 1, scale: 1 }}
                             exit={{ opacity: 0, scale: 0.8 }}
-                            className={`absolute border-4 border-red-500 rounded-lg shadow-[0_0_15px_rgba(239,68,68,0.5)] bg-red-500/10 box-border${isGuidedStep ? ' animate-pulse' : ''}`}
+                            className={`absolute border-4 border-red-500 rounded-lg shadow-[0_0_25px_rgba(239,68,68,0.7)] outline outline-2 outline-red-300 bg-red-500/15 box-border${isGuidedStep ? ' animate-pulse' : ''}`}
                             style={{
                                 top: rect.top,
                                 left: rect.left,
@@ -591,7 +621,20 @@ const Overlay: React.FC<OverlayProps> = ({ highlights, currentStepIndex }) => {
                                 height: rect.height,
                             }}
                         >
-                            <div className="absolute -top-10 left-0 bg-red-500 text-white font-bold px-3 py-1 rounded shadow-md whitespace-nowrap text-sm z-50 pointer-events-auto flex items-center gap-2">
+                            <div
+                                className="absolute bg-red-500 text-white font-bold px-3 py-1 rounded shadow-md text-sm z-50 pointer-events-auto flex items-center gap-2"
+                                style={{
+                                    top: clampedLabelTop - rect.top,
+                                    left: labelLeft - rect.left,
+                                    maxWidth: labelMaxWidth,
+                                    overflow: 'hidden',
+                                    textOverflow: 'ellipsis',
+                                    display: '-webkit-box',
+                                    WebkitLineClamp: 2,
+                                    WebkitBoxOrient: 'vertical',
+                                    whiteSpace: 'normal',
+                                }}
+                            >
                                 {stepLabel && <span className="text-[10px] uppercase tracking-wide text-white/80">{stepLabel}</span>}
                                 <span>{highlight.explanation}</span>
                             </div>

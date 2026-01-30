@@ -5,7 +5,7 @@ export interface SimplifiedNode {
     children?: SimplifiedNode[]
 }
 
-const IGNORED_TAGS = new Set(['script', 'style', 'meta', 'link', 'noscript', 'template'])
+export const IGNORED_TAGS = new Set(['script', 'style', 'meta', 'link', 'noscript', 'template'])
 const SEMANTIC_TAGS = new Set([
     'header', 'footer', 'nav', 'main', 'section', 'article', 'aside', 'form',
     'label', 'fieldset', 'legend', 'table', 'thead', 'tbody', 'tr', 'th', 'td',
@@ -20,7 +20,7 @@ const attributeAllowList = new Set([
 
 const isBrowser = typeof window !== 'undefined'
 
-const isElementHidden = (el: Element): boolean => {
+export const isElementHidden = (el: Element): boolean => {
     if (!(el instanceof HTMLElement)) return false
     if (el.hidden) return true
     if (el.getAttribute('aria-hidden') === 'true') return true

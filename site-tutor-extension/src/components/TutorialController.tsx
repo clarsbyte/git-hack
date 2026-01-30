@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AlertCircle, CheckCircle2, ChevronLeft, ChevronRight, Lightbulb, Sparkles, X } from 'lucide-react'
 import type { TutorialPayload, TutorialStep } from '../types/tutorial'
 import { ActionVerifier } from '../utils/actionVerifier'
+import type { ElementIndexer } from '../utils/elementIndexer'
 
 interface TutorialControllerProps {
     tutorial: TutorialPayload
@@ -16,12 +17,16 @@ const AUTO_ADVANCE_DELAY = 900
 const statusCopy = {
     waiting: 'Waiting for you to complete this step...',
     matched: 'Great! Moving to the next step...',
-    timeout: 'Having trouble? Use the hint below or click Next to continue.',
+    hint: 'Having trouble? Use the hint below or click Next to continue.',
+}
+
+const getIndexer = (): ElementIndexer | undefined => {
+    return (window as typeof window & { __siteTutorElementIndexer?: ElementIndexer }).__siteTutorElementIndexer
 }
 
 const TutorialController: React.FC<TutorialControllerProps> = ({ tutorial, onClose, onStepChange, onComplete, initialStepIndex = 0 }) => {
     const [currentStepIndex, setCurrentStepIndex] = useState(initialStepIndex)
-    const [status, setStatus] = useState<'waiting' | 'matched' | 'timeout'>('waiting')
+    const [status, setStatus] = useState<'waiting' | 'matched' | 'hint'>('waiting')
     const [hint, setHint] = useState<string | null>(null)
     const verifierRef = useRef(new ActionVerifier())
     const autoAdvanceTimeoutRef = useRef<ReturnType<typeof window.setTimeout> | null>(null)
@@ -125,6 +130,13 @@ const TutorialController: React.FC<TutorialControllerProps> = ({ tutorial, onClo
         setHint(null)
         setStatus('waiting')
         clearAutoAdvance()
+
+        // Re-index the page to handle DOM changes between steps
+        const indexer = getIndexer()
+        if (indexer) {
+            indexer.indexPage(document)
+        }
+
         verifierRef.current?.watchStep(activeStep, {
             onMatch: () => {
                 setStatus('matched')
@@ -133,8 +145,8 @@ const TutorialController: React.FC<TutorialControllerProps> = ({ tutorial, onClo
                     goToNextStep()
                 }, AUTO_ADVANCE_DELAY)
             },
-            onTimeout: () => {
-                setStatus('timeout')
+            onHintReady: () => {
+                setStatus('hint')
                 setHint(activeStep.hint || activeStep.expectedResult || 'Try following the on-screen instructions closely.')
             }
         })
@@ -201,7 +213,7 @@ const TutorialController: React.FC<TutorialControllerProps> = ({ tutorial, onClo
                         {activeStep.actionType.toUpperCase()}
                     </span>
                     <span style={{ color: '#d4d4d8' }}>•</span>
-                    <span style={{ color: status === 'timeout' ? '#d97706' : '#71717a' }}>
+                    <span style={{ color: status === 'hint' ? '#d97706' : '#71717a' }}>
                         {statusCopy[status]}
                     </span>
                 </div>
@@ -212,7 +224,7 @@ const TutorialController: React.FC<TutorialControllerProps> = ({ tutorial, onClo
                     </p>
                 )}
                 <div className="step-selector">
-                    Target selector: <code>{activeStep.selector}</code>
+                    Target: <code>{activeStep.elementIndex != null ? `Element #${activeStep.elementIndex}` : activeStep.selector}</code>
                 </div>
             </div>
 
