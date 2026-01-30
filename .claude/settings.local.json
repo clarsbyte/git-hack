@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run build:*)",
+      "Bash(curl:*)",
+      "Bash(git checkout:*)",
+      "Bash(npm install:*)",
+      "Bash(ls:*)",
+      "Bash(python:*)"
+    ]
+  },
+  "disabledMcpjsonServers": [
+    "washedmcp"
+  ]
+}

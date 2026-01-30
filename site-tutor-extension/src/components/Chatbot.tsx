@@ -1,7 +1,19 @@
 import React, { useState, useRef, useEffect } from 'react'
-import { MessageCircle, X, Send } from 'lucide-react'
+import { MessageCircle, X, Send, Loader2 } from 'lucide-react'
 import { motion, AnimatePresence } from 'framer-motion'
 import Overlay from './Overlay'
+import TutorialController from './TutorialController'
+import type { TutorialActionType, TutorialPayload } from '../types/tutorial'
+import { ElementIndexer } from '../utils/elementIndexer'
+import {
+    generateFingerprint,
+    saveTutorialRecord,
+    loadTutorialRecord,
+    findMatchingTutorial,
+    markStepCompleted,
+    getCompletionHistory,
+    type TutorialRecord,
+} from '../utils/tutorialMemory'
 
 interface Message {
     sender: 'user' | 'bot'
@@ -11,16 +23,304 @@ interface Message {
 interface Highlight {
     selector: string
     explanation: string
+    elementIndex?: number
 }
+
+interface AutomationAction {
+    type: string
+    url?: string
+    selector?: string
+    taskId?: string
+}
+
+const getIndexer = (): ElementIndexer => {
+    const win = window as typeof window & { __siteTutorElementIndexer?: ElementIndexer }
+    if (!win.__siteTutorElementIndexer) {
+        win.__siteTutorElementIndexer = new ElementIndexer()
+    }
+    return win.__siteTutorElementIndexer
+}
+
+const compressScreenshot = async (dataUrl: string): Promise<Blob> => {
+    return new Promise((resolve, reject) => {
+        const img = new Image()
+        img.onload = () => {
+            const canvas = document.createElement('canvas')
+            const ctx = canvas.getContext('2d')
+            if (!ctx) {
+                reject(new Error('Could not get canvas context'))
+                return
+            }
+
+            const maxWidth = 1920
+            const maxHeight = 1080
+            let width = img.width
+            let height = img.height
+
+            if (width > maxWidth || height > maxHeight) {
+                const ratio = Math.min(maxWidth / width, maxHeight / height)
+                width = Math.floor(width * ratio)
+                height = Math.floor(height * ratio)
+            }
+
+            canvas.width = width
+            canvas.height = height
+            ctx.drawImage(img, 0, 0, width, height)
+
+            canvas.toBlob(
+                (blob) => {
+                    if (blob) {
+                        resolve(blob)
+                    } else {
+                        reject(new Error('Failed to compress image'))
+                    }
+                },
+                'image/jpeg',
+                0.75
+            )
+        }
+        img.onerror = () => reject(new Error('Failed to load image'))
+        img.src = dataUrl
+    })
+}
+
+const STORAGE_KEY_PREFIX = 'siteTutorState'
+const FALLBACK_STORAGE_KEY = `${STORAGE_KEY_PREFIX}:default`
+const extractNumberedSteps = (text: string): string[] | null => {
+    const lines = text.split(/\r?\n/).map(line => line.trim())
+    const steps: string[] = []
+    let current = ''
+
+    lines.forEach(line => {
+        if (!line) return
+        const match = line.match(/^\s*\d+(?:\.|\))\s+(.*)$/)
+        if (match) {
+            if (current.length > 0) {
+                steps.push(current.trim())
+            }
+            current = match[1].trim()
+            return
+        }
+
+        if (current.length > 0) {
+            current += ` ${line}`
+        }
+    })
+
+    if (current.length > 0) {
+        steps.push(current.trim())
+    }
+
+    return steps.length >= 2 ? steps : null
+}
+
+const inferActionType = (text: string): TutorialActionType => {
+    const lower = text.toLowerCase()
+    if (lower.includes('type') || lower.includes('enter') || lower.includes('fill')) {
+        return 'input'
+    }
+    if (lower.includes('go to') || lower.includes('navigate') || lower.includes('open')) {
+        return 'navigate'
+    }
+    return 'click'
+}
+
+const buildTutorialFromSteps = (steps: string[], highlights?: Highlight[]): TutorialPayload => {
+    return {
+        title: 'Step-by-step guide',
+        steps: steps.map((instruction, index) => ({
+            stepNumber: index + 1,
+            selector: highlights?.[index]?.selector ?? '',
+            instruction,
+            actionType: inferActionType(instruction),
+            expectedResult: undefined,
+            elementIndex: highlights?.[index]?.elementIndex
+        }))
+    }
+}
+
+const buildHighlightsFromSteps = (steps: TutorialPayload['steps'], highlights?: Highlight[]): Highlight[] => {
+    return steps.map((step, index) => ({
+        selector: highlights?.[index]?.selector ?? step.selector ?? '',
+        explanation: step.instruction,
+        elementIndex: highlights?.[index]?.elementIndex ?? step.elementIndex
+    }))
+}
+
+const SESSION_STORE_KEY = `${STORAGE_KEY_PREFIX}:sessions`
+
+const escapeHtml = (text: string): string =>
+    text
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;')
+
+const applyInlineMarkdown = (text: string): string => {
+    let output = text
+    output = output.replace(/`([^`]+)`/g, '<code>$1</code>')
+    output = output.replace(/\*\*\*([^*]+)\*\*\*/g, '<strong>$1</strong>')
+    output = output.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    output = output.replace(/__([^_]+)__/g, '<strong>$1</strong>')
+    output = output.replace(/\*([^*]+)\*/g, '<em>$1</em>')
+    output = output.replace(/_([^_]+)_/g, '<em>$1</em>')
+    return output
+}
+
+const renderMarkdown = (raw: string): string => {
+    const lines = escapeHtml(raw).split(/\r?\n/)
+    let html = ''
+    let paragraph: string[] = []
+    let listType: 'ol' | 'ul' | null = null
+    let listItems: string[] = []
+
+    const flushParagraph = () => {
+        if (paragraph.length === 0) return
+        const content = paragraph.join('<br />')
+        html += `<p>${applyInlineMarkdown(content)}</p>`
+        paragraph = []
+    }
+
+    const flushList = () => {
+        if (!listType || listItems.length === 0) return
+        const itemsHtml = listItems.map(item => `<li>${applyInlineMarkdown(item)}</li>`).join('')
+        html += `<${listType}>${itemsHtml}</${listType}>`
+        listType = null
+        listItems = []
+    }
+
+    lines.forEach(line => {
+        const trimmed = line.trim()
+        if (!trimmed) {
+            flushParagraph()
+            flushList()
+            return
+        }
+
+        const orderedMatch = trimmed.match(/^(\d+)[.)]\s+(.*)$/)
+        if (orderedMatch) {
+            flushParagraph()
+            if (listType && listType !== 'ol') {
+                flushList()
+            }
+            listType = 'ol'
+            listItems.push(orderedMatch[2])
+            return
+        }
+
+        const unorderedMatch = trimmed.match(/^[-*]\s+(.*)$/)
+        if (unorderedMatch) {
+            flushParagraph()
+            if (listType && listType !== 'ul') {
+                flushList()
+            }
+            listType = 'ul'
+            listItems.push(unorderedMatch[1])
+            return
+        }
+
+        if (listType) {
+            flushList()
+        }
+        paragraph.push(trimmed)
+    })
+
+    flushParagraph()
+    flushList()
+
+    return html
+}
+
+// Hardcoded example tutorial for creating a new GitHub repository
+const EXAMPLE_CREATE_REPO_TUTORIAL: TutorialPayload = {
+    title: 'Create a New GitHub Repository',
+    steps: [
+        {
+            stepNumber: 1,
+            selector: 'a[href="/new"]',
+            instruction: 'Click the "New" button or repository creation link in the top right corner of GitHub.',
+            actionType: 'click',
+            expectedResult: 'repository creation form',
+            hint: 'Look for a green button with a plus icon or a "New" link in the header navigation.'
+        },
+        {
+            stepNumber: 2,
+            selector: 'input[name="repository[name]"]',
+            instruction: 'Enter a name for your repository in the "Repository name" field.',
+            actionType: 'input',
+            expectedResult: 'repository name',
+            hint: 'The field is usually at the top of the form. Use a descriptive name like "my-project".'
+        },
+        {
+            stepNumber: 3,
+            selector: 'input[name="repository[description]"]',
+            instruction: '(Optional) Add a description for your repository.',
+            actionType: 'input',
+            expectedResult: 'description',
+            hint: 'This step is optional - you can skip it and click Next if you prefer.'
+        },
+        {
+            stepNumber: 4,
+            selector: 'input[name="repository[visibility]"][value="public"]',
+            instruction: 'Choose the visibility: Public (anyone can see) or Private (only you).',
+            actionType: 'click',
+            expectedResult: 'visibility',
+            hint: 'Public repositories are free and visible to everyone. Private repositories require a paid plan.'
+        },
+        {
+            stepNumber: 5,
+            selector: 'button[type="submit"]',
+            instruction: 'Click the "Create repository" button at the bottom of the form.',
+            actionType: 'click',
+            expectedResult: '/new',
+            hint: 'The button is usually green and located at the bottom of the form.'
+        }
+    ]
+}
+
+interface StoredState {
+    tutorial: TutorialPayload | null
+    currentTutorialStep: number
+    isOpen: boolean
+    origin?: string
+}
+
+interface SessionSnapshot {
+    tutorial: TutorialPayload | null
+    currentTutorialStep: number
+    isOpen: boolean
+    origin: string
+    lastUrl: string
+    updatedAt: number
+}
+
+type SessionStore = Record<string, SessionSnapshot>
+
+type ChatMode = 'tutorial' | 'idle'
 
 const Chatbot: React.FC = () => {
     const [isOpen, setIsOpen] = useState(false)
-    const [messages, setMessages] = useState<Message[]>([
-        { sender: 'bot', text: "Hi! I'm your Site Tutor. I can teach you anything about this website. Click the camera icon or ask a question to get started!" }
-    ])
+    const [mode, setMode] = useState<ChatMode>('idle')
     const [input, setInput] = useState('')
     const [loading, setLoading] = useState(false)
+
+    // Chat state
+    const [messages, setMessages] = useState<Message[]>([
+        { sender: 'bot', text: "Hi! I'm your Site Tutor. I can teach you anything about this website. Ask a question or request a tutorial!" }
+    ])
     const [highlights, setHighlights] = useState<Highlight[]>([])
+    const [sessionId, setSessionId] = useState<string | null>(null)
+    const [automationStatus, setAutomationStatus] = useState<'idle' | 'running' | 'success' | 'error'>('idle')
+    const [automationProgress, setAutomationProgress] = useState<string[]>([])
+
+    // Tutorial mode state
+    const [tutorial, setTutorial] = useState<TutorialPayload | null>(null)
+    const [currentTutorialStep, setCurrentTutorialStep] = useState(0)
+    const [isRestoring, setIsRestoring] = useState(true)
+    const [storageKey, setStorageKey] = useState<string | null>(null)
+    const [tabId, setTabId] = useState<number | null>(null)
+    const [tutorialFingerprint, setTutorialFingerprint] = useState<string | null>(null)
 
     const messagesEndRef = useRef<HTMLDivElement>(null)
 
@@ -32,40 +332,267 @@ const Chatbot: React.FC = () => {
         scrollToBottom()
     }, [messages])
 
+    // Initialize storage key for tutorial persistence
+    useEffect(() => {
+        chrome.runtime.sendMessage({ action: 'getTabId' }, (response) => {
+            if (chrome.runtime.lastError) {
+                console.warn('Site Tutor: unable to determine tab id', chrome.runtime.lastError)
+                setStorageKey(FALLBACK_STORAGE_KEY)
+                return
+            }
+
+            const key = `${STORAGE_KEY_PREFIX}:${response?.tabId ?? 'default'}`
+            setTabId(typeof response?.tabId === 'number' ? response.tabId : null)
+            setStorageKey(key)
+        })
+    }, [])
+
+    // Restore tutorial state from storage
+    useEffect(() => {
+        if (!storageKey) return
+
+        // Check if chrome.storage is available
+        if (!chrome?.storage?.local) {
+            console.warn('Site Tutor: chrome.storage not available')
+            setIsRestoring(false)
+            return
+        }
+
+        chrome.storage.local.get([storageKey, SESSION_STORE_KEY], (result) => {
+            if (chrome.runtime.lastError) {
+                console.warn('Failed to load state:', chrome.runtime.lastError)
+                setIsRestoring(false)
+                return
+            }
+
+            const stored = result[storageKey] as StoredState | undefined
+            const sessionStore = result[SESSION_STORE_KEY] as SessionStore | undefined
+            const session = tabId !== null ? sessionStore?.[String(tabId)] : undefined
+
+            if (stored && stored.origin === window.location.origin) {
+                setTutorial(stored.tutorial)
+                setCurrentTutorialStep(stored.currentTutorialStep)
+                setIsOpen(stored.isOpen)
+                if (stored.tutorial) {
+                    setMode('tutorial')
+                    setHighlights(buildHighlightsFromSteps(stored.tutorial.steps))
+                } else {
+                    setHighlights([])
+                }
+            } else if (session && session.origin === window.location.origin) {
+                const nextStepIndex = session.lastUrl !== window.location.href && session.tutorial
+                    ? Math.min(session.currentTutorialStep + 1, session.tutorial.steps.length - 1)
+                    : session.currentTutorialStep
+
+                setTutorial(session.tutorial)
+                setCurrentTutorialStep(nextStepIndex)
+                setIsOpen(session.isOpen)
+                if (session.tutorial) {
+                    setMode('tutorial')
+                    setHighlights(buildHighlightsFromSteps(session.tutorial.steps))
+                } else {
+                    setHighlights([])
+                }
+            }
+
+            setIsRestoring(false)
+        })
+    }, [storageKey, tabId])
+
+    // Persist tutorial state to storage
+    useEffect(() => {
+        if (!storageKey || isRestoring) return
+        if (!chrome?.storage?.local) return
+
+        const state: StoredState = {
+            tutorial,
+            currentTutorialStep,
+            isOpen,
+            origin: window.location.origin
+        }
+
+        chrome.storage.local.set({ [storageKey]: state })
+    }, [tutorial, currentTutorialStep, isOpen, storageKey, isRestoring])
+
+    useEffect(() => {
+        if (tabId === null || isRestoring) return
+        if (!chrome?.storage?.local) return
+
+        const snapshot: SessionSnapshot = {
+            tutorial,
+            currentTutorialStep,
+            isOpen,
+            origin: window.location.origin,
+            lastUrl: window.location.href,
+            updatedAt: Date.now()
+        }
+
+        chrome.storage.local.get([SESSION_STORE_KEY], (result) => {
+            if (chrome.runtime.lastError) {
+                console.warn('Failed to load session store:', chrome.runtime.lastError)
+                return
+            }
+
+            const store = (result[SESSION_STORE_KEY] as SessionStore | undefined) ?? {}
+            store[String(tabId)] = snapshot
+            chrome.storage.local.set({ [SESSION_STORE_KEY]: store })
+        })
+    }, [tutorial, currentTutorialStep, isOpen, tabId, isRestoring])
+
+    const isCreateRepoRequest = (message: string): boolean => {
+        const normalized = message.toLowerCase().trim()
+        const patterns = [
+            'create a new repo',
+            'create new repo',
+            'create a repo',
+            'create repo',
+            'make a new repo',
+            'make new repo',
+            'new repository',
+            'create repository',
+            'create a new repository',
+            'create new repository'
+        ]
+        return patterns.some(pattern => normalized.includes(pattern))
+    }
+
+    const exitTutorial = () => {
+        setTutorial(null)
+        setCurrentTutorialStep(0)
+        setMode('idle')
+    }
+
+    const handleTutorialComplete = () => {
+        if (tutorialFingerprint) {
+            // Mark all steps completed
+            const stepCount = tutorial?.steps.length ?? 0
+            for (let i = 0; i < stepCount; i++) {
+                markStepCompleted(tutorialFingerprint, i).catch(() => {})
+            }
+        }
+        setTutorialFingerprint(null)
+        exitTutorial()
+        setHighlights([])
+    }
+
+    const handleReset = () => {
+        exitTutorial()
+        setHighlights([])
+        setInput('')
+        setLoading(false)
+        setMessages([
+            { sender: 'bot', text: "Hi! I'm your Site Tutor. I can teach you anything about this website. Ask a question or request a tutorial!" }
+        ])
+        setAutomationStatus('idle')
+        setAutomationProgress([])
+    }
+
     const handleSend = async () => {
         if (!input.trim()) return
 
         const userMessage = input
-        setMessages(prev => [...prev, { sender: 'user', text: userMessage }])
         setInput('')
         setLoading(true)
-        setHighlights([]) // Clear previous highlights
+        setHighlights([])
+
+        // Check for hardcoded tutorial request
+        if (isCreateRepoRequest(userMessage)) {
+            setLoading(false)
+            setMode('tutorial')
+            setTutorial(EXAMPLE_CREATE_REPO_TUTORIAL)
+            setHighlights(buildHighlightsFromSteps(EXAMPLE_CREATE_REPO_TUTORIAL.steps))
+            setCurrentTutorialStep(0)
+            return
+        }
+
+        // Lux mode disabled: keep standard chat flow
+        setMode('idle')
+        setMessages(prev => [...prev, { sender: 'user', text: userMessage }])
 
         try {
-            // 1. Capture Screenshot
-            const screenshotDataUrl = await new Promise<string>((resolve) => {
-                chrome.runtime.sendMessage({ action: 'captureScreen' }, (response) => {
-                    if (chrome.runtime.lastError) {
-                        console.error(chrome.runtime.lastError)
-                        resolve('') // Proceed without screenshot if fails
-                    } else {
-                        resolve(response?.dataUrl || '')
-                    }
-                })
-            })
+            let screenshotDataUrl = ''
 
-            // 2. Prepare Form Data
+            // Always try desktop screenshot first for better context
+            console.log('[Screenshot] Using desktop capture')
+            try {
+                const desktopResponse = await fetch('http://localhost:8000/capture-desktop')
+                if (desktopResponse.ok) {
+                    const desktopData = await desktopResponse.json()
+                    screenshotDataUrl = `data:image/png;base64,${desktopData.screenshot}`
+                    console.log('[Screenshot] Desktop screenshot captured successfully')
+                } else {
+                    console.error('[Screenshot] Desktop capture failed, falling back to tab capture')
+                }
+            } catch (error) {
+                console.error('[Screenshot] Desktop capture error:', error)
+            }
+
+            // Fallback to Chrome tab capture if desktop capture failed
+            if (!screenshotDataUrl) {
+                console.log('[Screenshot] Using Chrome tab capture as fallback')
+                screenshotDataUrl = await new Promise<string>((resolve) => {
+                    chrome.runtime.sendMessage({ action: 'captureScreen' }, (response) => {
+                        if (chrome.runtime.lastError) {
+                            console.error('[Screenshot] Tab capture error:', chrome.runtime.lastError)
+                            resolve('')
+                        } else {
+                            resolve(response?.dataUrl || '')
+                        }
+                    })
+                })
+            }
+
+            // Prepare Form Data
             const formData = new FormData()
             formData.append('message', userMessage)
 
-            if (screenshotDataUrl) {
-                // Convert data URL to blob
-                const res = await fetch(screenshotDataUrl)
-                const blob = await res.blob()
-                formData.append('screenshot', blob, 'screenshot.png')
+            // Include session ID if we have one
+            if (sessionId) {
+                formData.append('sessionId', sessionId)
             }
 
-            // 3. Call Backend
+            if (tutorial && mode === 'tutorial') {
+                const tutorialContext = {
+                    title: tutorial.title,
+                    currentStepIndex: currentTutorialStep,
+                    totalSteps: tutorial.steps.length,
+                    currentStep: tutorial.steps[currentTutorialStep]?.instruction ?? '',
+                    steps: tutorial.steps.map(step => step.instruction),
+                }
+                formData.append('tutorialContext', JSON.stringify(tutorialContext))
+            }
+
+            if (screenshotDataUrl) {
+                // Compress and convert data URL to blob
+                const compressedBlob = await compressScreenshot(screenshotDataUrl)
+                formData.append('screenshot', compressedBlob, 'screenshot.jpg')
+                console.log('[Screenshot] Screenshot attached to request')
+            } else {
+                console.warn('[Screenshot] No screenshot available to send')
+            }
+
+            // Add indexed DOM context
+            try {
+                const indexer = getIndexer()
+                indexer.indexPage(document)
+                const domText = indexer.toTextRepresentation()
+                formData.append('dom', domText)
+            } catch (err) {
+                console.warn('Site Tutor: unable to generate indexed DOM', err)
+            }
+
+            // Add completion history
+            try {
+                const history = await getCompletionHistory(window.location.origin)
+                if (history.length > 0) {
+                    const summary = history.map(h => `- ${h.title}`).join('\n')
+                    formData.append('completionHistory', summary)
+                }
+            } catch (err) {
+                console.warn('Site Tutor: unable to load completion history', err)
+            }
+
+            // Call Backend
             const response = await fetch('http://localhost:8000/chat', {
                 method: 'POST',
                 body: formData
@@ -73,106 +600,90 @@ const Chatbot: React.FC = () => {
 
             const data = await response.json()
 
-            setMessages(prev => [...prev, { sender: 'bot', text: data.text }])
+            // Store session ID from response
+            if (data.sessionId && !sessionId) {
+                setSessionId(data.sessionId)
+                console.log('Session ID received:', data.sessionId)
+            }
 
-            let newHighlights = data.highlights || []
+            const parsedSteps = extractNumberedSteps(data.text || '')
+            if (parsedSteps) {
+                const tutorialPayload = buildTutorialFromSteps(parsedSteps, data.highlights)
 
-            // Check if user is asking for button highlighting - always use direct DOM detection for reliability
-            const userMessageLower = userMessage.toLowerCase()
-            const isAllButtonsRequest = (userMessageLower.includes('all') || userMessageLower.includes('every') || userMessageLower.includes('highlight')) &&
-                                       (userMessageLower.includes('button') || userMessageLower.includes('btn'))
+                // Check for prior progress on this tutorial
+                const fp = generateFingerprint(
+                    window.location.origin,
+                    tutorialPayload.title,
+                    tutorialPayload.steps.map(s => s.instruction)
+                )
+                setTutorialFingerprint(fp)
 
-            // For button requests, ALWAYS use direct DOM detection (backend selectors are unreliable)
-            if (isAllButtonsRequest) {
-                // Clear any previous highlight markers
-                document.querySelectorAll('[data-site-tutor-id]').forEach(el => {
-                    el.removeAttribute('data-site-tutor-id')
-                })
+                let resumeStep = 0
+                try {
+                    const existing = await loadTutorialRecord(fp)
+                    if (existing) {
+                        // Resume from where they left off
+                        const nextIncomplete = existing.steps.findIndex(s => !s.completed)
+                        resumeStep = nextIncomplete >= 0 ? nextIncomplete : 0
+                    } else {
+                        // Check for similar tutorial
+                        const match = await findMatchingTutorial(window.location.origin, userMessage)
+                        if (match && match.completedAt) {
+                            setMessages(prev => [...prev, { sender: 'bot', text: `You've completed a similar tutorial ("${match.title}") before. Starting fresh but building on what you know!` }])
+                        }
+                    }
 
-                // Find all button-like elements on the page
-                const allButtons: Highlight[] = []
-                let buttonIndex = 0
-
-                // Helper to check if element is visible
-                const isVisible = (el: Element): boolean => {
-                    const rect = el.getBoundingClientRect()
-                    const style = window.getComputedStyle(el)
-                    return rect.width > 0 && rect.height > 0 &&
-                           style.display !== 'none' &&
-                           style.visibility !== 'hidden' &&
-                           style.opacity !== '0'
+                    // Save new record
+                    const record: TutorialRecord = {
+                        fingerprint: fp,
+                        origin: window.location.origin,
+                        title: tutorialPayload.title,
+                        query: userMessage,
+                        steps: tutorialPayload.steps.map(s => ({ instruction: s.instruction, completed: false })),
+                        startedAt: Date.now(),
+                        lastAccessedAt: Date.now(),
+                        currentStepIndex: resumeStep,
+                    }
+                    await saveTutorialRecord(record)
+                } catch (err) {
+                    console.warn('Site Tutor: memory error', err)
                 }
 
-                // Find actual button elements
-                document.querySelectorAll('button').forEach((btn) => {
-                    if (isVisible(btn)) {
-                        const id = `btn-${buttonIndex++}`
-                        btn.setAttribute('data-site-tutor-id', id)
-                        const text = btn.textContent?.trim() || 'Button'
-                        allButtons.push({
-                            selector: `[data-site-tutor-id="${id}"]`,
-                            explanation: text.substring(0, 30) || 'Button'
-                        })
-                    }
-                })
+                setMode('tutorial')
+                setTutorial(tutorialPayload)
+                setCurrentTutorialStep(resumeStep)
+                setHighlights(buildHighlightsFromSteps(tutorialPayload.steps, data.highlights))
+                setMessages(prev => [...prev, { sender: 'bot', text: resumeStep > 0 ? `Resuming tutorial from step ${resumeStep + 1}.` : 'Starting step-by-step tutorial. Use Next to move through each step.' }])
+            } else {
+                setMessages(prev => [...prev, { sender: 'bot', text: data.text }])
 
-                // Find elements with role="button"
-                document.querySelectorAll('[role="button"]').forEach((el) => {
-                    if (isVisible(el) && !el.hasAttribute('data-site-tutor-id')) {
-                        const id = `btn-${buttonIndex++}`
-                        el.setAttribute('data-site-tutor-id', id)
-                        const text = el.textContent?.trim() || 'Button'
-                        allButtons.push({
-                            selector: `[data-site-tutor-id="${id}"]`,
-                            explanation: text.substring(0, 30) || 'Button'
-                        })
-                    }
-                })
-
-                // Find input buttons
-                document.querySelectorAll('input[type="button"], input[type="submit"]').forEach((input) => {
-                    if (isVisible(input)) {
-                        const id = `btn-${buttonIndex++}`
-                        input.setAttribute('data-site-tutor-id', id)
-                        const value = (input as HTMLInputElement).value || 'Submit'
-                        allButtons.push({
-                            selector: `[data-site-tutor-id="${id}"]`,
-                            explanation: value.substring(0, 30) || 'Input Button'
-                        })
-                    }
-                })
-
-                // Find anchor tags that look like buttons (have button classes or role)
-                document.querySelectorAll('a').forEach((link) => {
-                    if (link.hasAttribute('data-site-tutor-id')) return
-                    const classes = link.className?.toLowerCase() || ''
-                    const role = link.getAttribute('role')
-                    if (isVisible(link) && (classes.includes('button') || classes.includes('btn') || role === 'button')) {
-                        const id = `btn-${buttonIndex++}`
-                        link.setAttribute('data-site-tutor-id', id)
-                        const text = link.textContent?.trim() || 'Link Button'
-                        allButtons.push({
-                            selector: `[data-site-tutor-id="${id}"]`,
-                            explanation: text.substring(0, 30) || 'Link Button'
-                        })
-                    }
-                })
-
-                if (allButtons.length > 0) {
-                    console.log(`Site Tutor: Found ${allButtons.length} buttons on the page`, allButtons)
-                    newHighlights = allButtons
-                } else {
-                    console.log('Site Tutor: No buttons found on this page')
+                // Set highlights
+                if (data.highlights && data.highlights.length > 0) {
+                    setHighlights(data.highlights)
+                    console.log('Site Tutor: Received highlights:', data.highlights)
                 }
             }
-            
-            setHighlights(newHighlights)
-            
-            // Log highlights for debugging
-            if (newHighlights.length > 0) {
-                console.log('Site Tutor: Received highlights:', newHighlights)
-            } else {
-                console.log('Site Tutor: No highlights in response')
+
+            // Handle automation actions
+            if (data.automation) {
+                const automation: AutomationAction = data.automation
+                if (automation.type === 'navigate' && automation.url) {
+                    // Give user a moment to read the message, then navigate
+                    setTimeout(() => {
+                        window.location.href = automation.url!
+                    }, 1500)
+                } else if (automation.type === 'click' && automation.selector) {
+                    // Auto-click the specified element
+                    setTimeout(() => {
+                        const element = document.querySelector(automation.selector!)
+                        if (element && element instanceof HTMLElement) {
+                            element.click()
+                            console.log('Auto-clicked element:', automation.selector)
+                        } else {
+                            console.warn('Element not found for auto-click:', automation.selector)
+                        }
+                    }, 1000)
+                }
             }
 
         } catch (error) {
@@ -183,86 +694,124 @@ const Chatbot: React.FC = () => {
         }
     }
 
+
     return (
         <>
-            <Overlay highlights={highlights} />
+            <Overlay
+                highlights={highlights}
+                currentStepIndex={mode === 'tutorial' ? currentTutorialStep : undefined}
+            />
 
-            <div className="fixed bottom-6 right-6 z-[99999] font-sans text-gray-800 antialiased">
+            <div className="fixed bottom-6 right-6 z-[99999] font-sans text-gray-800 antialiased pointer-events-auto">
                 <AnimatePresence>
                     {isOpen && (
                         <motion.div
-                            initial={{ opacity: 0, scale: 0.9, y: 20 }}
+                            className="chat-container pointer-events-auto"
+                            initial={{ opacity: 0, scale: 0.8, y: 20 }}
                             animate={{ opacity: 1, scale: 1, y: 0 }}
-                            exit={{ opacity: 0, scale: 0.9, y: 20 }}
-                            className="mb-4 w-96 rounded-2xl bg-white shadow-2xl ring-1 ring-black/5 flex flex-col overflow-hidden"
-                            style={{ height: '500px' }}
+                            exit={{ opacity: 0, scale: 0.8, y: 20 }}
+                            data-mode={mode}
                         >
-                            {/* Header */}
-                            <div className="flex items-center justify-between bg-gradient-to-r from-violet-600 to-indigo-600 px-6 py-4 text-white">
-                                <h2 className="text-lg font-semibold tracking-wide">Site Tutor</h2>
+                            <div className="chat-header" data-mode={mode}>
+                                <MessageCircle size={20} />
+                                <span className="font-medium">
+                                    {mode === 'tutorial' ? 'Tutorial Mode' : 'Site Tutor'}
+                                </span>
                                 <button
                                     onClick={() => setIsOpen(false)}
-                                    className="rounded-full p-1 opacity-80 hover:bg-white/20 hover:opacity-100 transition-colors"
+                                    className="ml-auto hover:bg-white/20 p-1 rounded transition-colors"
+                                    aria-label="Close chat"
                                 >
-                                    <X size={20} />
+                                    <X size={18} />
                                 </button>
                             </div>
 
-                            {/* Messages */}
-                            <div className="flex-1 overflow-y-auto p-4 bg-gray-50 flex flex-col gap-3">
-                                {messages.map((msg, idx) => (
-                                    <div
-                                        key={idx}
-                                        className={`max-w-[80%] p-3 rounded-2xl text-sm ${msg.sender === 'user' ? 'self-end bg-violet-600 text-white rounded-br-none' : 'self-start bg-white border border-gray-100 text-gray-600 rounded-tl-none shadow-sm'}`}
-                                    >
-                                        {msg.text}
-                                    </div>
-                                ))}
-                                {loading && (
-                                    <div className="self-start bg-white border border-gray-100 p-3 rounded-2xl rounded-tl-none shadow-sm text-sm text-gray-500">
-                                        Thinking...
-                                    </div>
-                                )}
-                                {highlights.length > 0 && !loading && (
-                                    <div className="self-start bg-red-50 border border-red-200 p-2 rounded-lg text-xs text-red-800">
-                                        ✨ Highlighting {highlights.length} element{highlights.length !== 1 ? 's' : ''} on the page
-                                    </div>
-                                )}
-                                <div ref={messagesEndRef} />
-                            </div>
-
-                            {/* Input Area */}
-                            <div className="p-4 border-t border-gray-100 bg-white">
-                                <div className="relative flex items-center gap-2">
-                                    <input
-                                        type="text"
-                                        value={input}
-                                        onChange={(e) => setInput(e.target.value)}
-                                        onKeyDown={(e) => e.key === 'Enter' && handleSend()}
-                                        placeholder="Ask about this page..."
-                                        className="flex-1 rounded-xl bg-gray-100 px-4 py-3 text-sm focus:bg-white focus:outline-none focus:ring-2 focus:ring-violet-500 transition-all shadow-inner"
+                            <div className="chat-body">
+                                {mode === 'tutorial' && tutorial ? (
+                                    <TutorialController
+                                        tutorial={tutorial}
+                                        initialStepIndex={currentTutorialStep}
+                                        onStepChange={(index) => {
+                                            // Mark previous step as completed when advancing
+                                            if (index > currentTutorialStep && tutorialFingerprint) {
+                                                markStepCompleted(tutorialFingerprint, currentTutorialStep).catch(() => {})
+                                            }
+                                            setCurrentTutorialStep(index)
+                                        }}
+                                        onComplete={handleTutorialComplete}
+                                        onClose={handleReset}
                                     />
-                                    <button
-                                        onClick={handleSend}
-                                        disabled={loading || !input.trim()}
-                                        className="rounded-lg bg-violet-600 p-3 text-white hover:bg-violet-700 transition-colors shadow-md hover:shadow-lg disabled:opacity-50 disabled:cursor-not-allowed"
-                                    >
-                                        <Send size={16} />
-                                    </button>
-                                </div>
+                                ) : (
+                                    <>
+                                        <div className="messages-container">
+                                            {messages.map((msg, idx) => (
+                                                <div
+                                                    key={idx}
+                                                    className={`message ${msg.sender === 'user' ? 'message-user' : 'message-bot'}`}
+                                                >
+                                                    <div
+                                                        className="message-content"
+                                                        dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.text) }}
+                                                    />
+                                                </div>
+                                            ))}
+                                            {automationProgress.length > 0 && (
+                                                <div className="message message-bot">
+                                                    <div className="text-sm font-semibold mb-1">Automation Progress:</div>
+                                                    {automationProgress.map((progress, idx) => (
+                                                        <div key={idx} className="text-xs opacity-80">{progress}</div>
+                                                    ))}
+                                                </div>
+                                            )}
+                                            <div ref={messagesEndRef} />
+                                        </div>
+
+                                        <div className="chat-input-area">
+                                            <input
+                                                type="text"
+                                                value={input}
+                                                onChange={(e) => setInput(e.target.value)}
+                                                onKeyDown={(e) => {
+                                                    e.stopPropagation()
+                                                    if (e.key === 'Enter' && !loading) {
+                                                        e.preventDefault()
+                                                        handleSend()
+                                                    }
+                                                }}
+                                                placeholder="Ask a question or request a tutorial..."
+                                                disabled={loading || automationStatus === 'running'}
+                                                className="chat-input"
+                                            />
+                                            <button
+                                                onClick={handleSend}
+                                                disabled={loading || automationStatus === 'running'}
+                                                className="chat-send-button"
+                                                aria-label="Send message"
+                                            >
+                                                {loading ? <Loader2 size={18} className="animate-spin" /> : <Send size={18} />}
+                                            </button>
+                                        </div>
+                                    </>
+                                )}
                             </div>
                         </motion.div>
                     )}
                 </AnimatePresence>
 
-                <motion.button
-                    whileHover={{ scale: 1.05 }}
-                    whileTap={{ scale: 0.95 }}
-                    onClick={() => setIsOpen(!isOpen)}
-                    className="flex h-14 w-14 items-center justify-center rounded-full bg-gradient-to-r from-violet-600 to-indigo-600 text-white shadow-xl hover:shadow-2xl hover:shadow-violet-500/30 transition-shadow"
-                >
-                    {isOpen ? <X size={24} /> : <MessageCircle size={28} />}
-                </motion.button>
+                {!isOpen && (
+                    <motion.button
+                        className="chat-fab pointer-events-auto"
+                        onClick={() => setIsOpen(true)}
+                        initial={{ scale: 0 }}
+                        animate={{ scale: 1 }}
+                        whileHover={{ scale: 1.1 }}
+                        whileTap={{ scale: 0.95 }}
+                        data-mode={mode}
+                        aria-label="Open chat"
+                    >
+                        <MessageCircle size={24} />
+                    </motion.button>
+                )}
             </div>
         </>
     )

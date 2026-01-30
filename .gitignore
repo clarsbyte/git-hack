@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+env/
+venv/
+ENV/
+.env
+.env.*
+*.env
+
+# Results
+results/
+
+# Node modules
+node_modules/
+
+backend/.env
+backend/.env.*
