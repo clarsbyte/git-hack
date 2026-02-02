@@ -93,7 +93,8 @@ async def chat(
     sessionId: Optional[str] = Form(None),
     dom: Optional[str] = Form(None),
     completionHistory: Optional[str] = Form(None),
-    tutorialContext: Optional[str] = Form(None)
+    tutorialContext: Optional[str] = Form(None),
+    generateMode: Optional[str] = Form(None)
 ):
     print(f"Received message: {message}")
 
@@ -179,6 +180,19 @@ The user is currently in a step-by-step tutorial. Use this to avoid restarting f
 If the user asks a question while mid-tutorial, continue from the current step and reference the next best action.
 """
 
+        initial_generation_hint = ""
+        if generateMode == "initial":
+            initial_generation_hint = """
+
+CRITICAL - TUTORIAL MODE:
+The user is asking for help doing something. You MUST respond with exactly ONE numbered step in the "text" field.
+The "text" field MUST start with "1." followed by a clear instruction.
+
+Example "text" value: "1. Click on the 'APIs and services' option in the Quick access section."
+
+Do NOT write a paragraph. Do NOT explain. Just "1. [action]". ONE step only.
+"""
+
         prompt_text = f"""
 You are a Site Tutor, an expert web developer and UI guide.
 Your goal is to answer the user's question about the website screenshot provided.
@@ -213,9 +227,11 @@ ELEMENT REFERENCING:
 - Cross-reference the screenshot with the indexed element list to pick the correct index.
 - If the indexed list is not available, fall back to a CSS selector in the "selector" field.
 
+{initial_generation_hint}
+
 Return your response strictly as a JSON object with this format:
 {{
-  "text": "Your conversational answer here...",
+  "text": "{'1. [Single clear action the user should take next]' if generateMode == 'initial' else 'Your conversational answer here...'}",
   "highlights": [
     {{ "elementIndex": 5, "explanation": "Brief label for the highlight" }}
   ],
@@ -422,6 +438,238 @@ async def capture_desktop():
     except Exception as e:
         print(f"Error capturing desktop: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to capture desktop: {str(e)}")
+
+class StepVerificationResponse(BaseModel):
+    verified: bool
+    feedback: str
+
+@app.post("/verify-step", response_model=StepVerificationResponse)
+async def verify_step(
+    sessionId: str = Form(...),
+    stepIndex: int = Form(...),
+    stepDescription: str = Form(...),
+    screenshot: UploadFile = File(...),
+    originalQuery: str = Form(...),
+):
+    """Verify if a step was completed correctly by analyzing screenshot"""
+    session = session_manager.get_session(sessionId)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Convert screenshot to PIL Image
+    image_bytes = await screenshot.read()
+    image = Image.open(io.BytesIO(image_bytes))
+
+    # Build verification prompt
+    prompt = f"""You are verifying if the user completed a tutorial step correctly.
+
+Original Goal: {originalQuery}
+Current Step (#{stepIndex + 1}): {stepDescription}
+
+Look at the screenshot and determine:
+1. Has the user completed this step?
+2. Is the page in the expected state?
+
+Respond with JSON:
+{{
+  "verified": true/false,
+  "feedback": "Brief message to user (if not verified, tell them what to fix)"
+}}
+"""
+
+    # Call Claude with screenshot
+    img_bytes = io.BytesIO()
+    image.save(img_bytes, format="PNG")
+    img_bytes.seek(0)
+
+    message = client.messages.create(
+        model=model_name,
+        max_tokens=500,
+        messages=[{"role": "user", "content": [
+            {"type": "text", "text": prompt},
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": base64.b64encode(img_bytes.getvalue()).decode("utf-8")
+                }
+            }
+        ]}]
+    )
+
+    # Parse response
+    raw_text = ""
+    for block in message.content:
+        text_value = getattr(block, "text", None)
+        if text_value:
+            raw_text += text_value
+
+    # Clean potential markdown code blocks
+    if raw_text.startswith("```json"):
+        raw_text = raw_text[7:]
+    if raw_text.startswith("```"):
+        raw_text = raw_text[3:]
+    if raw_text.endswith("```"):
+        raw_text = raw_text[:-3]
+
+    try:
+        result = json.loads(raw_text.strip())
+    except json.JSONDecodeError:
+        extracted = extract_json_object(raw_text)
+        if extracted:
+            result = json.loads(extracted.strip())
+        else:
+            # Fallback to verified=true if parsing fails
+            result = {"verified": True, "feedback": "Step verification completed"}
+
+    return StepVerificationResponse(
+        verified=result.get("verified", False),
+        feedback=result.get("feedback", "Step verification failed")
+    )
+
+class RegenerateStepsResponse(BaseModel):
+    newSteps: List[dict]
+    isComplete: bool
+
+@app.post("/regenerate-steps", response_model=RegenerateStepsResponse)
+async def regenerate_steps(
+    sessionId: str = Form(...),
+    originalQuery: str = Form(...),
+    completedSteps: str = Form(...),
+    currentStepIndex: int = Form(...),
+    screenshot: UploadFile = File(...),
+    dom: str = Form(""),
+):
+    """Generate next batch of steps based on current progress"""
+    session = session_manager.get_session(sessionId)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Parse completed steps
+    completed_list = json.loads(completedSteps)
+
+    # Convert screenshot
+    image_bytes = await screenshot.read()
+    image = Image.open(io.BytesIO(image_bytes))
+
+    # Build regeneration prompt
+    completed_steps_text = "\n".join([f"{i+1}. {step}" for i, step in enumerate(completed_list)])
+
+    prompt = f"""You are helping a user learn how to accomplish a task on a website.
+
+ORIGINAL USER GOAL: {originalQuery}
+
+STEPS COMPLETED SO FAR:
+{completed_steps_text}
+
+CRITICAL: Generate ONLY ONE next step. Not two, not three. ONE single step.
+Look at the current screenshot and indexed DOM to determine what the user should do next.
+You will be called again after this step is completed to generate the next one.
+
+If the goal is fully accomplished, respond with an empty steps list and set "isComplete": true.
+
+INDEXED DOM ELEMENTS:
+{dom[:3000] if dom else "No DOM available"}
+
+Respond with JSON:
+{{
+  "steps": [
+    {{
+      "stepNumber": {currentStepIndex + 1},
+      "instruction": "Single clear action to take",
+      "actionType": "click" or "input" or "navigate" or "wait",
+      "selector": "CSS selector",
+      "elementIndex": 5,
+      "expectedResult": "What should happen",
+      "hint": "Optional hint if user gets stuck"
+    }}
+  ],
+  "isComplete": false
+}}
+
+Generate exactly ONE step. Keep the ORIGINAL GOAL in mind: {originalQuery}
+"""
+
+    # Call Claude
+    img_bytes = io.BytesIO()
+    image.save(img_bytes, format="PNG")
+    img_bytes.seek(0)
+
+    # Include recent session context (map "bot" -> "assistant" for API)
+    # Anthropic requires alternating user/assistant and must start with user
+    recent_messages = []
+    for m in session.messages[-4:]:
+        role = "assistant" if m.role == "bot" else m.role
+        if role not in ("user", "assistant"):
+            continue
+        # Skip if same role as previous (would break alternation)
+        if recent_messages and recent_messages[-1]["role"] == role:
+            continue
+        recent_messages.append({
+            "role": role,
+            "content": m.text
+        })
+    # Ensure it starts with "user" and doesn't end with "user" (since we append one)
+    if recent_messages and recent_messages[0]["role"] != "user":
+        recent_messages = recent_messages[1:]
+    if recent_messages and recent_messages[-1]["role"] == "user":
+        recent_messages = recent_messages[:-1]
+
+    message = client.messages.create(
+        model=model_name,
+        max_tokens=2000,
+        messages=[
+            *recent_messages,
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": base64.b64encode(img_bytes.getvalue()).decode("utf-8")
+                        }
+                    }
+                ]
+            }
+        ]
+    )
+
+    # Parse response
+    raw_text = ""
+    for block in message.content:
+        text_value = getattr(block, "text", None)
+        if text_value:
+            raw_text += text_value
+
+    # Clean potential markdown code blocks
+    if raw_text.startswith("```json"):
+        raw_text = raw_text[7:]
+    if raw_text.startswith("```"):
+        raw_text = raw_text[3:]
+    if raw_text.endswith("```"):
+        raw_text = raw_text[:-3]
+
+    try:
+        result = json.loads(raw_text.strip())
+    except json.JSONDecodeError:
+        extracted = extract_json_object(raw_text)
+        if extracted:
+            result = json.loads(extracted.strip())
+        else:
+            # Fallback to empty steps if parsing fails
+            result = {"steps": [], "isComplete": True}
+
+    # Store in session for context
+    session.add_message("assistant", raw_text)
+
+    return RegenerateStepsResponse(
+        newSteps=result.get("steps", []),
+        isComplete=result.get("isComplete", False)
+    )
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

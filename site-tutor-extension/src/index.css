@@ -107,7 +107,7 @@
 /* ===== BODY ===== */
 .chat-body {
   flex: 1;
-  overflow: hidden;
+  overflow-y: auto;
   padding: 16px;
   background: linear-gradient(180deg, rgba(247, 245, 241, 0.7), rgba(241, 238, 231, 0.9));
   display: flex;

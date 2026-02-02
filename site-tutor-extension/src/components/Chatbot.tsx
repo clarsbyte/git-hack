@@ -86,17 +86,22 @@ const compressScreenshot = async (dataUrl: string): Promise<Blob> => {
 
 const STORAGE_KEY_PREFIX = 'siteTutorState'
 const FALLBACK_STORAGE_KEY = `${STORAGE_KEY_PREFIX}:default`
-const extractNumberedSteps = (text: string): string[] | null => {
+const extractNumberedSteps = (text: string, maxSteps?: number): string[] | null => {
     const lines = text.split(/\r?\n/).map(line => line.trim())
     const steps: string[] = []
     let current = ''
 
     lines.forEach(line => {
         if (!line) return
+        // Stop if we've reached the max steps limit
+        if (maxSteps && steps.length >= maxSteps && current.length === 0) return
+
         const match = line.match(/^\s*\d+(?:\.|\))\s+(.*)$/)
         if (match) {
             if (current.length > 0) {
                 steps.push(current.trim())
+                // Stop if we've reached max steps after pushing
+                if (maxSteps && steps.length >= maxSteps) return
             }
             current = match[1].trim()
             return
@@ -107,11 +112,28 @@ const extractNumberedSteps = (text: string): string[] | null => {
         }
     })
 
-    if (current.length > 0) {
+    if (current.length > 0 && (!maxSteps || steps.length < maxSteps)) {
         steps.push(current.trim())
     }
 
-    return steps.length >= 2 ? steps : null
+    return steps.length >= 1 ? steps : null
+}
+
+const extractTotalStepsHint = (text: string): number | null => {
+    // Try to extract total step count from hints like "This will take about 5 steps"
+    const patterns = [
+        /(\d+)\s+steps?\s+total/i,
+        /take\s+(?:about|approximately)?\s*(\d+)\s+steps?/i,
+        /total\s+of\s+(\d+)\s+steps?/i
+    ]
+
+    for (const pattern of patterns) {
+        const match = text.match(pattern)
+        if (match && match[1]) {
+            return parseInt(match[1], 10)
+        }
+    }
+    return null
 }
 
 const inferActionType = (text: string): TutorialActionType => {
@@ -322,6 +344,12 @@ const Chatbot: React.FC = () => {
     const [tabId, setTabId] = useState<number | null>(null)
     const [tutorialFingerprint, setTutorialFingerprint] = useState<string | null>(null)
 
+    // Incremental step generation state
+    const [originalQuery, setOriginalQuery] = useState<string>('')
+    const [completedStepDescriptions, setCompletedStepDescriptions] = useState<string[]>([])
+    const [isRegenerating, setIsRegenerating] = useState(false)
+    const [totalExpectedSteps, setTotalExpectedSteps] = useState<number | null>(null)
+
     const messagesEndRef = useRef<HTMLDivElement>(null)
 
     const scrollToBottom = () => {
@@ -485,6 +513,164 @@ const Chatbot: React.FC = () => {
         ])
         setAutomationStatus('idle')
         setAutomationProgress([])
+        setOriginalQuery('')
+        setCompletedStepDescriptions([])
+        setIsRegenerating(false)
+        setTotalExpectedSteps(null)
+    }
+
+    const captureScreenshot = async (): Promise<Blob | null> => {
+        try {
+            // Try desktop screenshot first
+            const desktopResponse = await fetch('http://localhost:8000/capture-desktop')
+            if (desktopResponse.ok) {
+                const desktopData = await desktopResponse.json()
+                const base64Data = desktopData.screenshot
+                const binaryData = atob(base64Data)
+                const bytes = new Uint8Array(binaryData.length)
+                for (let i = 0; i < binaryData.length; i++) {
+                    bytes[i] = binaryData.charCodeAt(i)
+                }
+                return new Blob([bytes], { type: 'image/png' })
+            }
+        } catch (error) {
+            console.error('[Screenshot] Desktop capture failed:', error)
+        }
+
+        // Fallback to Chrome tab capture
+        return new Promise<Blob | null>((resolve) => {
+            chrome.runtime.sendMessage({ action: 'captureScreen' }, async (response) => {
+                if (chrome.runtime.lastError || !response?.dataUrl) {
+                    resolve(null)
+                    return
+                }
+                const compressedBlob = await compressScreenshot(response.dataUrl)
+                resolve(compressedBlob)
+            })
+        })
+    }
+
+    const fetchWithTimeout = (url: string, options: RequestInit, timeoutMs = 15000): Promise<Response> => {
+        return Promise.race([
+            fetch(url, options),
+            new Promise<Response>((_, reject) =>
+                setTimeout(() => reject(new Error('Request timed out')), timeoutMs)
+            )
+        ])
+    }
+
+    const handleStepVerificationAndRegeneration = async (completedStepIndex: number) => {
+        if (!tutorial || !sessionId || !originalQuery) {
+            // No session yet — skip verification, just regenerate next step
+            setCurrentTutorialStep(prev => prev + 1)
+            return
+        }
+
+        setIsRegenerating(true)
+
+        try {
+            // 1. Take fresh screenshot
+            const screenshot = await captureScreenshot()
+            if (!screenshot) {
+                setCurrentTutorialStep(prev => prev + 1)
+                setIsRegenerating(false)
+                return
+            }
+
+            // 2. Verify step completion (skip if it fails/times out)
+            let verified = true
+            try {
+                const verifyFormData = new FormData()
+                verifyFormData.append('sessionId', sessionId)
+                verifyFormData.append('stepIndex', completedStepIndex.toString())
+                verifyFormData.append('stepDescription', tutorial.steps[completedStepIndex].instruction)
+                verifyFormData.append('screenshot', screenshot, 'screenshot.jpg')
+                verifyFormData.append('originalQuery', originalQuery)
+
+                const verifyResponse = await fetchWithTimeout('http://localhost:8000/verify-step', {
+                    method: 'POST',
+                    body: verifyFormData
+                })
+                const verifyResult = await verifyResponse.json()
+                verified = verifyResult.verified
+                if (!verified) {
+                    setMessages(prev => [...prev, { sender: 'bot', text: verifyResult.feedback }])
+                    setIsRegenerating(false)
+                    return
+                }
+            } catch {
+                // Verification failed/timed out — proceed anyway
+                console.warn('Step verification skipped (timeout or error)')
+            }
+
+            // 3. Mark step completed
+            if (tutorialFingerprint) {
+                markStepCompleted(tutorialFingerprint, completedStepIndex).catch(() => {})
+            }
+
+            const newCompletedSteps = [
+                ...completedStepDescriptions,
+                tutorial.steps[completedStepIndex].instruction
+            ]
+            setCompletedStepDescriptions(newCompletedSteps)
+
+            // 4. Regenerate next step
+            const indexer = getIndexer()
+            indexer.indexPage(document)
+            const domText = indexer.toTextRepresentation()
+
+            const regenerateFormData = new FormData()
+            regenerateFormData.append('sessionId', sessionId)
+            regenerateFormData.append('originalQuery', originalQuery)
+            regenerateFormData.append('completedSteps', JSON.stringify(newCompletedSteps))
+            regenerateFormData.append('currentStepIndex', (completedStepIndex + 1).toString())
+            regenerateFormData.append('screenshot', screenshot, 'screenshot.jpg')
+            regenerateFormData.append('dom', domText)
+
+            const regenerateResponse = await fetchWithTimeout('http://localhost:8000/regenerate-steps', {
+                method: 'POST',
+                body: regenerateFormData
+            }, 20000)
+
+            const { newSteps, isComplete } = await regenerateResponse.json()
+
+            if (isComplete || newSteps.length === 0) {
+                handleTutorialComplete()
+                setMessages(prev => [...prev, { sender: 'bot', text: 'Tutorial complete! You\'ve accomplished your goal.' }])
+            } else {
+                const mappedSteps = newSteps.map((step: any, i: number) => ({
+                    stepNumber: completedStepIndex + 2 + i,
+                    instruction: step.instruction,
+                    actionType: step.actionType || 'click',
+                    selector: step.selector || '',
+                    expectedResult: step.expectedResult,
+                    hint: step.hint,
+                    elementIndex: step.elementIndex
+                }))
+
+                const updatedSteps = [
+                    ...tutorial.steps.slice(0, completedStepIndex + 1),
+                    ...mappedSteps
+                ]
+
+                setTutorial(prev => {
+                    if (!prev) return prev
+                    return { ...prev, steps: updatedSteps }
+                })
+
+                // Update highlights for new steps
+                setHighlights(buildHighlightsFromSteps(updatedSteps))
+
+                // Advance to the new step
+                setCurrentTutorialStep(completedStepIndex + 1)
+            }
+
+        } catch (error) {
+            console.error('Error during verification/regeneration:', error)
+            setMessages(prev => [...prev, { sender: 'bot', text: 'Having trouble generating the next step. Click Next to try again.' }])
+        } finally {
+            setIsRegenerating(false)
+        }
     }
 
     const handleSend = async () => {
@@ -494,6 +680,10 @@ const Chatbot: React.FC = () => {
         setInput('')
         setLoading(true)
         setHighlights([])
+
+        // Store original query for step regeneration
+        setOriginalQuery(userMessage)
+        setCompletedStepDescriptions([])
 
         // Check for hardcoded tutorial request
         if (isCreateRepoRequest(userMessage)) {
@@ -551,6 +741,9 @@ const Chatbot: React.FC = () => {
                 formData.append('sessionId', sessionId)
             }
 
+            // Signal initial step generation mode
+            formData.append('generateMode', 'initial')
+
             if (tutorial && mode === 'tutorial') {
                 const tutorialContext = {
                     title: tutorial.title,
@@ -606,8 +799,15 @@ const Chatbot: React.FC = () => {
                 console.log('Session ID received:', data.sessionId)
             }
 
-            const parsedSteps = extractNumberedSteps(data.text || '')
+            // Extract only the first step for incremental generation
+            const parsedSteps = extractNumberedSteps(data.text || '', 1)
             if (parsedSteps) {
+                // Try to extract total expected steps from AI response
+                const expectedTotal = extractTotalStepsHint(data.text || '')
+                if (expectedTotal) {
+                    setTotalExpectedSteps(expectedTotal)
+                }
+
                 const tutorialPayload = buildTutorialFromSteps(parsedSteps, data.highlights)
 
                 // Check for prior progress on this tutorial
@@ -625,6 +825,17 @@ const Chatbot: React.FC = () => {
                         // Resume from where they left off
                         const nextIncomplete = existing.steps.findIndex(s => !s.completed)
                         resumeStep = nextIncomplete >= 0 ? nextIncomplete : 0
+
+                        // Restore incremental generation state
+                        if (existing.originalQuery) {
+                            setOriginalQuery(existing.originalQuery)
+                        }
+                        if (existing.completedStepDescriptions) {
+                            setCompletedStepDescriptions(existing.completedStepDescriptions)
+                        }
+                        if (existing.totalExpectedSteps) {
+                            setTotalExpectedSteps(existing.totalExpectedSteps)
+                        }
                     } else {
                         // Check for similar tutorial
                         const match = await findMatchingTutorial(window.location.origin, userMessage)
@@ -643,6 +854,9 @@ const Chatbot: React.FC = () => {
                         startedAt: Date.now(),
                         lastAccessedAt: Date.now(),
                         currentStepIndex: resumeStep,
+                        originalQuery: userMessage,
+                        completedStepDescriptions: [],
+                        totalExpectedSteps: totalExpectedSteps ?? undefined,
                     }
                     await saveTutorialRecord(record)
                 } catch (err) {
@@ -740,6 +954,8 @@ const Chatbot: React.FC = () => {
                                         }}
                                         onComplete={handleTutorialComplete}
                                         onClose={handleReset}
+                                        onStepVerify={handleStepVerificationAndRegeneration}
+                                        isRegenerating={isRegenerating}
                                     />
                                 ) : (
                                     <>
@@ -772,10 +988,11 @@ const Chatbot: React.FC = () => {
                                                 value={input}
                                                 onChange={(e) => setInput(e.target.value)}
                                                 onKeyDown={(e) => {
-                                                    e.stopPropagation()
-                                                    if (e.key === 'Enter' && !loading) {
+                                                    if (e.key === 'Enter') {
                                                         e.preventDefault()
-                                                        handleSend()
+                                                        if (!loading && automationStatus !== 'running') {
+                                                            handleSend()
+                                                        }
                                                     }
                                                 }}
                                                 placeholder="Ask a question or request a tutorial..."

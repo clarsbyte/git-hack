@@ -18,6 +18,9 @@ export interface TutorialRecord {
     lastAccessedAt: number
     completedAt?: number
     currentStepIndex: number
+    originalQuery?: string
+    completedStepDescriptions?: string[]
+    totalExpectedSteps?: number
 }
 
 export function generateFingerprint(origin: string, title: string, steps: string[]): string {

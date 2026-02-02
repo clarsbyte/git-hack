@@ -10,6 +10,8 @@ interface TutorialControllerProps {
     onStepChange?: (index: number) => void
     onComplete?: () => void
     initialStepIndex?: number
+    onStepVerify?: (stepIndex: number) => Promise<void>
+    isRegenerating?: boolean
 }
 
 const AUTO_ADVANCE_DELAY = 900
@@ -18,49 +20,43 @@ const statusCopy = {
     waiting: 'Waiting for you to complete this step...',
     matched: 'Great! Moving to the next step...',
     hint: 'Having trouble? Use the hint below or click Next to continue.',
+    verifying: 'Verifying step completion...',
 }
 
 const getIndexer = (): ElementIndexer | undefined => {
     return (window as typeof window & { __siteTutorElementIndexer?: ElementIndexer }).__siteTutorElementIndexer
 }
 
-const TutorialController: React.FC<TutorialControllerProps> = ({ tutorial, onClose, onStepChange, onComplete, initialStepIndex = 0 }) => {
+const TutorialController: React.FC<TutorialControllerProps> = ({ tutorial, onClose, onStepChange, onComplete, initialStepIndex = 0, onStepVerify, isRegenerating = false }) => {
     const [currentStepIndex, setCurrentStepIndex] = useState(initialStepIndex)
-    const [status, setStatus] = useState<'waiting' | 'matched' | 'hint'>('waiting')
+    const [status, setStatus] = useState<'waiting' | 'matched' | 'hint' | 'verifying'>('waiting')
     const [hint, setHint] = useState<string | null>(null)
     const verifierRef = useRef(new ActionVerifier())
     const autoAdvanceTimeoutRef = useRef<ReturnType<typeof window.setTimeout> | null>(null)
     const stepAdvanceTimeoutRef = useRef<ReturnType<typeof window.setTimeout> | null>(null)
     const previousStepIndexRef = useRef(initialStepIndex)
     const [showStepAdvance, setShowStepAdvance] = useState(false)
+    const syncingFromPropRef = useRef(false)
 
     const steps = tutorial.steps
     const activeStep: TutorialStep | undefined = steps[currentStepIndex]
     const totalSteps = steps.length
 
+    // Sync internal step index from parent props (no queueMicrotask to avoid flicker)
     useEffect(() => {
-        let cancelled = false
-
-        queueMicrotask(() => {
-            if (cancelled) return
-            if (initialStepIndex === 0) {
-                setCurrentStepIndex(0)
-                setHint(null)
-                setStatus('waiting')
-            } else {
-                setCurrentStepIndex(initialStepIndex)
-                setHint(null)
-                setStatus('waiting')
-            }
-            previousStepIndexRef.current = initialStepIndex
-        })
-
-        return () => {
-            cancelled = true
-        }
+        syncingFromPropRef.current = true
+        setCurrentStepIndex(initialStepIndex)
+        setHint(null)
+        setStatus('waiting')
+        previousStepIndexRef.current = initialStepIndex
     }, [tutorial, initialStepIndex])
 
+    // Notify parent only when step changes internally (not from prop sync)
     useEffect(() => {
+        if (syncingFromPropRef.current) {
+            syncingFromPropRef.current = false
+            return
+        }
         if (typeof onStepChange === 'function') {
             onStepChange(currentStepIndex)
         }
@@ -81,32 +77,38 @@ const TutorialController: React.FC<TutorialControllerProps> = ({ tutorial, onClo
     }
 
     useEffect(() => {
-        let cancelled = false
-
-        queueMicrotask(() => {
-            if (cancelled) return
-            if (currentStepIndex > previousStepIndexRef.current) {
-                setShowStepAdvance(true)
-                clearStepAdvanceFlash()
-                stepAdvanceTimeoutRef.current = window.setTimeout(() => {
-                    setShowStepAdvance(false)
-                    stepAdvanceTimeoutRef.current = null
-                }, 2000)
-            } else if (currentStepIndex < previousStepIndexRef.current) {
+        if (currentStepIndex > previousStepIndexRef.current) {
+            setShowStepAdvance(true)
+            clearStepAdvanceFlash()
+            stepAdvanceTimeoutRef.current = window.setTimeout(() => {
                 setShowStepAdvance(false)
-                clearStepAdvanceFlash()
-            }
-
-            previousStepIndexRef.current = currentStepIndex
-        })
-
-        return () => {
-            cancelled = true
+                stepAdvanceTimeoutRef.current = null
+            }, 2000)
+        } else if (currentStepIndex < previousStepIndexRef.current) {
+            setShowStepAdvance(false)
+            clearStepAdvanceFlash()
         }
+
+        previousStepIndexRef.current = currentStepIndex
     }, [currentStepIndex])
 
-    const goToNextStep = useCallback(() => {
+    const goToNextStep = useCallback(async () => {
         clearAutoAdvance()
+
+        // When verification is provided, let the parent handle everything
+        if (onStepVerify) {
+            setStatus('verifying')
+            try {
+                await onStepVerify(currentStepIndex)
+            } catch (error) {
+                console.error('Step verification error:', error)
+            }
+            setStatus('waiting')
+            // Parent will update tutorial + initialStepIndex, causing re-render
+            return
+        }
+
+        // No verification — advance normally (old behavior)
         setHint(null)
         setStatus('waiting')
         setCurrentStepIndex(prev => {
@@ -116,7 +118,7 @@ const TutorialController: React.FC<TutorialControllerProps> = ({ tutorial, onClo
             }
             return nextIndex
         })
-    }, [onComplete, totalSteps])
+    }, [onStepVerify, currentStepIndex, onComplete, totalSteps])
 
     const goToPreviousStep = useCallback(() => {
         clearAutoAdvance()
@@ -153,16 +155,10 @@ const TutorialController: React.FC<TutorialControllerProps> = ({ tutorial, onClo
     }, [activeStep, goToNextStep])
 
     useEffect(() => {
-        let cancelled = false
         const verifier = verifierRef.current
-
-        queueMicrotask(() => {
-            if (cancelled) return
-            startWatchingStep()
-        })
+        startWatchingStep()
 
         return () => {
-            cancelled = true
             verifier?.stopWatching()
             clearAutoAdvance()
         }
@@ -176,7 +172,14 @@ const TutorialController: React.FC<TutorialControllerProps> = ({ tutorial, onClo
 
     const progressLabel = useMemo(() => `Step ${currentStepIndex + 1} of ${totalSteps}`, [currentStepIndex, totalSteps])
 
-    if (!activeStep) return null
+    if (!activeStep) {
+        return (
+            <div className="flex flex-col gap-4 h-full items-center justify-center">
+                <p style={{ color: '#71717a' }}>Loading next step...</p>
+                <button onClick={onClose} className="nav-btn">Close tutorial</button>
+            </div>
+        )
+    }
 
     return (
         <div className="flex flex-col gap-4 h-full">
@@ -203,6 +206,15 @@ const TutorialController: React.FC<TutorialControllerProps> = ({ tutorial, onClo
                 <div className="step-advance-notification" aria-live="polite">
                     <Sparkles size={16} />
                     <span>Step {currentStepIndex + 1} ready! Follow the on-page highlight.</span>
+                </div>
+            )}
+
+            {isRegenerating && (
+                <div className="step-advance-notification" aria-live="polite" style={{ backgroundColor: '#3b82f6' }}>
+                    <div className="animate-spin" style={{ display: 'inline-block' }}>
+                        <CheckCircle2 size={16} />
+                    </div>
+                    <span>Checking progress and generating next steps...</span>
                 </div>
             )}
 
@@ -258,9 +270,10 @@ const TutorialController: React.FC<TutorialControllerProps> = ({ tutorial, onClo
                     </button>
                     <button
                         onClick={goToNextStep}
+                        disabled={status === 'verifying' || isRegenerating}
                         className="nav-btn nav-btn-primary"
                     >
-                        {currentStepIndex === totalSteps - 1 ? 'Finish' : 'Next'}
+                        {!onStepVerify && currentStepIndex === totalSteps - 1 ? 'Finish' : 'Next'}
                         <ChevronRight size={16} />
                     </button>
                 </div>
