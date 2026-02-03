@@ -118,7 +118,7 @@ export class RouteTracker {
    * Create page state snapshot
    * Captures URL, title, and DOM hash
    */
-  capturePageState(): EnhancedStepRecord['pageState'] {
+  capturePageState(): NonNullable<EnhancedStepRecord['pageState']> {
     return {
       url: window.location.href,
       urlHash: this.getUrlWithoutParams(window.location.href),

@@ -325,7 +325,6 @@ const Chatbot: React.FC = () => {
     const [tutorialFingerprint, setTutorialFingerprint] = useState<string | null>(null)
 
     // LLM verification state
-    const [llmApiKey, setLlmApiKey] = useState<string>('')
     const llmVerifierRef = useRef<LLMVerifier | null>(null)
     const routeTrackerRef = useRef<RouteTracker | null>(null)
 
@@ -357,11 +356,13 @@ const Chatbot: React.FC = () => {
     // Load API key and initialize verifiers
     useEffect(() => {
         chrome.storage.local.get('openai_api_key', (result) => {
-            const apiKey = result.openai_api_key || ''
-            setLlmApiKey(apiKey)
+            const rawApiKey = (result as Record<string, unknown>).openai_api_key
+            const apiKey = typeof rawApiKey === 'string' ? rawApiKey : ''
 
             if (apiKey) {
                 llmVerifierRef.current = new LLMVerifier(apiKey)
+            } else {
+                llmVerifierRef.current = null
             }
         })
     }, [])

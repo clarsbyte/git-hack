@@ -24,6 +24,7 @@ const statusCopy = {
     waiting: 'Waiting for you to complete this step...',
     matched: 'Great! Moving to the next step...',
     hint: 'Having trouble? Use the hint below or click Next to continue.',
+    error: 'Something went wrong. Review the error below and retry when ready.',
 }
 
 const getIndexer = (): ElementIndexer | undefined => {
@@ -136,12 +137,6 @@ const TutorialController: React.FC<TutorialControllerProps> = ({ tutorial, onClo
         setCurrentStepIndex(prev => Math.max(prev - 1, 0))
     }, [])
 
-    const retryStep = useCallback(() => {
-        setError(null)
-        setIsPaused(false)
-        startWatchingStep()
-    }, [startWatchingStep])
-
     const cancelTutorial = useCallback(() => {
         setError(null)
         setIsPaused(false)
@@ -190,6 +185,12 @@ const TutorialController: React.FC<TutorialControllerProps> = ({ tutorial, onClo
             }
         })
     }, [activeStep, goToNextStep, tutorialFingerprint])
+
+    const retryStep = useCallback(() => {
+        setError(null)
+        setIsPaused(false)
+        startWatchingStep()
+    }, [startWatchingStep])
 
     useEffect(() => {
         let cancelled = false
