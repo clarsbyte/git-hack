@@ -1,12 +1,18 @@
-import type { TutorialStep } from '../types/tutorial'
+import type { TutorialStep, StepError } from '../types/tutorial'
 import type { ElementIndexer } from './elementIndexer'
+import { LLMVerifier, type VerificationRequest, type VerificationResponse } from './llmVerifier'
+import { RouteTracker } from './routeTracker'
 
 type MatchHandler = () => void
+type ErrorHandler = (error: StepError) => void
+type ProgressHandler = (message: string) => void
 
 export type WatchOptions = {
     hintDelayMs?: number
     onMatch: MatchHandler
     onHintReady?: () => void
+    onError?: ErrorHandler
+    onProgress?: ProgressHandler
 }
 
 const DEFAULT_HINT_DELAY = 15000
@@ -97,6 +103,19 @@ export class ActionVerifier {
     private cleanupFns: Array<() => void> = []
     private initialUrl = ''
     private matched = false
+    private llmVerifier: LLMVerifier | null = null
+    private routeTracker: RouteTracker | null = null
+    private currentStep: TutorialStep | null = null
+    private currentOptions: WatchOptions | null = null
+
+    constructor(options?: { llmVerifier?: LLMVerifier | null; routeTracker?: RouteTracker | null }) {
+        this.llmVerifier = options?.llmVerifier || null
+        this.routeTracker = options?.routeTracker || null
+    }
+
+    private getCurrentOptions(): WatchOptions {
+        return this.currentOptions || { onMatch: () => {} }
+    }
 
     stopWatching(): void {
         if (this.hintTimeoutId) {
@@ -115,6 +134,8 @@ export class ActionVerifier {
     watchStep(step: TutorialStep, options: WatchOptions): void {
         this.stopWatching()
         this.matched = false
+        this.currentStep = step
+        this.currentOptions = options
 
         const hintDelayMs = options.hintDelayMs ?? DEFAULT_HINT_DELAY
 
@@ -170,7 +191,7 @@ export class ActionVerifier {
             console.warn('Site Tutor: Target element not found for click listener', { selector: step.selector, elementIndex: step.elementIndex })
         }
 
-        const listener = (event: MouseEvent) => {
+        const listener = async (event: MouseEvent) => {
             if (this.matched) return
             if (!(event.target instanceof Element)) return
 
@@ -192,7 +213,29 @@ export class ActionVerifier {
 
             console.log('Site Tutor: Click detected on target element')
 
-            if (expectedResult) {
+            const clickedEl = event.target as HTMLElement
+
+            if (expectedResult && this.llmVerifier) {
+                // NEW: LLM-based verification flow
+                clickDetected = true
+
+                // Show progress
+                const options = this.getCurrentOptions()
+                options?.onProgress?.('Verifying action...')
+
+                // Wait for page to update
+                await new Promise(resolve => setTimeout(resolve, 500))
+
+                // Verify with LLM
+                const verification = await this.verifyActionWithLLM(clickedEl, expectedResult)
+
+                if (verification.isCorrect || verification.confidence > 0.7) {
+                    handler()
+                } else {
+                    this.handleVerificationFailure(verification, clickedEl, options)
+                }
+            } else if (expectedResult) {
+                // OLD: Local verification fallback
                 clickDetected = true
                 setTimeout(() => {
                     if (this.matched) return
@@ -205,6 +248,7 @@ export class ActionVerifier {
                     }
                 }, 300)
             } else {
+                // No verification needed
                 handler()
             }
         }
@@ -212,7 +256,8 @@ export class ActionVerifier {
         document.addEventListener('click', listener, true)
         this.cleanupFns.push(() => document.removeEventListener('click', listener, true))
 
-        if (expectedResult) {
+        if (expectedResult && !this.llmVerifier) {
+            // Fallback interval check (only when no LLM)
             const checkInterval = window.setInterval(() => {
                 if (this.matched) return
                 if (!clickDetected) return
@@ -436,5 +481,74 @@ export class ActionVerifier {
         }
 
         return false
+    }
+
+    /**
+     * Verify action using LLM
+     */
+    private async verifyActionWithLLM(
+        clickedElement: HTMLElement,
+        expectedResult?: string
+    ): Promise<VerificationResponse> {
+        // If no expected result or no LLM verifier, auto-approve
+        if (!expectedResult || !this.llmVerifier) {
+            return {
+                isCorrect: true,
+                confidence: 1,
+                reason: 'No verification required'
+            }
+        }
+
+        const request: VerificationRequest = {
+            stepNumber: this.currentStep?.stepNumber || 0,
+            stepInstruction: this.currentStep?.instruction || '',
+            expectedResult: expectedResult,
+            actualPageState: {
+                url: window.location.href,
+                title: document.title,
+                visibleElements: LLMVerifier.extractVisibleElements(),
+                clickedElement: clickedElement.textContent?.trim() || clickedElement.tagName
+            }
+        }
+
+        return await this.llmVerifier.verifyStepOutcome(request)
+    }
+
+    /**
+     * Handle verification failure
+     */
+    private handleVerificationFailure(
+        verification: VerificationResponse,
+        clickedElement: HTMLElement,
+        options: WatchOptions
+    ): void {
+        this.matched = true  // Prevent other listeners from triggering
+        this.stopWatching()
+
+        const error: StepError = {
+            message: verification.reason,
+            expectedAction: this.currentStep?.instruction || '',
+            actualAction: `Clicked: ${clickedElement.textContent?.trim() || clickedElement.tagName}`,
+            canRetry: true
+        }
+
+        options.onError?.(error)
+    }
+
+    /**
+     * Capture clicked element for memory
+     */
+    captureClickedElement(element: HTMLElement): any {
+        if (this.routeTracker) {
+            return this.routeTracker.captureClickedElement(element)
+        }
+        return null
+    }
+
+    /**
+     * Get captured element data (for use by TutorialController)
+     */
+    getLastClickedElementData(): any {
+        return this.routeTracker ? this.routeTracker.capturePageState() : null
     }
 }

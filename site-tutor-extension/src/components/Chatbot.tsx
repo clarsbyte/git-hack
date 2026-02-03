@@ -5,6 +5,8 @@ import Overlay from './Overlay'
 import TutorialController from './TutorialController'
 import type { TutorialActionType, TutorialPayload } from '../types/tutorial'
 import { ElementIndexer } from '../utils/elementIndexer'
+import { LLMVerifier } from '../utils/llmVerifier'
+import { RouteTracker } from '../utils/routeTracker'
 import {
     generateFingerprint,
     saveTutorialRecord,
@@ -322,6 +324,11 @@ const Chatbot: React.FC = () => {
     const [tabId, setTabId] = useState<number | null>(null)
     const [tutorialFingerprint, setTutorialFingerprint] = useState<string | null>(null)
 
+    // LLM verification state
+    const [llmApiKey, setLlmApiKey] = useState<string>('')
+    const llmVerifierRef = useRef<LLMVerifier | null>(null)
+    const routeTrackerRef = useRef<RouteTracker | null>(null)
+
     const messagesEndRef = useRef<HTMLDivElement>(null)
 
     const scrollToBottom = () => {
@@ -346,6 +353,27 @@ const Chatbot: React.FC = () => {
             setStorageKey(key)
         })
     }, [])
+
+    // Load API key and initialize verifiers
+    useEffect(() => {
+        chrome.storage.local.get('openai_api_key', (result) => {
+            const apiKey = result.openai_api_key || ''
+            setLlmApiKey(apiKey)
+
+            if (apiKey) {
+                llmVerifierRef.current = new LLMVerifier(apiKey)
+            }
+        })
+    }, [])
+
+    // Initialize route tracker when tutorial starts
+    useEffect(() => {
+        if (tutorialFingerprint && !routeTrackerRef.current) {
+            routeTrackerRef.current = new RouteTracker(tutorialFingerprint)
+        } else if (!tutorialFingerprint && routeTrackerRef.current) {
+            routeTrackerRef.current = null
+        }
+    }, [tutorialFingerprint])
 
     // Restore tutorial state from storage
     useEffect(() => {
@@ -731,6 +759,9 @@ const Chatbot: React.FC = () => {
                                     <TutorialController
                                         tutorial={tutorial}
                                         initialStepIndex={currentTutorialStep}
+                                        tutorialFingerprint={tutorialFingerprint || undefined}
+                                        llmVerifier={llmVerifierRef.current}
+                                        routeTracker={routeTrackerRef.current}
                                         onStepChange={(index) => {
                                             // Mark previous step as completed when advancing
                                             if (index > currentTutorialStep && tutorialFingerprint) {

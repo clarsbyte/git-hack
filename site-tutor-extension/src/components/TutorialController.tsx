@@ -1,8 +1,11 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { AlertCircle, CheckCircle2, ChevronLeft, ChevronRight, Lightbulb, Sparkles, X } from 'lucide-react'
-import type { TutorialPayload, TutorialStep } from '../types/tutorial'
+import { AlertCircle, CheckCircle2, ChevronLeft, ChevronRight, Lightbulb, Sparkles, X, AlertTriangle } from 'lucide-react'
+import type { TutorialPayload, TutorialStep, StepError } from '../types/tutorial'
 import { ActionVerifier } from '../utils/actionVerifier'
 import type { ElementIndexer } from '../utils/elementIndexer'
+import { saveStepError } from '../utils/tutorialMemory'
+import type { LLMVerifier } from '../utils/llmVerifier'
+import type { RouteTracker } from '../utils/routeTracker'
 
 interface TutorialControllerProps {
     tutorial: TutorialPayload
@@ -10,6 +13,9 @@ interface TutorialControllerProps {
     onStepChange?: (index: number) => void
     onComplete?: () => void
     initialStepIndex?: number
+    tutorialFingerprint?: string
+    llmVerifier?: LLMVerifier | null
+    routeTracker?: RouteTracker | null
 }
 
 const AUTO_ADVANCE_DELAY = 900
@@ -24,11 +30,16 @@ const getIndexer = (): ElementIndexer | undefined => {
     return (window as typeof window & { __siteTutorElementIndexer?: ElementIndexer }).__siteTutorElementIndexer
 }
 
-const TutorialController: React.FC<TutorialControllerProps> = ({ tutorial, onClose, onStepChange, onComplete, initialStepIndex = 0 }) => {
+const TutorialController: React.FC<TutorialControllerProps> = ({ tutorial, onClose, onStepChange, onComplete, initialStepIndex = 0, tutorialFingerprint, llmVerifier, routeTracker }) => {
     const [currentStepIndex, setCurrentStepIndex] = useState(initialStepIndex)
-    const [status, setStatus] = useState<'waiting' | 'matched' | 'hint'>('waiting')
+    const [status, setStatus] = useState<'waiting' | 'matched' | 'hint' | 'error'>('waiting')
     const [hint, setHint] = useState<string | null>(null)
-    const verifierRef = useRef(new ActionVerifier())
+    const [error, setError] = useState<StepError | null>(null)
+    const [isPaused, setIsPaused] = useState(false)
+    const verifierRef = useRef(new ActionVerifier({
+        llmVerifier: llmVerifier || null,
+        routeTracker: routeTracker || null
+    }))
     const autoAdvanceTimeoutRef = useRef<ReturnType<typeof window.setTimeout> | null>(null)
     const stepAdvanceTimeoutRef = useRef<ReturnType<typeof window.setTimeout> | null>(null)
     const previousStepIndexRef = useRef(initialStepIndex)
@@ -125,9 +136,23 @@ const TutorialController: React.FC<TutorialControllerProps> = ({ tutorial, onClo
         setCurrentStepIndex(prev => Math.max(prev - 1, 0))
     }, [])
 
+    const retryStep = useCallback(() => {
+        setError(null)
+        setIsPaused(false)
+        startWatchingStep()
+    }, [startWatchingStep])
+
+    const cancelTutorial = useCallback(() => {
+        setError(null)
+        setIsPaused(false)
+        onClose()
+    }, [onClose])
+
     const startWatchingStep = useCallback(() => {
         if (!activeStep) return
         setHint(null)
+        setError(null)
+        setIsPaused(false)
         setStatus('waiting')
         clearAutoAdvance()
 
@@ -148,9 +173,23 @@ const TutorialController: React.FC<TutorialControllerProps> = ({ tutorial, onClo
             onHintReady: () => {
                 setStatus('hint')
                 setHint(activeStep.hint || activeStep.expectedResult || 'Try following the on-screen instructions closely.')
+            },
+            onError: (stepError) => {
+                setStatus('error')
+                setError(stepError)
+                setIsPaused(true)
+                clearAutoAdvance()
+
+                // Save error to memory
+                if (tutorialFingerprint) {
+                    saveStepError(tutorialFingerprint, activeStep.stepNumber - 1, stepError)
+                }
+            },
+            onProgress: (msg) => {
+                setHint(msg)
             }
         })
-    }, [activeStep, goToNextStep])
+    }, [activeStep, goToNextStep, tutorialFingerprint])
 
     useEffect(() => {
         let cancelled = false
@@ -228,12 +267,42 @@ const TutorialController: React.FC<TutorialControllerProps> = ({ tutorial, onClo
                 </div>
             </div>
 
-            {hint && (
+            {hint && !isPaused && (
                 <div className="hint-box">
                     <Lightbulb size={16} style={{ marginTop: '2px' }} />
                     <div>
                         <p className="hint-title">Need a hint?</p>
                         <p>{hint}</p>
+                    </div>
+                </div>
+            )}
+
+            {error && isPaused && (
+                <div className="error-box">
+                    <AlertTriangle size={20} className="error-icon" />
+                    <div className="error-content">
+                        <h4 className="error-title">Wrong Action Detected</h4>
+                        <p className="error-message">{error.message}</p>
+                        <div className="error-details">
+                            <div>
+                                <strong>Expected:</strong>
+                                <p>{error.expectedAction}</p>
+                            </div>
+                            <div>
+                                <strong>What happened:</strong>
+                                <p>{error.actualAction}</p>
+                            </div>
+                        </div>
+                        <div className="error-actions">
+                            {error.canRetry && (
+                                <button onClick={retryStep} className="retry-btn">
+                                    ↻ Retry This Step
+                                </button>
+                            )}
+                            <button onClick={cancelTutorial} className="cancel-btn">
+                                Cancel Tutorial
+                            </button>
+                        </div>
                     </div>
                 </div>
             )}

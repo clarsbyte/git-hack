@@ -6,6 +6,37 @@ export interface StepRecord {
     instruction: string
     completed: boolean
     completedAt?: number
+
+    // Enhanced memory fields
+    clickedElement?: {
+        xpath: string
+        selector: string
+        elementText: string
+        tagName: string
+    }
+
+    pageState?: {
+        url: string
+        urlHash: string
+        title: string
+        domHash: string
+        timestamp: number
+    }
+
+    verification?: {
+        method: 'llm' | 'strict' | 'manual'
+        isCorrect: boolean
+        llmResponse?: string
+        errorReason?: string
+        verifiedAt: number
+    }
+
+    error?: {
+        message: string
+        expectedAction: string
+        actualAction: string
+        canRetry: boolean
+    }
 }
 
 export interface TutorialRecord {
@@ -140,4 +171,104 @@ export async function getCompletionHistory(origin: string): Promise<{ title: str
         .filter(r => r.origin === origin && r.completedAt)
         .map(r => ({ title: r.title, completedAt: r.completedAt! }))
         .sort((a, b) => b.completedAt - a.completedAt)
+}
+
+/**
+ * Save step error when wrong action is detected
+ */
+export async function saveStepError(
+    fingerprint: string,
+    stepIndex: number,
+    error: { message: string; expectedAction: string; actualAction: string; canRetry: boolean }
+): Promise<void> {
+    const records = await loadAllRecords()
+    const record = records.find(r => r.fingerprint === fingerprint)
+    if (!record) return
+
+    if (stepIndex >= 0 && stepIndex < record.steps.length) {
+        record.steps[stepIndex].error = {
+            message: error.message,
+            expectedAction: error.expectedAction,
+            actualAction: error.actualAction,
+            canRetry: error.canRetry
+        }
+        record.lastAccessedAt = Date.now()
+    }
+
+    await saveAllRecords(records)
+}
+
+/**
+ * Save step verification result and action data
+ */
+export async function saveStepVerification(
+    fingerprint: string,
+    stepIndex: number,
+    verification: {
+        isCorrect: boolean
+        confidence: number
+        reason: string
+        suggestedAction?: 'continue' | 'retry' | 'abort'
+    },
+    actionData: {
+        clickedElement?: StepRecord['clickedElement']
+        pageState?: StepRecord['pageState']
+    }
+): Promise<void> {
+    const records = await loadAllRecords()
+    const record = records.find(r => r.fingerprint === fingerprint)
+    if (!record) return
+
+    if (stepIndex >= 0 && stepIndex < record.steps.length) {
+        record.steps[stepIndex] = {
+            ...record.steps[stepIndex],
+            clickedElement: actionData.clickedElement,
+            pageState: actionData.pageState,
+            verification: {
+                method: 'llm',
+                isCorrect: verification.isCorrect,
+                llmResponse: verification.reason,
+                verifiedAt: Date.now()
+            }
+        }
+        record.lastAccessedAt = Date.now()
+    }
+
+    await saveAllRecords(records)
+}
+
+/**
+ * Get route history for a tutorial
+ */
+export async function getRouteHistory(fingerprint: string): Promise<any | null> {
+    const ROUTE_HISTORY_KEY = `siteTutor:routeHistory:${fingerprint}`
+
+    if (!chrome?.storage?.local) return null
+    return new Promise((resolve) => {
+        chrome.storage.local.get([ROUTE_HISTORY_KEY], (result) => {
+            if (chrome.runtime.lastError) {
+                console.warn('routeHistory: load error', chrome.runtime.lastError)
+                resolve(null)
+                return
+            }
+            resolve(result[ROUTE_HISTORY_KEY] ?? null)
+        })
+    })
+}
+
+/**
+ * Save route history for a tutorial
+ */
+export async function saveRouteHistory(fingerprint: string, history: any): Promise<void> {
+    const ROUTE_HISTORY_KEY = `siteTutor:routeHistory:${fingerprint}`
+
+    if (!chrome?.storage?.local) return
+    return new Promise((resolve) => {
+        chrome.storage.local.set({ [ROUTE_HISTORY_KEY]: history }, () => {
+            if (chrome.runtime.lastError) {
+                console.warn('routeHistory: save error', chrome.runtime.lastError)
+            }
+            resolve()
+        })
+    })
 }
