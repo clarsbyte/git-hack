@@ -622,10 +622,14 @@ const Overlay: React.FC<OverlayProps> = ({ highlights, currentStepIndex }) => {
                     const viewportHeight = typeof window !== 'undefined' ? window.innerHeight : 0
                     const labelMaxWidth = Math.min(360, Math.max(200, viewportWidth - 16))
                     const labelLeft = Math.min(Math.max(8, rect.left), Math.max(8, viewportWidth - labelMaxWidth - 8))
-                    const labelTopPreferred = rect.top - 40
-                    const labelTopFallback = rect.bottom + 8
-                    const labelTop = labelTopPreferred < 8 ? labelTopFallback : labelTopPreferred
-                    const clampedLabelTop = Math.min(Math.max(8, labelTop), Math.max(8, viewportHeight - 40))
+                    const labelGap = 10
+                    const labelHeightEstimate = isGuidedStep ? 52 : 44
+                    const spaceAbove = rect.top
+                    const spaceBelow = viewportHeight - rect.bottom
+                    const canPlaceAbove = spaceAbove >= labelHeightEstimate + labelGap
+                    const canPlaceBelow = spaceBelow >= labelHeightEstimate + labelGap
+                    const placeAbove = canPlaceAbove || (!canPlaceBelow && spaceAbove >= spaceBelow)
+                    const labelTop = placeAbove ? -labelGap : rect.height + labelGap
 
                     return (
                         <motion.div
@@ -644,7 +648,7 @@ const Overlay: React.FC<OverlayProps> = ({ highlights, currentStepIndex }) => {
                             <div
                                 className="absolute bg-red-500 text-white font-bold px-3 py-1 rounded shadow-md text-sm z-50 pointer-events-auto flex items-center gap-2"
                                 style={{
-                                    top: clampedLabelTop - rect.top,
+                                    top: labelTop,
                                     left: labelLeft - rect.left,
                                     maxWidth: labelMaxWidth,
                                     overflow: 'hidden',
@@ -653,6 +657,7 @@ const Overlay: React.FC<OverlayProps> = ({ highlights, currentStepIndex }) => {
                                     WebkitLineClamp: 2,
                                     WebkitBoxOrient: 'vertical',
                                     whiteSpace: 'normal',
+                                    transform: placeAbove ? 'translateY(-100%)' : 'none',
                                 }}
                             >
                                 {stepLabel && <span className="text-[10px] uppercase tracking-wide text-white/80">{stepLabel}</span>}

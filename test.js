@@ -4,11 +4,11 @@ const path = require('node:path')
 const checks = [
   {
     file: 'backend/main.py',
-    required: ['CLAUDE_API_KEY'],
+    required: ['CEREBRAS_API_KEY'],
   },
   {
     file: 'README.md',
-    required: ['CLAUDE_API_KEY'],
+    required: ['CEREBRAS_API_KEY'],
   }
 ]
 
@@ -25,7 +25,8 @@ for (const check of checks) {
     }
   }
 
-  for (const forbidden of check.forbidden) {
+  const forbiddenList = check.forbidden ?? []
+  for (const forbidden of forbiddenList) {
     if (content.includes(forbidden)) {
       console.error(`[FAIL] ${check.file} contains ${forbidden}`)
       ok = false
@@ -34,7 +35,7 @@ for (const check of checks) {
 }
 
 if (ok) {
-  console.log('OK: CLAUDE_API_KEY is set and legacy keys are not present.')
+  console.log('OK: CEREBRAS_API_KEY is set and legacy keys are not present.')
   process.exit(0)
 }
 

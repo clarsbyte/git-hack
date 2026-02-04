@@ -6,12 +6,13 @@ from pydantic import BaseModel
 from typing import List, Optional
 import json
 from dotenv import load_dotenv
-from anthropic import Anthropic
-from PIL import Image, ImageGrab
+from PIL import ImageGrab
 import io
 import asyncio
 from session_manager import SessionManager, TutorialPlanState
 import base64
+from cerebras.cloud.sdk import Cerebras
+from cerebras.cloud.sdk import APIError, APIConnectionError, RateLimitError
 
 load_dotenv()
 
@@ -33,13 +34,124 @@ def extract_json_object(raw_text: str) -> Optional[str]:
         return raw_text[start:last_end]
     return None
 
-api_key = os.getenv("CLAUDE_API_KEY")
-if not api_key:
-    print("WARNING: CLAUDE_API_KEY not found in environment variables.")
+def check_network_connectivity(host: str = "api.cerebras.ai") -> dict:
+    """Check if the Cerebras API is reachable using the SDK."""
+    import socket
+    result = {
+        "dns_ok": False,
+        "https_ok": False,
+        "auth_ok": False,
+        "dns_error": None,
+        "https_error": None,
+    }
 
-client = Anthropic(api_key=api_key)
-model_name = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
-max_output_tokens = int(os.getenv("CLAUDE_MAX_TOKENS", "4096"))
+    # Check DNS
+    try:
+        ip = socket.gethostbyname(host)
+        result["dns_ok"] = True
+        result["dns_ip"] = ip
+    except socket.gaierror as e:
+        result["dns_error"] = f"Cannot resolve {host}: {e}"
+        return result
+
+    # Check HTTPS connectivity with authentication using SDK
+    if not cerebras_client:
+        result["https_error"] = "Cerebras client not initialized"
+        return result
+
+    try:
+        # Try a simple API call with minimal tokens
+        cerebras_client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": "test"}],
+            max_tokens=1,
+        )
+        result["https_ok"] = True
+        result["auth_ok"] = True
+    except APIConnectionError as e:
+        result["https_error"] = f"Connection failed: {e}"
+    except APIError as e:
+        if "401" in str(e.status_code) or "Unauthorized" in str(e):
+            result["https_error"] = f"HTTP 401: Invalid or expired API key"
+        elif "403" in str(e.status_code) or "Forbidden" in str(e):
+            result["https_error"] = f"HTTP 403: Access forbidden - check account permissions"
+            result["https_ok"] = True  # Connection works, auth/permissions fail
+        else:
+            result["https_error"] = f"API error: {e}"
+    except Exception as e:
+        result["https_error"] = f"Connection check failed: {e}"
+
+    return result
+
+api_key = os.getenv("CEREBRAS_API_KEY")
+if not api_key:
+    print("WARNING: CEREBRAS_API_KEY not found in environment variables.")
+
+model_name = "llama-3.3-70b";
+max_output_tokens = int(os.getenv("CEREBRAS_MAX_TOKENS", "4096"))
+request_timeout = float(os.getenv("CEREBRAS_TIMEOUT", "60"))
+
+# Initialize Cerebras client
+cerebras_client = None
+if api_key:
+    try:
+        cerebras_client = Cerebras(api_key=api_key, timeout=request_timeout)
+    except Exception as e:
+        print(f"WARNING: Failed to initialize Cerebras client: {e}")
+
+def cerebras_chat(messages: list, max_tokens: int, temperature: float = 0.0, stream: bool = False) -> dict:
+    """
+    Send a chat message to Cerebras API using the official SDK.
+    Returns the full response object from the API.
+    """
+    if not api_key:
+        raise RuntimeError("CEREBRAS_API_KEY not configured")
+
+    if not cerebras_client:
+        raise RuntimeError("Cerebras client failed to initialize. Check CEREBRAS_API_KEY.")
+
+    try:
+        response = cerebras_client.chat.completions.create(
+            model=model_name,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stream=stream,
+        )
+
+        # Convert response to dict format for compatibility with existing code
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": response.choices[0].message.content
+                    }
+                }
+            ]
+        }
+
+    except APIConnectionError as e:
+        error_msg = f"Cerebras connection error: {e}. Check your internet connection."
+        print(f"Connection Error: {error_msg}")
+        raise RuntimeError(error_msg) from e
+    except RateLimitError as e:
+        error_msg = f"Cerebras rate limit exceeded. Please wait before retrying."
+        print(f"Rate Limit Error: {error_msg}")
+        raise RuntimeError(error_msg) from e
+    except APIError as e:
+        error_msg = f"Cerebras API error {e.status_code}: {e.message}"
+        print(f"API Error: {error_msg}")
+        raise RuntimeError(error_msg) from e
+    except Exception as e:
+        error_msg = f"Unexpected error calling Cerebras: {e}"
+        print(f"Unexpected Error: {error_msg}")
+        raise RuntimeError(error_msg) from e
+
+def extract_cerebras_message(response_json: dict) -> str:
+    try:
+        return response_json["choices"][0]["message"]["content"] or ""
+    except (KeyError, IndexError, TypeError):
+        return json.dumps(response_json)
 
 app = FastAPI()
 
@@ -53,6 +165,24 @@ app.add_middleware(
 
 # Session Manager for conversation tracking
 session_manager = SessionManager()
+
+@app.get("/health-check")
+async def health_check():
+    """
+    Diagnostic endpoint to check Cerebras API connectivity.
+    Useful for debugging network issues before attempting requests.
+    """
+    network_info = check_network_connectivity()
+
+    return {
+        "backend": "ok",
+        "api_key_configured": bool(api_key),
+        "network": network_info,
+        "message": (
+            "✓ Ready to connect to Cerebras" if (network_info["dns_ok"] and network_info["https_ok"])
+            else "✗ Cannot reach Cerebras API - check network settings"
+        )
+    }
 
 @app.on_event("startup")
 async def startup_event():
@@ -98,22 +228,18 @@ async def chat(
 
     if not api_key:
          return ChatResponse(
-             text="Please set your CLAUDE_API_KEY in the backend/.env file to enable the AI agent.",
+             text="Please set your CEREBRAS_API_KEY in the backend/.env file to enable the AI agent.",
              highlights=[],
              automation=None,
              sessionId=session.id
          )
 
     try:
-        # Process and store screenshot
-        screenshot_image = None
         if screenshot:
-            print(f"Processing screenshot: {screenshot.filename}")
-            image_bytes = await screenshot.read()
-            screenshot_image = Image.open(io.BytesIO(image_bytes))
+            print(f"Screenshot received ({screenshot.filename}) but Cerebras is text-only; ignoring image.")
 
         # Store user message in session
-        session.add_message('user', message, screenshot_image)
+        session.add_message('user', message)
 
         prompt_text = ""
         # Detect if this is a "select" or "highlight" instruction
@@ -282,36 +408,20 @@ If no automation is needed, set "automation": null.
 If you cannot find an element index, you may include a "selector" field as a CSS selector fallback.
 """
 
-        if not screenshot_image:
+        if screenshot:
+            prompt_text += "\n(Screenshot provided but omitted; current Cerebras models are text-only.)"
+        else:
             prompt_text += "\n(No screenshot provided, answer based on general web knowledge if possible)"
 
-        # Generate content with Claude
-        content_blocks = [{"type": "text", "text": prompt_text}]
-        if screenshot_image:
-            img_bytes = io.BytesIO()
-            screenshot_image.save(img_bytes, format="PNG")
-            img_bytes.seek(0)
-            content_blocks.append({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": "image/png",
-                    "data": base64.b64encode(img_bytes.getvalue()).decode("utf-8")
-                }
-            })
-
-        response = client.messages.create(
-            model=model_name,
+        response = cerebras_chat(
+            [{"role": "user", "content": prompt_text}],
             max_tokens=max_output_tokens,
-            messages=[{"role": "user", "content": content_blocks}],
+            temperature=0.0,
+            stream=False,
         )
 
-        raw_text = ""
-        for block in response.content:
-            text_value = getattr(block, "text", None)
-            if text_value:
-                raw_text += text_value
-        print(f"Claude raw response: {raw_text}")
+        raw_text = extract_cerebras_message(response)
+        print(f"Cerebras raw response: {raw_text}")
         
         # Clean potential markdown code blocks
         if raw_text.startswith("```json"):
@@ -408,7 +518,7 @@ If you cannot find an element index, you may include a "selector" field as a CSS
         )
 
     except Exception as e:
-        print(f"Error calling Claude: {e}")
+        print(f"Error calling Cerebras: {e}")
         return ChatResponse(
             text=f"I encountered an error analyzing the page: {str(e)}",
             highlights=[],
@@ -513,35 +623,17 @@ CRITICAL:
 """
 
     try:
-        content_blocks = [{"type": "text", "text": prompt}]
-
-        # Process screenshot if provided
         if screenshot:
-            image_bytes = await screenshot.read()
-            screenshot_image = Image.open(io.BytesIO(image_bytes))
-            img_bytes = io.BytesIO()
-            screenshot_image.save(img_bytes, format="PNG")
-            img_bytes.seek(0)
-            content_blocks.append({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": "image/png",
-                    "data": base64.b64encode(img_bytes.getvalue()).decode("utf-8")
-                }
-            })
+            print("Continue-tutorial screenshot received but omitted; Cerebras is text-only.")
 
-        response = client.messages.create(
-            model=model_name,
+        response = cerebras_chat(
+            [{"role": "user", "content": prompt}],
             max_tokens=max_output_tokens,
-            messages=[{"role": "user", "content": content_blocks}],
+            temperature=0.0,
+            stream=False,
         )
 
-        raw_text = ""
-        for block in response.content:
-            text_value = getattr(block, "text", None)
-            if text_value:
-                raw_text += text_value
+        raw_text = extract_cerebras_message(response)
 
         print(f"Continue-tutorial raw response: {raw_text}")
 
@@ -634,32 +726,17 @@ Based on the screenshot and page context, did the user successfully complete thi
   "reason": "brief explanation"
 }}"""
 
-        # Build content blocks
-        content_blocks = [{"type": "text", "text": verify_prompt}]
-
-        # Add screenshot if provided
         if request.screenshot:
-            content_blocks.append({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": "image/png",
-                    "data": request.screenshot
-                }
-            })
+            verify_prompt += "\n(Note: Screenshot provided but omitted; current Cerebras models are text-only.)"
 
-        # Call Claude for verification
-        response = client.messages.create(
-            model=model_name,
+        response = cerebras_chat(
+            [{"role": "user", "content": verify_prompt}],
             max_tokens=200,
-            messages=[{"role": "user", "content": content_blocks}],
+            temperature=0.0,
+            stream=False,
         )
 
-        raw_text = ""
-        for block in response.content:
-            text_value = getattr(block, "text", None)
-            if text_value:
-                raw_text += text_value
+        raw_text = extract_cerebras_message(response)
 
         # Parse JSON response
         try:

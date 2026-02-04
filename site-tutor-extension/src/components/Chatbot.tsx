@@ -87,6 +87,10 @@ const compressScreenshot = async (dataUrl: string): Promise<Blob> => {
 
 const STORAGE_KEY_PREFIX = 'siteTutorState'
 const FALLBACK_STORAGE_KEY = `${STORAGE_KEY_PREFIX}:default`
+const GLOBAL_UI_STATE_KEY = `${STORAGE_KEY_PREFIX}:ui`
+const DEFAULT_MESSAGES: Message[] = [
+    { sender: 'bot', text: "Hi! I'm your Site Tutor. I can teach you anything about this website. Ask a question or request a tutorial!" }
+]
 const extractNumberedSteps = (text: string): string[] | null => {
     const lines = text.split(/\r?\n/).map(line => line.trim())
     const steps: string[] = []
@@ -310,9 +314,7 @@ const Chatbot: React.FC = () => {
     const [loading, setLoading] = useState(false)
 
     // Chat state
-    const [messages, setMessages] = useState<Message[]>([
-        { sender: 'bot', text: "Hi! I'm your Site Tutor. I can teach you anything about this website. Ask a question or request a tutorial!" }
-    ])
+    const [messages, setMessages] = useState<Message[]>(DEFAULT_MESSAGES)
     const [highlights, setHighlights] = useState<Highlight[]>([])
     const [sessionId, setSessionId] = useState<string | null>(null)
 
@@ -389,7 +391,7 @@ const Chatbot: React.FC = () => {
             return
         }
 
-        chrome.storage.local.get([storageKey, SESSION_STORE_KEY], (result) => {
+        chrome.storage.local.get([storageKey, SESSION_STORE_KEY, GLOBAL_UI_STATE_KEY], (result) => {
             if (chrome.runtime.lastError) {
                 console.warn('Failed to load state:', chrome.runtime.lastError)
                 setIsRestoring(false)
@@ -398,13 +400,15 @@ const Chatbot: React.FC = () => {
 
             const stored = result[storageKey] as StoredState | undefined
             const sessionStore = result[SESSION_STORE_KEY] as SessionStore | undefined
+            const uiState = result[GLOBAL_UI_STATE_KEY] as { isOpen?: boolean } | undefined
+            const globalIsOpen = uiState?.isOpen === true
             const session = tabId !== null ? sessionStore?.[String(tabId)] : undefined
 
             const restoredUrl = stored?.lastUrl ?? session?.lastUrl ?? null
             if (stored && stored.origin === window.location.origin) {
                 setTutorial(stored.tutorial)
                 setCurrentTutorialStep(stored.currentTutorialStep)
-                setIsOpen(stored.isOpen)
+                setIsOpen(stored.isOpen || globalIsOpen)
                 setRestoredLastUrl(restoredUrl)
                 setSessionId(stored.sessionId ?? null)
                 if (stored.tutorial) {
@@ -420,7 +424,7 @@ const Chatbot: React.FC = () => {
 
                 setTutorial(session.tutorial)
                 setCurrentTutorialStep(nextStepIndex)
-                setIsOpen(session.isOpen)
+                setIsOpen(session.isOpen || globalIsOpen)
                 setRestoredLastUrl(restoredUrl)
                 setSessionId(session.sessionId ?? null)
                 if (session.tutorial) {
@@ -429,6 +433,16 @@ const Chatbot: React.FC = () => {
                 } else {
                     setHighlights([])
                 }
+            } else {
+                const openState = stored?.isOpen ?? session?.isOpen ?? globalIsOpen
+                setIsOpen(!!openState)
+                setTutorial(null)
+                setCurrentTutorialStep(0)
+                setMode('idle')
+                setHighlights([])
+                setSessionId(null)
+                setRestoredLastUrl(restoredUrl)
+                setMessages(DEFAULT_MESSAGES)
             }
 
             setIsRestoring(false)
@@ -451,6 +465,13 @@ const Chatbot: React.FC = () => {
 
         chrome.storage.local.set({ [storageKey]: state })
     }, [tutorial, currentTutorialStep, isOpen, storageKey, isRestoring])
+
+    useEffect(() => {
+        if (isRestoring) return
+        if (!chrome?.storage?.local) return
+
+        chrome.storage.local.set({ [GLOBAL_UI_STATE_KEY]: { isOpen } })
+    }, [isOpen, isRestoring])
 
     useEffect(() => {
         if (tabId === null || isRestoring) return
@@ -521,9 +542,7 @@ const Chatbot: React.FC = () => {
         setInput('')
         setLoading(false)
         setSessionId(null)
-        setMessages([
-            { sender: 'bot', text: "Hi! I'm your Site Tutor. I can teach you anything about this website. Ask a question or request a tutorial!" }
-        ])
+        setMessages(DEFAULT_MESSAGES)
     }
 
     const handleSend = async () => {

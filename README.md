@@ -6,17 +6,17 @@ A Chrome extension that teaches users how to use any website through interactive
 
 ```
 site-tutor-extension/   # Chrome extension (React + TypeScript + Vite)
-backend/                # FastAPI server with Gemini AI integration
+backend/                # FastAPI server with Cerebras Inference integration
 ```
 
 ## Key Features
 
 ### 1. Element Indexing (Accurate Overlays)
 
-Instead of having Gemini guess CSS selectors from screenshots, the extension walks the DOM and assigns each interactive element a numeric index. Gemini picks an index number, and the frontend looks up the real element directly — no selector matching needed.
+Instead of having Cerebras guess CSS selectors from screenshots, the extension walks the DOM and assigns each interactive element a numeric index. Cerebras picks an index number, and the frontend looks up the real element directly — no selector matching needed.
 
 - **`elementIndexer.ts`** — `ElementIndexer` class that indexes up to 200 interactive/visible elements, traverses Shadow DOM, skips the extension's own UI
-- Produces compact text representations sent to Gemini:
+- Produces compact text representations sent to Cerebras:
   ```
   [0] button "Sign in" id="login-btn"
   [1] a "Pricing" href="/pricing"
@@ -30,7 +30,7 @@ Tutorial progress persists across tab closes using `chrome.storage.local`.
 
 - **`tutorialMemory.ts`** — Fingerprints tutorials by origin + title + steps, stores up to 50 records with 30-day expiry
 - Resumes from where the user left off on return
-- Detects similar previously-completed tutorials so Gemini can skip basics
+- Detects similar previously-completed tutorials so Cerebras can skip basics
 - Sends completion history to the backend so AI builds on prior knowledge
 
 ### 3. Seamless Step Detection (No Hard Timeout)
@@ -55,7 +55,7 @@ The watcher runs continuously instead of stopping after 20 seconds.
 | `site-tutor-extension/src/components/Chatbot.tsx` | Main chat UI, orchestrates indexer + memory |
 | `site-tutor-extension/src/components/Overlay.tsx` | Element highlight overlay rendering |
 | `site-tutor-extension/src/components/TutorialController.tsx` | Step-by-step tutorial UI and watcher |
-| `backend/main.py` | FastAPI server, Gemini prompt, element index API |
+| `backend/main.py` | FastAPI server, Cerebras prompt, element index API |
 
 ## Setup
 
@@ -79,7 +79,10 @@ pip install -r requirements.txt
 Create a `backend/.env` file:
 
 ```
-CLAUDE_API_KEY=your_key_here
+CEREBRAS_API_KEY=your_key_here
+# Optional overrides:
+# CEREBRAS_MODEL=llama-3.3-70b
+# CEREBRAS_BASE_URL=https://api.cerebras.ai/v1
 ```
 
 Start the server:
