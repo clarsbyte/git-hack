@@ -15,12 +15,24 @@ class Message:
 
 
 @dataclass
+class TutorialPlanState:
+    """Tracks the high-level tutorial plan across page transitions"""
+    plan_steps: list                    # All abstract steps as dicts
+    completed_step_indices: List[int]   # Which global steps are done
+    current_page_start_index: int       # Where current page steps begin in plan
+    original_query: str                 # The user's original tutorial request
+    title: str                          # Tutorial title
+    total_steps: int                    # Total number of plan steps
+
+
+@dataclass
 class Session:
     """Represents a conversation session with history"""
     id: str
     messages: List[Message] = field(default_factory=list)
     created_at: datetime = field(default_factory=datetime.now)
     last_activity: datetime = field(default_factory=datetime.now)
+    tutorial_plan: Optional[TutorialPlanState] = None
 
     def add_message(self, role: str, text: str, screenshot: Optional[Image.Image] = None):
         """Add a message to the session history"""
@@ -36,7 +48,7 @@ class Session:
         return datetime.now() - self.last_activity > timedelta(minutes=ttl_minutes)
 
     def get_conversation_history(self) -> str:
-        """Get formatted conversation history for LUX task generation"""
+        """Get formatted conversation history"""
         return "\n".join([
             f"{msg.role.upper()}: {msg.text}"
             for msg in self.messages

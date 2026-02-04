@@ -79,7 +79,7 @@ pip install -r requirements.txt
 Create a `backend/.env` file:
 
 ```
-GEMINI_API_KEY=your_key_here
+CLAUDE_API_KEY=your_key_here
 ```
 
 Start the server:

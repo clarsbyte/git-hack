@@ -13,6 +13,36 @@ export interface TutorialStep {
 export interface TutorialPayload {
     title: string
     steps: TutorialStep[]
+    plan?: TutorialPlan
+    planStepOffset?: number
+}
+
+// Abstract step in the high-level plan - NO element indices, page-agnostic
+export interface PlanStep {
+    stepNumber: number
+    instruction: string
+    actionType: TutorialActionType
+    expectedResult?: string
+    hint?: string
+    expectsPageChange: boolean
+    pageDescription?: string
+}
+
+// Highlight with a reference back to which plan step it belongs to
+export interface PlanHighlight {
+    elementIndex?: number
+    explanation: string
+    selector?: string
+    planStepNumber?: number
+}
+
+// Full high-level plan returned by the backend
+export interface TutorialPlan {
+    title: string
+    totalSteps: number
+    planSteps: PlanStep[]
+    currentPageHighlights: PlanHighlight[]
+    currentPageRange: { startIndex: number; endIndex: number }
 }
 
 // Extended step record with full action memory

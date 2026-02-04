@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import type { ElementIndexer } from '../utils/elementIndexer'
+import { elementMatchesInstruction, findBestElementByInstruction } from '../utils/stepElementResolver'
 
 interface Highlight {
     selector: string
@@ -486,6 +487,13 @@ const Overlay: React.FC<OverlayProps> = ({ highlights, currentStepIndex }) => {
                     el = indexer.getElement(h.elementIndex)
                     if (el) {
                         console.log(`Site Tutor: Found element by index ${h.elementIndex}`, { element: el })
+                        if (!elementMatchesInstruction(el, h.explanation)) {
+                            console.warn('Site Tutor: Indexed element did not match instruction, falling back to local resolution', {
+                                elementIndex: h.elementIndex,
+                                explanation: h.explanation
+                            })
+                            el = null
+                        }
                     }
                 }
 
@@ -538,6 +546,11 @@ const Overlay: React.FC<OverlayProps> = ({ highlights, currentStepIndex }) => {
                 }
 
                 if (!el) {
+                    const resolved = findBestElementByInstruction(h.explanation)
+                    if (resolved) el = resolved
+                }
+
+                if (!el) {
                     const found = findElementByExplanation(h.explanation, h.selector || '')
                     if (found) el = found
                 }
@@ -572,7 +585,13 @@ const Overlay: React.FC<OverlayProps> = ({ highlights, currentStepIndex }) => {
         const timeoutId = setTimeout(updateRects, 100)
 
         const handleResize = () => updateRects()
-        const handleScroll = () => updateRects()
+
+        // Throttle scroll updates to reduce jitter
+        let scrollTimeout: ReturnType<typeof setTimeout> | null = null
+        const handleScroll = () => {
+            if (scrollTimeout) clearTimeout(scrollTimeout)
+            scrollTimeout = setTimeout(updateRects, 16) // ~60fps
+        }
 
         window.addEventListener('resize', handleResize)
         window.addEventListener('scroll', handleScroll, { capture: true, passive: true })
@@ -584,6 +603,7 @@ const Overlay: React.FC<OverlayProps> = ({ highlights, currentStepIndex }) => {
 
         return () => {
             clearTimeout(timeoutId)
+            if (scrollTimeout) clearTimeout(scrollTimeout)
             window.removeEventListener('resize', handleResize)
             window.removeEventListener('scroll', handleScroll)
             observer.disconnect()
@@ -613,12 +633,12 @@ const Overlay: React.FC<OverlayProps> = ({ highlights, currentStepIndex }) => {
                             initial={{ opacity: 0, scale: 0.8 }}
                             animate={{ opacity: 1, scale: 1 }}
                             exit={{ opacity: 0, scale: 0.8 }}
-                            className={`absolute border-4 border-red-500 rounded-lg shadow-[0_0_25px_rgba(239,68,68,0.7)] outline outline-2 outline-red-300 bg-red-500/15 box-border${isGuidedStep ? ' animate-pulse' : ''}`}
+                            className={`fixed border-4 border-red-500 rounded-lg shadow-[0_0_25px_rgba(239,68,68,0.7)] outline outline-2 outline-red-300 bg-red-500/15 box-border${isGuidedStep ? ' animate-pulse' : ''}`}
                             style={{
-                                top: rect.top,
-                                left: rect.left,
-                                width: rect.width,
-                                height: rect.height,
+                                top: `${rect.top}px`,
+                                left: `${rect.left}px`,
+                                width: `${rect.width}px`,
+                                height: `${rect.height}px`,
                             }}
                         >
                             <div

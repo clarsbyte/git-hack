@@ -3,7 +3,7 @@ import { MessageCircle, X, Send, Loader2 } from 'lucide-react'
 import { motion, AnimatePresence } from 'framer-motion'
 import Overlay from './Overlay'
 import TutorialController from './TutorialController'
-import type { TutorialActionType, TutorialPayload } from '../types/tutorial'
+import type { TutorialActionType, TutorialPayload, TutorialPlan, TutorialStep } from '../types/tutorial'
 import { ElementIndexer } from '../utils/elementIndexer'
 import { LLMVerifier } from '../utils/llmVerifier'
 import { RouteTracker } from '../utils/routeTracker'
@@ -32,7 +32,6 @@ interface AutomationAction {
     type: string
     url?: string
     selector?: string
-    taskId?: string
 }
 
 const getIndexer = (): ElementIndexer => {
@@ -286,6 +285,8 @@ interface StoredState {
     currentTutorialStep: number
     isOpen: boolean
     origin?: string
+    lastUrl?: string
+    sessionId?: string | null
 }
 
 interface SessionSnapshot {
@@ -295,6 +296,7 @@ interface SessionSnapshot {
     origin: string
     lastUrl: string
     updatedAt: number
+    sessionId?: string | null
 }
 
 type SessionStore = Record<string, SessionSnapshot>
@@ -313,8 +315,6 @@ const Chatbot: React.FC = () => {
     ])
     const [highlights, setHighlights] = useState<Highlight[]>([])
     const [sessionId, setSessionId] = useState<string | null>(null)
-    const [automationStatus, setAutomationStatus] = useState<'idle' | 'running' | 'success' | 'error'>('idle')
-    const [automationProgress, setAutomationProgress] = useState<string[]>([])
 
     // Tutorial mode state
     const [tutorial, setTutorial] = useState<TutorialPayload | null>(null)
@@ -323,6 +323,7 @@ const Chatbot: React.FC = () => {
     const [storageKey, setStorageKey] = useState<string | null>(null)
     const [tabId, setTabId] = useState<number | null>(null)
     const [tutorialFingerprint, setTutorialFingerprint] = useState<string | null>(null)
+    const [restoredLastUrl, setRestoredLastUrl] = useState<string | null>(null)
 
     // LLM verification state
     const llmVerifierRef = useRef<LLMVerifier | null>(null)
@@ -379,6 +380,7 @@ const Chatbot: React.FC = () => {
     // Restore tutorial state from storage
     useEffect(() => {
         if (!storageKey) return
+        setRestoredLastUrl(null)
 
         // Check if chrome.storage is available
         if (!chrome?.storage?.local) {
@@ -398,10 +400,13 @@ const Chatbot: React.FC = () => {
             const sessionStore = result[SESSION_STORE_KEY] as SessionStore | undefined
             const session = tabId !== null ? sessionStore?.[String(tabId)] : undefined
 
+            const restoredUrl = stored?.lastUrl ?? session?.lastUrl ?? null
             if (stored && stored.origin === window.location.origin) {
                 setTutorial(stored.tutorial)
                 setCurrentTutorialStep(stored.currentTutorialStep)
                 setIsOpen(stored.isOpen)
+                setRestoredLastUrl(restoredUrl)
+                setSessionId(stored.sessionId ?? null)
                 if (stored.tutorial) {
                     setMode('tutorial')
                     setHighlights(buildHighlightsFromSteps(stored.tutorial.steps))
@@ -416,6 +421,8 @@ const Chatbot: React.FC = () => {
                 setTutorial(session.tutorial)
                 setCurrentTutorialStep(nextStepIndex)
                 setIsOpen(session.isOpen)
+                setRestoredLastUrl(restoredUrl)
+                setSessionId(session.sessionId ?? null)
                 if (session.tutorial) {
                     setMode('tutorial')
                     setHighlights(buildHighlightsFromSteps(session.tutorial.steps))
@@ -437,7 +444,9 @@ const Chatbot: React.FC = () => {
             tutorial,
             currentTutorialStep,
             isOpen,
-            origin: window.location.origin
+            origin: window.location.origin,
+            lastUrl: window.location.href,
+            sessionId,
         }
 
         chrome.storage.local.set({ [storageKey]: state })
@@ -453,7 +462,8 @@ const Chatbot: React.FC = () => {
             isOpen,
             origin: window.location.origin,
             lastUrl: window.location.href,
-            updatedAt: Date.now()
+            updatedAt: Date.now(),
+            sessionId,
         }
 
         chrome.storage.local.get([SESSION_STORE_KEY], (result) => {
@@ -489,6 +499,7 @@ const Chatbot: React.FC = () => {
         setTutorial(null)
         setCurrentTutorialStep(0)
         setMode('idle')
+        setRestoredLastUrl(null)
     }
 
     const handleTutorialComplete = () => {
@@ -509,11 +520,10 @@ const Chatbot: React.FC = () => {
         setHighlights([])
         setInput('')
         setLoading(false)
+        setSessionId(null)
         setMessages([
             { sender: 'bot', text: "Hi! I'm your Site Tutor. I can teach you anything about this website. Ask a question or request a tutorial!" }
         ])
-        setAutomationStatus('idle')
-        setAutomationProgress([])
     }
 
     const handleSend = async () => {
@@ -528,13 +538,13 @@ const Chatbot: React.FC = () => {
         if (isCreateRepoRequest(userMessage)) {
             setLoading(false)
             setMode('tutorial')
+            setRestoredLastUrl(null)
             setTutorial(EXAMPLE_CREATE_REPO_TUTORIAL)
             setHighlights(buildHighlightsFromSteps(EXAMPLE_CREATE_REPO_TUTORIAL.steps))
             setCurrentTutorialStep(0)
             return
         }
 
-        // Lux mode disabled: keep standard chat flow
         setMode('idle')
         setMessages(prev => [...prev, { sender: 'user', text: userMessage }])
 
@@ -635,15 +645,40 @@ const Chatbot: React.FC = () => {
                 console.log('Session ID received:', data.sessionId)
             }
 
-            const parsedSteps = extractNumberedSteps(data.text || '')
-            if (parsedSteps) {
-                const tutorialPayload = buildTutorialFromSteps(parsedSteps, data.highlights)
+            // Check if the response includes a tutorial plan (two-tier response)
+            const planData = data.tutorialPlan as TutorialPlan | undefined
 
-                // Check for prior progress on this tutorial
+            if (planData && planData.planSteps && planData.planSteps.length > 0) {
+                // Two-tier plan response: build tutorial from current-page steps only
+                const currentRange = planData.currentPageRange ?? { startIndex: 0, endIndex: 0 }
+                const currentPagePlanSteps = planData.planSteps.slice(
+                    currentRange.startIndex,
+                    currentRange.endIndex + 1
+                )
+                const currentPageHighlights = planData.currentPageHighlights ?? data.highlights ?? []
+
+                const currentPageTutorialSteps: TutorialStep[] = currentPagePlanSteps.map((ps, idx) => ({
+                    stepNumber: ps.stepNumber,
+                    selector: currentPageHighlights[idx]?.selector ?? '',
+                    instruction: ps.instruction,
+                    actionType: ps.actionType ?? inferActionType(ps.instruction),
+                    expectedResult: ps.expectedResult,
+                    hint: ps.hint,
+                    elementIndex: currentPageHighlights[idx]?.elementIndex,
+                }))
+
+                const tutorialPayload: TutorialPayload = {
+                    title: planData.title || 'Step-by-step guide',
+                    steps: currentPageTutorialSteps,
+                    plan: planData,
+                    planStepOffset: currentRange.startIndex,
+                }
+
+                // Check for prior progress
                 const fp = generateFingerprint(
                     window.location.origin,
                     tutorialPayload.title,
-                    tutorialPayload.steps.map(s => s.instruction)
+                    planData.planSteps.map(s => s.instruction)
                 )
                 setTutorialFingerprint(fp)
 
@@ -651,24 +686,21 @@ const Chatbot: React.FC = () => {
                 try {
                     const existing = await loadTutorialRecord(fp)
                     if (existing) {
-                        // Resume from where they left off
                         const nextIncomplete = existing.steps.findIndex(s => !s.completed)
                         resumeStep = nextIncomplete >= 0 ? nextIncomplete : 0
                     } else {
-                        // Check for similar tutorial
                         const match = await findMatchingTutorial(window.location.origin, userMessage)
                         if (match && match.completedAt) {
                             setMessages(prev => [...prev, { sender: 'bot', text: `You've completed a similar tutorial ("${match.title}") before. Starting fresh but building on what you know!` }])
                         }
                     }
 
-                    // Save new record
                     const record: TutorialRecord = {
                         fingerprint: fp,
                         origin: window.location.origin,
                         title: tutorialPayload.title,
                         query: userMessage,
-                        steps: tutorialPayload.steps.map(s => ({ instruction: s.instruction, completed: false })),
+                        steps: planData.planSteps.map(s => ({ instruction: s.instruction, completed: false })),
                         startedAt: Date.now(),
                         lastAccessedAt: Date.now(),
                         currentStepIndex: resumeStep,
@@ -678,18 +710,69 @@ const Chatbot: React.FC = () => {
                     console.warn('Site Tutor: memory error', err)
                 }
 
+                console.log(`[Site Tutor] Plan-based tutorial: ${planData.totalSteps} total steps, ${currentPageTutorialSteps.length} on this page (range ${currentRange.startIndex}-${currentRange.endIndex})`)
+
                 setMode('tutorial')
+                setRestoredLastUrl(null)
                 setTutorial(tutorialPayload)
-                setCurrentTutorialStep(resumeStep)
-                setHighlights(buildHighlightsFromSteps(tutorialPayload.steps, data.highlights))
+                setCurrentTutorialStep(Math.min(resumeStep, currentPageTutorialSteps.length - 1))
+                setHighlights(buildHighlightsFromSteps(currentPageTutorialSteps))
                 setMessages(prev => [...prev, { sender: 'bot', text: resumeStep > 0 ? `Resuming tutorial from step ${resumeStep + 1}.` : 'Starting step-by-step tutorial. Use Next to move through each step.' }])
             } else {
-                setMessages(prev => [...prev, { sender: 'bot', text: data.text }])
+                // Fallback: try legacy flat step parsing
+                const parsedSteps = extractNumberedSteps(data.text || '')
+                if (parsedSteps) {
+                    const tutorialPayload = buildTutorialFromSteps(parsedSteps, data.highlights)
 
-                // Set highlights
-                if (data.highlights && data.highlights.length > 0) {
-                    setHighlights(data.highlights)
-                    console.log('Site Tutor: Received highlights:', data.highlights)
+                    const fp = generateFingerprint(
+                        window.location.origin,
+                        tutorialPayload.title,
+                        tutorialPayload.steps.map(s => s.instruction)
+                    )
+                    setTutorialFingerprint(fp)
+
+                    let resumeStep = 0
+                    try {
+                        const existing = await loadTutorialRecord(fp)
+                        if (existing) {
+                            const nextIncomplete = existing.steps.findIndex(s => !s.completed)
+                            resumeStep = nextIncomplete >= 0 ? nextIncomplete : 0
+                        } else {
+                            const match = await findMatchingTutorial(window.location.origin, userMessage)
+                            if (match && match.completedAt) {
+                                setMessages(prev => [...prev, { sender: 'bot', text: `You've completed a similar tutorial ("${match.title}") before. Starting fresh but building on what you know!` }])
+                            }
+                        }
+
+                        const record: TutorialRecord = {
+                            fingerprint: fp,
+                            origin: window.location.origin,
+                            title: tutorialPayload.title,
+                            query: userMessage,
+                            steps: tutorialPayload.steps.map(s => ({ instruction: s.instruction, completed: false })),
+                            startedAt: Date.now(),
+                            lastAccessedAt: Date.now(),
+                            currentStepIndex: resumeStep,
+                        }
+                        await saveTutorialRecord(record)
+                    } catch (err) {
+                        console.warn('Site Tutor: memory error', err)
+                    }
+
+                    setMode('tutorial')
+                    setRestoredLastUrl(null)
+                    setTutorial(tutorialPayload)
+                    setCurrentTutorialStep(resumeStep)
+                    setHighlights(buildHighlightsFromSteps(tutorialPayload.steps, data.highlights))
+                    setMessages(prev => [...prev, { sender: 'bot', text: resumeStep > 0 ? `Resuming tutorial from step ${resumeStep + 1}.` : 'Starting step-by-step tutorial. Use Next to move through each step.' }])
+                } else {
+                    setMessages(prev => [...prev, { sender: 'bot', text: data.text }])
+
+                    // Set highlights
+                    if (data.highlights && data.highlights.length > 0) {
+                        setHighlights(data.highlights)
+                        console.log('Site Tutor: Received highlights:', data.highlights)
+                    }
                 }
             }
 
@@ -717,7 +800,7 @@ const Chatbot: React.FC = () => {
 
         } catch (error) {
             console.error('Error:', error)
-            setMessages(prev => [...prev, { sender: 'bot', text: 'Sorry, I encountered an error connecting to the brain.' }])
+            setMessages(prev => [...prev, { sender: 'bot', text: 'turn the back end on' }])
         } finally {
             setLoading(false)
         }
@@ -759,7 +842,9 @@ const Chatbot: React.FC = () => {
                                 {mode === 'tutorial' && tutorial ? (
                                     <TutorialController
                                         tutorial={tutorial}
+                                        sessionId={sessionId}
                                         initialStepIndex={currentTutorialStep}
+                                        initialLastUrl={restoredLastUrl || undefined}
                                         tutorialFingerprint={tutorialFingerprint || undefined}
                                         llmVerifier={llmVerifierRef.current}
                                         routeTracker={routeTrackerRef.current}
@@ -769,6 +854,15 @@ const Chatbot: React.FC = () => {
                                                 markStepCompleted(tutorialFingerprint, currentTutorialStep).catch(() => {})
                                             }
                                             setCurrentTutorialStep(index)
+                                        }}
+                                        onPageTransitionSteps={(newSteps: TutorialStep[], newOffset: number) => {
+                                            setTutorial(prev => prev ? {
+                                                ...prev,
+                                                steps: newSteps,
+                                                planStepOffset: newOffset,
+                                            } : null)
+                                            setCurrentTutorialStep(0)
+                                            setHighlights(buildHighlightsFromSteps(newSteps))
                                         }}
                                         onComplete={handleTutorialComplete}
                                         onClose={handleReset}
@@ -787,14 +881,6 @@ const Chatbot: React.FC = () => {
                                                     />
                                                 </div>
                                             ))}
-                                            {automationProgress.length > 0 && (
-                                                <div className="message message-bot">
-                                                    <div className="text-sm font-semibold mb-1">Automation Progress:</div>
-                                                    {automationProgress.map((progress, idx) => (
-                                                        <div key={idx} className="text-xs opacity-80">{progress}</div>
-                                                    ))}
-                                                </div>
-                                            )}
                                             <div ref={messagesEndRef} />
                                         </div>
 
@@ -811,12 +897,12 @@ const Chatbot: React.FC = () => {
                                                     }
                                                 }}
                                                 placeholder="Ask a question or request a tutorial..."
-                                                disabled={loading || automationStatus === 'running'}
+                                                disabled={loading}
                                                 className="chat-input"
                                             />
                                             <button
                                                 onClick={handleSend}
-                                                disabled={loading || automationStatus === 'running'}
+                                                disabled={loading}
                                                 className="chat-send-button"
                                                 aria-label="Send message"
                                             >

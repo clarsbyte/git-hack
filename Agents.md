@@ -639,5 +639,6 @@ ffmpeg -version
 8. **Test localhost** — Before deployment
 9. **Verify FFmpeg** — User must install
 10. **Keep researching** — Every session, every feature
+11. **Run build after every change** — Cursor, Codex, and Claude Code must run `npm run build` after each and every code or config change.
 
 **Remember: Outdated code is broken code. Research first, always.**

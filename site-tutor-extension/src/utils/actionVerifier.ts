@@ -1,7 +1,8 @@
 import type { TutorialStep, StepError } from '../types/tutorial'
 import type { ElementIndexer } from './elementIndexer'
-import { LLMVerifier, type VerificationRequest, type VerificationResponse } from './llmVerifier'
+import { LLMVerifier, type VerificationResponse } from './llmVerifier'
 import { RouteTracker } from './routeTracker'
+import { elementMatchesInstruction, findBestElementByInstruction } from './stepElementResolver'
 
 type MatchHandler = () => void
 type ErrorHandler = (error: StepError) => void
@@ -63,36 +64,40 @@ const resolveElement = (step: TutorialStep): Element | null => {
         const indexer = getIndexer()
         if (indexer) {
             const el = indexer.getElement(step.elementIndex)
-            if (el) return el
+            if (el && elementMatchesInstruction(el, step.instruction)) return el
         }
     }
 
     // Fallback: CSS selector
-    if (!step.selector) return null
-    try {
-        const matches = document.querySelectorAll(step.selector)
-        for (const el of Array.from(matches)) {
-            const rect = el.getBoundingClientRect()
-            const style = window.getComputedStyle(el)
-            if (rect.width > 0 && rect.height > 0 &&
-                style.display !== 'none' &&
-                style.visibility !== 'hidden' &&
-                style.opacity !== '0') {
-                return el
+    if (step.selector) {
+        try {
+            const matches = document.querySelectorAll(step.selector)
+            for (const el of Array.from(matches)) {
+                const rect = el.getBoundingClientRect()
+                const style = window.getComputedStyle(el)
+                if (rect.width > 0 && rect.height > 0 &&
+                    style.display !== 'none' &&
+                    style.visibility !== 'hidden' &&
+                    style.opacity !== '0') {
+                    return el
+                }
             }
+        } catch {
+            // Invalid selector
         }
-    } catch {
-        // Invalid selector
+
+        // Simplified selector
+        if (step.selector.includes(':') || step.selector.includes('::')) {
+            const simplified = step.selector.split(/[:]/)[0]
+            try {
+                const matches = document.querySelectorAll(simplified)
+                if (matches.length > 0) return matches[0]
+            } catch { /* ignore */ }
+        }
     }
 
-    // Simplified selector
-    if (step.selector.includes(':') || step.selector.includes('::')) {
-        const simplified = step.selector.split(/[:]/)[0]
-        try {
-            const matches = document.querySelectorAll(simplified)
-            if (matches.length > 0) return matches[0]
-        } catch { /* ignore */ }
-    }
+    const resolved = findBestElementByInstruction(step.instruction)
+    if (resolved) return resolved
 
     return null
 }
@@ -355,7 +360,16 @@ export class ActionVerifier {
     }
 
     private attachOutcomeObserver(expectedResult: string, handler: MatchHandler) {
-        // Check immediately in case outcome already exists
+        // Only use outcome observer for passive action types (wait/navigate)
+        // For click/input, we rely ONLY on the specific event listeners
+        const isPassiveAction = this.currentStep?.actionType === 'wait' || this.currentStep?.actionType === 'navigate'
+
+        if (!isPassiveAction) {
+            // Skip outcome observer for interactive actions
+            return
+        }
+
+        // Check immediately for passive actions
         if (this.verifyExpectedResult(expectedResult)) {
             // Defer to avoid sync issues
             setTimeout(() => {
@@ -490,8 +504,8 @@ export class ActionVerifier {
         clickedElement: HTMLElement,
         expectedResult?: string
     ): Promise<VerificationResponse> {
-        // If no expected result or no LLM verifier, auto-approve
-        if (!expectedResult || !this.llmVerifier) {
+        // If no expected result, auto-approve
+        if (!expectedResult) {
             return {
                 isCorrect: true,
                 confidence: 1,
@@ -499,19 +513,71 @@ export class ActionVerifier {
             }
         }
 
-        const request: VerificationRequest = {
-            stepNumber: this.currentStep?.stepNumber || 0,
-            stepInstruction: this.currentStep?.instruction || '',
-            expectedResult: expectedResult,
-            actualPageState: {
-                url: window.location.href,
-                title: document.title,
-                visibleElements: LLMVerifier.extractVisibleElements(),
-                clickedElement: clickedElement.textContent?.trim() || clickedElement.tagName
+        try {
+            // Capture fresh screenshot for verification
+            const screenshotData = await this.captureScreenshot()
+
+            // Get current DOM index
+            const indexer = getIndexer()
+            let domText = ""
+            if (indexer) {
+                indexer.indexPage(document)
+                domText = indexer.toTextRepresentation()
+            }
+
+            // Send verification request to backend with fresh context
+            const formData = new FormData()
+            formData.append('stepInstruction', this.currentStep?.instruction || '')
+            formData.append('expectedResult', expectedResult)
+            formData.append('clickedElement', clickedElement.textContent?.trim() || clickedElement.tagName)
+            if (domText) {
+                formData.append('dom', domText)
+            }
+            if (screenshotData) {
+                formData.append('screenshot', screenshotData)
+            }
+
+            const response = await fetch('http://localhost:8000/verify', {
+                method: 'POST',
+                body: formData
+            })
+
+            const result = await response.json()
+            return {
+                isCorrect: result.isCorrect,
+                confidence: result.confidence,
+                reason: result.reason
+            }
+        } catch (error) {
+            console.error('Verification error:', error)
+            // Fallback: accept the action
+            return {
+                isCorrect: true,
+                confidence: 0.5,
+                reason: 'Verification unavailable, accepting action'
             }
         }
+    }
 
-        return await this.llmVerifier.verifyStepOutcome(request)
+    private async captureScreenshot(): Promise<Blob | null> {
+        try {
+            // Use Chrome API to capture current tab
+            return new Promise((resolve) => {
+                chrome.runtime.sendMessage({ action: 'captureScreen' }, (response) => {
+                    if (response?.dataUrl) {
+                        // Convert data URL to blob
+                        fetch(response.dataUrl)
+                            .then(res => res.blob())
+                            .then(blob => resolve(blob))
+                            .catch(() => resolve(null))
+                    } else {
+                        resolve(null)
+                    }
+                })
+            })
+        } catch {
+            return null
+        }
     }
 
     /**
