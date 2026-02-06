@@ -1,11 +1,11 @@
 {
   "name": "site-tutor-extension",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.0.6",
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "node scripts/bump-version.mjs && tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview"
   },

@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react'
+import React, { useState, useRef, useEffect, useCallback } from 'react'
 import { MessageCircle, X, Send, Loader2 } from 'lucide-react'
 import { motion, AnimatePresence } from 'framer-motion'
 import Overlay from './Overlay'
@@ -16,6 +16,7 @@ import {
     getCompletionHistory,
     type TutorialRecord,
 } from '../utils/tutorialMemory'
+import { VERSION, PREVIOUS_VERSION } from '../version'
 
 interface Message {
     sender: 'user' | 'bot'
@@ -88,9 +89,21 @@ const compressScreenshot = async (dataUrl: string): Promise<Blob> => {
 const STORAGE_KEY_PREFIX = 'siteTutorState'
 const FALLBACK_STORAGE_KEY = `${STORAGE_KEY_PREFIX}:default`
 const GLOBAL_UI_STATE_KEY = `${STORAGE_KEY_PREFIX}:ui`
+const PENDING_NAV_KEY = 'siteTutor:pendingNavigation'
 const DEFAULT_MESSAGES: Message[] = [
     { sender: 'bot', text: "Hi! I'm your Site Tutor. I can teach you anything about this website. Ask a question or request a tutorial!" }
 ]
+
+const clearPendingNavigationForTab = (tabId: number | null) => {
+    if (!chrome?.storage?.local || tabId === null) return
+    chrome.storage.local.get([PENDING_NAV_KEY], (result) => {
+        if (chrome.runtime.lastError) return
+        const store = (result[PENDING_NAV_KEY] as Record<string, unknown> | undefined) ?? {}
+        if (!store[String(tabId)]) return
+        delete store[String(tabId)]
+        chrome.storage.local.set({ [PENDING_NAV_KEY]: store })
+    })
+}
 const extractNumberedSteps = (text: string): string[] | null => {
     const lines = text.split(/\r?\n/).map(line => line.trim())
     const steps: string[] = []
@@ -246,40 +259,35 @@ const EXAMPLE_CREATE_REPO_TUTORIAL: TutorialPayload = {
             selector: 'a[href="/new"]',
             instruction: 'Click the "New" button or repository creation link in the top right corner of GitHub.',
             actionType: 'click',
-            expectedResult: 'repository creation form',
-            hint: 'Look for a green button with a plus icon or a "New" link in the header navigation.'
+            expectedResult: 'repository creation form'
         },
         {
             stepNumber: 2,
             selector: 'input[name="repository[name]"]',
             instruction: 'Enter a name for your repository in the "Repository name" field.',
             actionType: 'input',
-            expectedResult: 'repository name',
-            hint: 'The field is usually at the top of the form. Use a descriptive name like "my-project".'
+            expectedResult: 'repository name'
         },
         {
             stepNumber: 3,
             selector: 'input[name="repository[description]"]',
             instruction: '(Optional) Add a description for your repository.',
             actionType: 'input',
-            expectedResult: 'description',
-            hint: 'This step is optional - you can skip it and click Next if you prefer.'
+            expectedResult: 'description'
         },
         {
             stepNumber: 4,
             selector: 'input[name="repository[visibility]"][value="public"]',
             instruction: 'Choose the visibility: Public (anyone can see) or Private (only you).',
             actionType: 'click',
-            expectedResult: 'visibility',
-            hint: 'Public repositories are free and visible to everyone. Private repositories require a paid plan.'
+            expectedResult: 'visibility'
         },
         {
             stepNumber: 5,
             selector: 'button[type="submit"]',
             instruction: 'Click the "Create repository" button at the bottom of the form.',
             actionType: 'click',
-            expectedResult: '/new',
-            hint: 'The button is usually green and located at the bottom of the form.'
+            expectedResult: '/new'
         }
     ]
 }
@@ -312,6 +320,7 @@ const Chatbot: React.FC = () => {
     const [mode, setMode] = useState<ChatMode>('idle')
     const [input, setInput] = useState('')
     const [loading, setLoading] = useState(false)
+    const [showVersionInfo, setShowVersionInfo] = useState(false)
 
     // Chat state
     const [messages, setMessages] = useState<Message[]>(DEFAULT_MESSAGES)
@@ -330,8 +339,12 @@ const Chatbot: React.FC = () => {
     // LLM verification state
     const llmVerifierRef = useRef<LLMVerifier | null>(null)
     const routeTrackerRef = useRef<RouteTracker | null>(null)
+    const dynamicRecalcInFlightRef = useRef(false)
+    const lastDynamicRecalcUrlRef = useRef('')
 
     const messagesEndRef = useRef<HTMLDivElement>(null)
+    const totalTutorialSteps = tutorial?.steps.length ?? 0
+    const currentStepNumber = Math.min(currentTutorialStep + 1, Math.max(totalTutorialSteps, 1))
 
     const scrollToBottom = () => {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -352,6 +365,8 @@ const Chatbot: React.FC = () => {
 
             const key = `${STORAGE_KEY_PREFIX}:${response?.tabId ?? 'default'}`
             setTabId(typeof response?.tabId === 'number' ? response.tabId : null)
+            ;(window as typeof window & { __siteTutorTabId?: number | null }).__siteTutorTabId =
+                typeof response?.tabId === 'number' ? response.tabId : null
             setStorageKey(key)
         })
     }, [])
@@ -378,6 +393,151 @@ const Chatbot: React.FC = () => {
             routeTrackerRef.current = null
         }
     }, [tutorialFingerprint])
+
+    const recalculateTutorialForCurrentPage = useCallback(async (reason: string = 'page-changed') => {
+        if (mode !== 'tutorial' || !tutorial) return
+
+        const currentUrl = window.location.href
+        if (dynamicRecalcInFlightRef.current) return
+        if (lastDynamicRecalcUrlRef.current === currentUrl) return
+
+        console.log(`🔄 [Site Tutor] Dynamic recalculation start | reason=${reason} | url=${currentUrl}`)
+        dynamicRecalcInFlightRef.current = true
+        lastDynamicRecalcUrlRef.current = currentUrl
+
+        try {
+            const formData = new FormData()
+            formData.append(
+                'message',
+                'Continue the active tutorial on this current page. Recalculate the next actionable steps for this page and return accurate highlights.'
+            )
+
+            if (sessionId) {
+                formData.append('sessionId', sessionId)
+            }
+
+            const tutorialContext = {
+                title: tutorial.title,
+                currentStepIndex: currentTutorialStep,
+                totalSteps: tutorial.steps.length,
+                currentStep: tutorial.steps[currentTutorialStep]?.instruction ?? '',
+                steps: tutorial.steps.map(step => step.instruction),
+                recalculationReason: reason,
+                currentUrl,
+            }
+            formData.append('tutorialContext', JSON.stringify(tutorialContext))
+
+            const indexer = getIndexer()
+            indexer.indexPage(document)
+            const domText = indexer.toTextRepresentation(true)
+            const viewportSummary = indexer.getViewportSummary()
+            formData.append('dom', domText)
+            formData.append('viewportInfo', viewportSummary)
+            formData.append('scrollPosition', String(window.scrollY))
+            console.log(`🧠 [Site Tutor] DOM forwarded to /chat (dynamic) | chars=${domText.length} | url=${currentUrl}`)
+
+            console.log('📡 [Site Tutor] POST /chat (dynamic recalculation)')
+            const response = await fetch('http://localhost:8000/chat', {
+                method: 'POST',
+                body: formData,
+            })
+            if (!response.ok) {
+                throw new Error(`Recalculation failed: ${response.status}`)
+            }
+
+            const data = await response.json()
+            if (data.sessionId && !sessionId) {
+                setSessionId(data.sessionId)
+            }
+
+            const planData = data.tutorialPlan as TutorialPlan | undefined
+            if (planData && planData.planSteps && planData.planSteps.length > 0) {
+                const currentRange = planData.currentPageRange ?? { startIndex: 0, endIndex: 0 }
+                const currentPagePlanSteps = planData.planSteps.slice(
+                    currentRange.startIndex,
+                    currentRange.endIndex + 1
+                )
+                const currentPageHighlights = planData.currentPageHighlights ?? data.highlights ?? []
+                const normalizedHighlights: Highlight[] = currentPageHighlights.map((h: any) => ({
+                    selector: h?.selector ?? '',
+                    explanation: h?.explanation ?? '',
+                    elementIndex: h?.elementIndex,
+                }))
+
+                const currentPageTutorialSteps: TutorialStep[] = currentPagePlanSteps.map((ps, idx) => ({
+                    stepNumber: ps.stepNumber,
+                    selector: normalizedHighlights[idx]?.selector ?? '',
+                    instruction: ps.instruction,
+                    actionType: ps.actionType ?? inferActionType(ps.instruction),
+                    expectedResult: ps.expectedResult,
+                    elementIndex: normalizedHighlights[idx]?.elementIndex,
+                }))
+
+                const tutorialPayload: TutorialPayload = {
+                    title: planData.title || tutorial.title || 'Step-by-step guide',
+                    steps: currentPageTutorialSteps,
+                    plan: planData,
+                    planStepOffset: currentRange.startIndex,
+                }
+
+                setMode('tutorial')
+                setTutorial(tutorialPayload)
+                setCurrentTutorialStep(0)
+                setHighlights(buildHighlightsFromSteps(currentPageTutorialSteps, normalizedHighlights))
+                console.log(`✅ [Site Tutor] Dynamic recalculation applied | newSteps=${currentPageTutorialSteps.length}`)
+                return
+            }
+
+            const parsedSteps = extractNumberedSteps(data.text || '')
+            if (parsedSteps && parsedSteps.length > 0) {
+                const tutorialPayload = buildTutorialFromSteps(parsedSteps, data.highlights)
+                setMode('tutorial')
+                setTutorial(tutorialPayload)
+                setCurrentTutorialStep(0)
+                setHighlights(buildHighlightsFromSteps(tutorialPayload.steps, data.highlights))
+                console.log(`✅ [Site Tutor] Dynamic recalculation applied from text steps | newSteps=${parsedSteps.length}`)
+            }
+        } catch (error) {
+            console.warn('❌ [Site Tutor] Dynamic tutorial recalculation failed', error)
+            // Allow retry on next page-change signal if this attempt failed.
+            lastDynamicRecalcUrlRef.current = ''
+        } finally {
+            console.log('🏁 [Site Tutor] Dynamic recalculation finished')
+            dynamicRecalcInFlightRef.current = false
+        }
+    }, [mode, tutorial, sessionId, currentTutorialStep])
+
+    // Re-index DOM and refresh highlights when the URL changes (SPA or traditional navigation)
+    useEffect(() => {
+        const handlePageChanged = () => {
+            console.log(`🧭 [Site Tutor] siteTutor:pageChanged | url=${window.location.href}`)
+            console.log('🧠 [Site Tutor] Re-indexing DOM due to page change')
+            const indexer = getIndexer()
+            indexer.indexPage(document)
+
+            // If in tutorial mode, refresh the highlights from the current tutorial steps
+            if (tutorial && mode === 'tutorial') {
+                setHighlights(buildHighlightsFromSteps(tutorial.steps))
+                // Fallback for static/no-plan sessions: re-query backend for fresh page steps.
+                if (!tutorial.plan || !sessionId) {
+                    console.log('🆘 [Site Tutor] No plan/session transition path; triggering dynamic /chat fallback recalculation')
+                    void recalculateTutorialForCurrentPage('page-changed-fallback')
+                }
+            }
+        }
+
+        window.addEventListener('siteTutor:pageChanged', handlePageChanged)
+        return () => {
+            window.removeEventListener('siteTutor:pageChanged', handlePageChanged)
+        }
+    }, [tutorial, mode, sessionId, recalculateTutorialForCurrentPage])
+
+    useEffect(() => {
+        if (mode !== 'tutorial' || !tutorial) {
+            dynamicRecalcInFlightRef.current = false
+            lastDynamicRecalcUrlRef.current = ''
+        }
+    }, [mode, tutorial])
 
     // Restore tutorial state from storage
     useEffect(() => {
@@ -418,7 +578,9 @@ const Chatbot: React.FC = () => {
                     setHighlights([])
                 }
             } else if (session && session.origin === window.location.origin) {
-                const nextStepIndex = session.lastUrl !== window.location.href && session.tutorial
+                const hasTutorial = !!session.tutorial
+                const didAdvanceForUrlChange = session.lastUrl !== window.location.href && hasTutorial
+                const nextStepIndex = didAdvanceForUrlChange && session.tutorial
                     ? Math.min(session.currentTutorialStep + 1, session.tutorial.steps.length - 1)
                     : session.currentTutorialStep
 
@@ -432,6 +594,9 @@ const Chatbot: React.FC = () => {
                     setHighlights(buildHighlightsFromSteps(session.tutorial.steps))
                 } else {
                     setHighlights([])
+                }
+                if (didAdvanceForUrlChange) {
+                    clearPendingNavigationForTab(tabId)
                 }
             } else {
                 const openState = stored?.isOpen ?? session?.isOpen ?? globalIsOpen
@@ -549,6 +714,7 @@ const Chatbot: React.FC = () => {
         if (!input.trim()) return
 
         const userMessage = input
+        console.log(`💬 [Site Tutor] User message -> /chat | url=${window.location.href} | text="${userMessage}"`)
         setInput('')
         setLoading(true)
         setHighlights([])
@@ -629,14 +795,18 @@ const Chatbot: React.FC = () => {
                 console.warn('[Screenshot] No screenshot available to send')
             }
 
-            // Add indexed DOM context
+            // Add indexed DOM context with viewport information
             try {
                 const indexer = getIndexer()
                 indexer.indexPage(document)
-                const domText = indexer.toTextRepresentation()
+                const domText = indexer.toTextRepresentation(true)  // Include viewport annotations
+                const viewportSummary = indexer.getViewportSummary()
                 formData.append('dom', domText)
+                formData.append('viewportInfo', viewportSummary)
+                formData.append('scrollPosition', String(window.scrollY))
+                console.log(`🧠 [Site Tutor] DOM forwarded to /chat | chars=${domText.length} | scrollY=${window.scrollY}`)
             } catch (err) {
-                console.warn('Site Tutor: unable to generate indexed DOM', err)
+                console.warn('⚠️ [Site Tutor] Unable to generate indexed DOM', err)
             }
 
             // Add completion history
@@ -651,6 +821,7 @@ const Chatbot: React.FC = () => {
             }
 
             // Call Backend
+            console.log('📡 [Site Tutor] POST /chat')
             const response = await fetch('http://localhost:8000/chat', {
                 method: 'POST',
                 body: formData
@@ -682,7 +853,6 @@ const Chatbot: React.FC = () => {
                     instruction: ps.instruction,
                     actionType: ps.actionType ?? inferActionType(ps.instruction),
                     expectedResult: ps.expectedResult,
-                    hint: ps.hint,
                     elementIndex: currentPageHighlights[idx]?.elementIndex,
                 }))
 
@@ -846,8 +1016,35 @@ const Chatbot: React.FC = () => {
                             <div className="chat-header" data-mode={mode}>
                                 <MessageCircle size={20} />
                                 <span className="font-medium">
-                                    {mode === 'tutorial' ? 'Tutorial Mode' : 'Site Tutor'}
+                                    {mode === 'tutorial' ? 'githack' : 'Site Tutor'}
                                 </span>
+                                {mode === 'tutorial' && tutorial && (
+                                    <span className="ml-2 text-[11px] px-2.5 py-1 rounded-md bg-emerald-700 text-emerald-50 border border-emerald-500 font-semibold">
+                                        Step {currentStepNumber}/{totalTutorialSteps}
+                                    </span>
+                                )}
+                                <div className="relative ml-2">
+                                    <button
+                                        type="button"
+                                        onMouseEnter={() => setShowVersionInfo(true)}
+                                        onMouseLeave={() => setShowVersionInfo(false)}
+                                        onFocus={() => setShowVersionInfo(true)}
+                                        onBlur={() => setShowVersionInfo(false)}
+                                        title={`Previous version: v${PREVIOUS_VERSION}`}
+                                        className="text-[11px] px-2.5 py-1 rounded-md bg-slate-900 text-slate-50 border border-slate-700 font-medium shadow-sm hover:bg-slate-800 transition-colors"
+                                        aria-label={`Current version v${VERSION}. Hover to see previous version.`}
+                                    >
+                                        v{VERSION}
+                                    </button>
+                                    {showVersionInfo && (
+                                        <div
+                                            className="absolute left-0 top-full mt-2 text-[11px] px-3 py-1.5 rounded-md bg-white text-slate-900 border border-slate-300 shadow-lg whitespace-nowrap z-[100000] pointer-events-none"
+                                            aria-live="polite"
+                                        >
+                                            Previous version: v{PREVIOUS_VERSION}
+                                        </div>
+                                    )}
+                                </div>
                                 <button
                                     onClick={() => setIsOpen(false)}
                                     className="ml-auto hover:bg-white/20 p-1 rounded transition-colors"
@@ -947,6 +1144,11 @@ const Chatbot: React.FC = () => {
                         aria-label="Open chat"
                     >
                         <MessageCircle size={24} />
+                        {mode === 'tutorial' && tutorial && (
+                            <span className="absolute -top-1 -right-1 text-[10px] leading-none px-1.5 py-1 rounded-full bg-emerald-700 text-emerald-50 border border-emerald-500 font-semibold">
+                                {currentStepNumber}
+                            </span>
+                        )}
                     </motion.button>
                 )}
             </div>

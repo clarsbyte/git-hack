@@ -1,4 +1,4 @@
-export type TutorialActionType = 'click' | 'input' | 'wait' | 'navigate'
+export type TutorialActionType = 'click' | 'input' | 'wait' | 'navigate' | 'scroll'
 
 export interface TutorialStep {
     stepNumber: number
@@ -6,8 +6,8 @@ export interface TutorialStep {
     instruction: string
     actionType: TutorialActionType
     expectedResult?: string
-    hint?: string
     elementIndex?: number
+    scrollTarget?: number  // For 'scroll' actionType - element index to scroll to
 }
 
 export interface TutorialPayload {
@@ -23,9 +23,9 @@ export interface PlanStep {
     instruction: string
     actionType: TutorialActionType
     expectedResult?: string
-    hint?: string
     expectsPageChange: boolean
     pageDescription?: string
+    scrollTarget?: number  // For 'scroll' actionType - element index to scroll to
 }
 
 // Highlight with a reference back to which plan step it belongs to

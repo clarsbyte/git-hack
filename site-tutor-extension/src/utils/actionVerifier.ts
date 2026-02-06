@@ -6,20 +6,102 @@ import { elementMatchesInstruction, findBestElementByInstruction } from './stepE
 
 type MatchHandler = () => void
 type ErrorHandler = (error: StepError) => void
-type ProgressHandler = (message: string) => void
 
 export type WatchOptions = {
-    hintDelayMs?: number
     onMatch: MatchHandler
-    onHintReady?: () => void
     onError?: ErrorHandler
-    onProgress?: ProgressHandler
 }
 
-const DEFAULT_HINT_DELAY = 15000
 const NAVIGATION_EVENT = 'siteTutor:navigation'
 const DEBOUNCE_MS = 200
 const PAGE_STATE_INTERVAL = 2000
+const PENDING_NAV_KEY = 'siteTutor:pendingNavigation'
+const PENDING_NAV_TTL_MS = 5 * 60 * 1000
+
+type PendingNavigationRecord = {
+    stepNumber: number
+    expectedResult?: string
+    initialUrl: string
+    startedAt: number
+}
+
+type PendingNavigationStore = Record<string, PendingNavigationRecord>
+
+const getCachedTabId = (): number | null => {
+    return (window as typeof window & { __siteTutorTabId?: number | null }).__siteTutorTabId ?? null
+}
+
+const getTabId = (): Promise<number | null> => {
+    const cached = getCachedTabId()
+    if (typeof cached === 'number') return Promise.resolve(cached)
+    return new Promise(resolve => {
+        try {
+            chrome.runtime.sendMessage({ action: 'getTabId' }, (response) => {
+                if (chrome.runtime.lastError) {
+                    resolve(null)
+                    return
+                }
+                const tabId = typeof response?.tabId === 'number' ? response.tabId : null
+                ;(window as typeof window & { __siteTutorTabId?: number | null }).__siteTutorTabId = tabId
+                resolve(tabId)
+            })
+        } catch {
+            resolve(null)
+        }
+    })
+}
+
+const loadPendingNavigation = async (): Promise<{ tabId: number; record: PendingNavigationRecord } | null> => {
+    if (!chrome?.storage?.local) return null
+    const tabId = await getTabId()
+    if (tabId === null) return null
+
+    return new Promise(resolve => {
+        chrome.storage.local.get([PENDING_NAV_KEY], (result) => {
+            if (chrome.runtime.lastError) {
+                resolve(null)
+                return
+            }
+            const store = (result[PENDING_NAV_KEY] as PendingNavigationStore | undefined) ?? {}
+            const record = store[String(tabId)]
+            if (!record) {
+                resolve(null)
+                return
+            }
+            if (Date.now() - record.startedAt > PENDING_NAV_TTL_MS) {
+                delete store[String(tabId)]
+                chrome.storage.local.set({ [PENDING_NAV_KEY]: store }, () => resolve(null))
+                return
+            }
+            resolve({ tabId, record })
+        })
+    })
+}
+
+const savePendingNavigation = async (record: PendingNavigationRecord): Promise<void> => {
+    if (!chrome?.storage?.local) return
+    const tabId = await getTabId()
+    if (tabId === null) return
+
+    chrome.storage.local.get([PENDING_NAV_KEY], (result) => {
+        const store = (result[PENDING_NAV_KEY] as PendingNavigationStore | undefined) ?? {}
+        store[String(tabId)] = record
+        chrome.storage.local.set({ [PENDING_NAV_KEY]: store })
+    })
+}
+
+const clearPendingNavigation = async (): Promise<void> => {
+    if (!chrome?.storage?.local) return
+    const tabId = await getTabId()
+    if (tabId === null) return
+
+    chrome.storage.local.get([PENDING_NAV_KEY], (result) => {
+        const store = (result[PENDING_NAV_KEY] as PendingNavigationStore | undefined) ?? {}
+        if (!store[String(tabId)]) return
+        delete store[String(tabId)]
+        chrome.storage.local.set({ [PENDING_NAV_KEY]: store })
+    })
+}
 
 const ensureHistoryEventsPatched = () => {
     const globalWindow = window as typeof window & { __siteTutorHistoryPatched?: boolean }
@@ -103,7 +185,6 @@ const resolveElement = (step: TutorialStep): Element | null => {
 }
 
 export class ActionVerifier {
-    private hintTimeoutId: ReturnType<typeof window.setTimeout> | null = null
     private intervalId: ReturnType<typeof window.setInterval> | null = null
     private cleanupFns: Array<() => void> = []
     private initialUrl = ''
@@ -123,10 +204,6 @@ export class ActionVerifier {
     }
 
     stopWatching(): void {
-        if (this.hintTimeoutId) {
-            window.clearTimeout(this.hintTimeoutId)
-            this.hintTimeoutId = null
-        }
         if (this.intervalId) {
             window.clearInterval(this.intervalId)
             this.intervalId = null
@@ -142,15 +219,8 @@ export class ActionVerifier {
         this.currentStep = step
         this.currentOptions = options
 
-        const hintDelayMs = options.hintDelayMs ?? DEFAULT_HINT_DELAY
-
-        // Hint timer — fires once but does NOT stop watching
-        if (hintDelayMs > 0 && options.onHintReady) {
-            this.hintTimeoutId = window.setTimeout(() => {
-                if (!this.matched) {
-                    options.onHintReady?.()
-                }
-            }, hintDelayMs)
+        if (step.actionType !== 'navigate') {
+            void clearPendingNavigation()
         }
 
         const handleMatch = () => {
@@ -224,10 +294,6 @@ export class ActionVerifier {
                 // NEW: LLM-based verification flow
                 clickDetected = true
 
-                // Show progress
-                const options = this.getCurrentOptions()
-                options?.onProgress?.('Verifying action...')
-
                 // Wait for page to update
                 await new Promise(resolve => setTimeout(resolve, 500))
 
@@ -237,6 +303,7 @@ export class ActionVerifier {
                 if (verification.isCorrect || verification.confidence > 0.7) {
                     handler()
                 } else {
+                    const options = this.getCurrentOptions()
                     this.handleVerificationFailure(verification, clickedEl, options)
                 }
             } else if (expectedResult) {
@@ -357,6 +424,37 @@ export class ActionVerifier {
         })
 
         this.intervalId = window.setInterval(checkUrlChange, 750)
+
+        void (async () => {
+            const pending = await loadPendingNavigation()
+            if (!pending) {
+                await savePendingNavigation({
+                    stepNumber: this.currentStep?.stepNumber ?? 0,
+                    expectedResult,
+                    initialUrl: this.initialUrl,
+                    startedAt: Date.now()
+                })
+                return
+            }
+
+            const { record } = pending
+            const currentUrl = window.location.href
+            const urlChanged = currentUrl !== record.initialUrl
+            const matchesExpected = urlChanged || (expectedResult ? this.verifyExpectedResult(expectedResult) : false)
+
+            if (matchesExpected) {
+                await clearPendingNavigation()
+                handler()
+                return
+            }
+
+            await savePendingNavigation({
+                stepNumber: this.currentStep?.stepNumber ?? record.stepNumber,
+                expectedResult,
+                initialUrl: record.initialUrl || this.initialUrl,
+                startedAt: record.startedAt
+            })
+        })()
     }
 
     private attachOutcomeObserver(expectedResult: string, handler: MatchHandler) {

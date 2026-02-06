@@ -218,13 +218,17 @@ async def chat(
     sessionId: Optional[str] = Form(None),
     dom: Optional[str] = Form(None),
     completionHistory: Optional[str] = Form(None),
-    tutorialContext: Optional[str] = Form(None)
+    tutorialContext: Optional[str] = Form(None),
+    viewportInfo: Optional[str] = Form(None),
+    scrollPosition: Optional[str] = Form(None)
 ):
-    print(f"Received message: {message}")
+    print(f"📥 [/chat] Received message: {message}")
 
     # Get or create session
     session = session_manager.get_or_create_session(sessionId)
-    print(f"Session ID: {session.id}")
+    print(f"🧷 [/chat] Session ID: {session.id}")
+    print(f"🧭 [/chat] URL context provided via tutorialContext? {'yes' if tutorialContext else 'no'}")
+    print(f"🧠 [/chat] DOM attached? {'yes' if dom else 'no'} | viewportInfo? {'yes' if viewportInfo else 'no'}")
 
     if not api_key:
          return ChatResponse(
@@ -236,7 +240,9 @@ async def chat(
 
     try:
         if screenshot:
-            print(f"Screenshot received ({screenshot.filename}) but Cerebras is text-only; ignoring image.")
+            print(f"🖼️ [/chat] Screenshot received ({screenshot.filename}) but Cerebras is text-only; ignoring image.")
+        else:
+            print("🖼️ [/chat] No screenshot provided.")
 
         # Store user message in session
         session.add_message('user', message)
@@ -269,9 +275,36 @@ CRITICAL: The user wants to find MULTIPLE elements. Generate a SEPARATE highligh
             dom_context = f"""
 INDEXED ELEMENTS ON THIS PAGE:
 Each interactive element has been assigned a numeric index. Reference elements by their index number.
-The list below shows: [index] tagName "visible text" key-attributes
+
+ANNOTATIONS:
+- [VISIBLE]: Element is in current viewport - best to highlight
+- [BELOW-SCROLL]: Element is below scroll fold - not visible until scrolling
+- [TOP/MID/BOTTOM-SECTION]: Page position (top third, middle third, bottom third)
+- in-TAGNAME: Parent element context (e.g., "in-div", "in-form#search")
+
+SELECTION PRIORITY:
+1. Find element matching the instruction text
+2. Among matching elements, prefer those marked [VISIBLE]
+3. When multiple similar elements exist (e.g., multiple Buy buttons), use position hints to pick the right one
+4. When uncertain, make your best educated guess
+
+The list below shows: [index] tagName "visible text" key-attributes in-PARENT [POSITION] [VISIBLE/BELOW-SCROLL]
 
 {dom}
+"""
+
+        # Include viewport information if provided
+        viewport_context = ""
+        if viewportInfo:
+            viewport_context = f"""
+VIEWPORT INFORMATION:
+{viewportInfo}
+
+CRITICAL RULES FOR ELEMENT SELECTION:
+1. ONLY return elementIndex for elements marked [VISIBLE]
+2. Never highlight elements marked [BELOW-SCROLL] - user can't see them until scrolling
+3. If the next step requires a [BELOW-SCROLL] element, include scroll instructions in your response
+4. Always make your best guess - don't return empty highlights
 """
 
         # Include completion history if provided
@@ -310,8 +343,28 @@ REQUIREMENTS:
 1. Create a complete plan with ALL steps numbered globally (1, 2, 3, ..., N)
 2. For each step, indicate if it will cause a PAGE CHANGE (navigation to a different URL)
 3. Identify which steps can be done on the CURRENT page shown in the screenshot
-4. Only provide elementIndex highlights for CURRENT-PAGE steps
+4. ALWAYS return at least one highlight for visible elements - never return empty highlights
 5. Return steps in the "text" field as numbered lines (ALL steps, not just current page)
+
+ELEMENT SELECTION PRIORITY (when in doubt, make your best guess):
+1. Exact text match for the step instruction → Use this element
+2. Partial text match + [VISIBLE] annotation → Use this element
+3. Similar/related element + [VISIBLE] → Make educated guess
+4. If no visible match exists → Include scroll instructions, still highlight best guess
+
+GOOD RESPONSE EXAMPLE:
+{{
+  "text": "1. Click the New button\\n2. Enter repository name",
+  "highlights": [{{"elementIndex": 5, "explanation": "Click the New button"}}],
+  "reasoning": "Found button with matching text at index 5"
+}}
+
+BAD RESPONSE EXAMPLE (DO NOT DO THIS):
+{{
+  "text": "I cannot determine which element to highlight...",
+  "highlights": [],
+  "reasoning": "Unable to find exact match"
+}}
 
 Include a "tutorialPlan" object in your response:
 {{
@@ -333,17 +386,18 @@ Include a "tutorialPlan" object in your response:
   "highlights": [
     {{"elementIndex": 5, "explanation": "Click the New button"}}
   ],
-  "reasoning": "..."
+  "reasoning": "Found button at index 5, it matches the first step instruction"
 }}
 
 CRITICAL RULES:
 - "planSteps" must include ALL steps for the ENTIRE task, even those on future pages
-- "currentPageHighlights" must ONLY include steps doable on THIS page with correct elementIndex from the DOM
-- "currentPageRange" indicates which planSteps indices are for the current page (startIndex to endIndex inclusive)
+- "currentPageHighlights" MUST include at least one element when visible elements exist
 - "highlights" should match "currentPageHighlights" (for backward compatibility)
+- Only include [VISIBLE] marked elements in highlights - NEVER include [BELOW-SCROLL] elements
 - "expectsPageChange" should be true if clicking/completing that step will navigate to a new URL
 - "actionType" must be one of: "click", "input", "navigate", "wait"
 - Use the indexed element list to find EXACT element indices for current-page steps only
+- If no exact match exists, make your best guess from available [VISIBLE] elements
 """
 
         prompt_text = f"""
@@ -360,6 +414,8 @@ User Question: "{message}"
 {multiple_elements_instruction}
 
 {dom_context}
+
+{viewport_context}
 
 {history_context}
 
@@ -542,13 +598,23 @@ async def continue_tutorial(
     dom: Optional[str] = Form(None),
     currentPlanStepIndex: int = Form(...),
     completedSteps: str = Form("[]"),
+    viewportInfo: Optional[str] = Form(None),
+    scrollPosition: Optional[str] = Form(None),
+    currentUrl: Optional[str] = Form(None),
+    completedStepInstruction: Optional[str] = Form(None),
 ):
     """
     Continue a multi-page tutorial after navigation.
     Re-generates highlights for the new page using the stored plan.
+    Also verifies the previous step was completed by checking the new page context.
     """
-    print(f"\n=== CONTINUE TUTORIAL ===")
-    print(f"Session: {sessionId}, resuming from plan step {currentPlanStepIndex}")
+    print(f"\n🚀 === /continue-tutorial ===")
+    print(f"🧷 Session: {sessionId}, resuming from plan step {currentPlanStepIndex}")
+    print(f"🧠 DOM attached? {'yes' if dom else 'no'} | viewportInfo? {'yes' if viewportInfo else 'no'} | screenshot? {'yes' if screenshot else 'no'}")
+    if currentUrl:
+        print(f"🧭 Current URL: {currentUrl}")
+    if completedStepInstruction:
+        print(f"✅ Completed step: {completedStepInstruction}")
 
     session = session_manager.get_session(sessionId)
     if not session or not session.tutorial_plan:
@@ -579,10 +645,44 @@ async def continue_tutorial(
         dom_context = f"""
 INDEXED ELEMENTS ON THIS NEW PAGE:
 Each interactive element has been assigned a numeric index. Reference elements by their index number.
-The list below shows: [index] tagName "visible text" key-attributes
+
+ANNOTATIONS:
+- [VISIBLE]: Element is in current viewport - best to highlight
+- [BELOW-SCROLL]: Element is below scroll fold - not visible until scrolling
+- [TOP/MID/BOTTOM-SECTION]: Page position (top third, middle third, bottom third)
+- in-TAGNAME: Parent element context (e.g., "in-div", "in-form#search")
+
+SELECTION STRATEGY:
+1. Match element to the plan step instruction
+2. Prefer [VISIBLE] marked elements
+3. Use position hints to disambiguate similar elements
+4. When multiple matches exist, choose the most prominent one
+
+The list below shows: [index] tagName "visible text" key-attributes in-PARENT [POSITION] [VISIBLE/BELOW-SCROLL]
 
 {dom}
 """
+
+    # Viewport context
+    viewport_context = ""
+    if viewportInfo:
+        viewport_context = f"""
+VIEWPORT INFORMATION:
+{viewportInfo}
+
+CRITICAL: Only highlight elements marked [VISIBLE]. Never highlight [BELOW-SCROLL] elements.
+"""
+
+    # Build verification context
+    verification_context = ""
+    if currentUrl or completedStepInstruction:
+        verification_context = "\nPAGE TRANSITION VERIFICATION:\n"
+        if currentUrl:
+            verification_context += f"- The user is now on: {currentUrl}\n"
+        if completedStepInstruction:
+            verification_context += f"- The user just completed: \"{completedStepInstruction}\"\n"
+        verification_context += "- VERIFY: Does the current page URL and DOM match what you'd expect after completing that step?\n"
+        verification_context += "- If the user appears to be on the WRONG page, note this in your reasoning and still try to map remaining steps.\n"
 
     prompt = f"""You are continuing a step-by-step tutorial that spans multiple pages.
 
@@ -596,14 +696,24 @@ REMAINING STEPS:
 {remaining_text}
 
 The user has navigated to a NEW PAGE. Below is the fresh screenshot and indexed DOM of this new page.
+{verification_context}
 
 {dom_context}
 
+{viewport_context}
+
 YOUR TASK:
 1. Look at the remaining plan steps (from step {currentPlanStepIndex + 1} onward)
-2. Identify which of those remaining steps can be performed on THIS page (visible in the screenshot/DOM)
-3. Provide elementIndex highlights ONLY for steps visible on this page
-4. Do NOT regenerate the plan -- use the existing plan step instructions
+2. Identify which of those remaining steps can be performed on THIS page (marked [VISIBLE])
+3. ALWAYS return at least one highlight when visible elements exist - never return empty highlights
+4. Make your best guess when multiple similar elements exist
+5. Do NOT regenerate the plan -- use the existing plan step instructions
+
+ELEMENT SELECTION PRIORITY:
+- Exact text match from plan + [VISIBLE] element → Use this
+- Partial text match + [VISIBLE] element → Use this
+- Similar element + [VISIBLE] → Make best guess
+- No visible match → Include both visible element AND scroll instruction
 
 Return your response as JSON:
 {{{{
@@ -616,10 +726,12 @@ Return your response as JSON:
 }}}}
 
 CRITICAL:
+- ALWAYS include highlights for [VISIBLE] elements when they exist
 - "planStepNumber" in each highlight must match the stepNumber from the plan
 - "currentPageRange" startIndex and endIndex are indices into the original planSteps array
-- Only include highlights for steps achievable on THIS page
-- Use the indexed element list to find EXACT element indices
+- ONLY include [VISIBLE] marked elements in highlights
+- Use the indexed element list to find EXACT element indices, or make educated guesses if inexact
+- Never return empty currentPageHighlights if any [VISIBLE] elements could reasonably match the step
 """
 
     try:

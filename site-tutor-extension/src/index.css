@@ -405,24 +405,6 @@
   font-family: 'Courier New', monospace;
 }
 
-/* Hint box */
-.hint-box {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  border-radius: 6px;
-  background: rgba(254, 243, 199, 0.9);
-  border: 1px solid rgba(251, 191, 36, 0.4);
-  padding: 12px;
-  font-size: 13px;
-  color: #8a4a12;
-}
-
-.hint-title {
-  font-weight: 600;
-  margin-bottom: 4px;
-}
-
 /* Error box */
 .error-box {
   display: flex;
@@ -601,9 +583,9 @@
   gap: 8px;
   width: 100%;
   padding: 16px 18px 18px;
-  background: rgba(255, 255, 255, 0.65);
-  border-top: 1px solid rgba(255, 255, 255, 0.4);
-  backdrop-filter: blur(14px);
+  background: transparent;
+  border-top: none;
+  backdrop-filter: none;
   position: relative;
   z-index: 1;
   box-sizing: border-box;
@@ -613,21 +595,21 @@
   flex: 1;
   min-width: 0;
   max-width: 100%;
-  background: rgba(255, 255, 255, 0.85);
-  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: transparent;
+  border: 1px solid rgba(148, 163, 184, 0.45);
   border-radius: 12px;
-  margin: 2px 0;
-  padding: 9px 12px;
+  margin: 0;
+  padding: 10px 12px;
   font-size: 13.5px;
   font-family: inherit;
   color: var(--ink-900);
   outline: none;
-  transition: all var(--transition);
+  transition: border-color var(--transition), box-shadow var(--transition), background-color var(--transition);
 }
 
 .chat-input:focus {
   border-color: rgba(42, 127, 108, 0.6);
-  box-shadow: 0 0 0 3px rgba(42, 127, 108, 0.15);
+  box-shadow: 0 0 0 3px rgba(42, 127, 108, 0.12);
 }
 
 .chat-input::placeholder {

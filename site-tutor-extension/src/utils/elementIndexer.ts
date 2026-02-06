@@ -2,12 +2,22 @@ import { isElementHidden, isInteractiveElement, IGNORED_TAGS } from './domSaniti
 
 const MAX_ELEMENTS = 200
 
+interface ElementMetadata {
+    index: number
+    element: HTMLElement
+    rect: DOMRect
+    viewportStatus: 'in-viewport' | 'above-fold' | 'below-fold'
+    scrollPosition: number
+}
+
 export class ElementIndexer {
     private elementMap: Map<number, HTMLElement> = new Map()
+    private metadata: Map<number, ElementMetadata> = new Map()
     private nextIndex = 0
 
     indexPage(root?: Document | ShadowRoot): void {
         this.elementMap.clear()
+        this.metadata.clear()
         this.nextIndex = 0
         const targetRoot = root ?? document
 
@@ -32,6 +42,36 @@ export class ElementIndexer {
             if (this.nextIndex >= MAX_ELEMENTS) break
             this.elementMap.set(this.nextIndex, el)
             this.nextIndex++
+        }
+
+        // Calculate viewport metadata for all indexed elements
+        this.calculateViewportMetadata()
+    }
+
+    private calculateViewportMetadata(): void {
+        const viewportHeight = window.innerHeight
+        const scrollY = window.scrollY
+
+        for (const [index, el] of this.elementMap) {
+            const rect = el.getBoundingClientRect()
+            const absoluteTop = rect.top + scrollY
+
+            let status: 'in-viewport' | 'above-fold' | 'below-fold'
+            if (rect.top >= 0 && rect.bottom <= viewportHeight) {
+                status = 'in-viewport'
+            } else if (absoluteTop < scrollY) {
+                status = 'above-fold'
+            } else {
+                status = 'below-fold'
+            }
+
+            this.metadata.set(index, {
+                index,
+                element: el,
+                rect,
+                viewportStatus: status,
+                scrollPosition: scrollY
+            })
         }
     }
 
@@ -86,8 +126,19 @@ export class ElementIndexer {
         return el
     }
 
-    toTextRepresentation(): string {
+    getViewportSummary(): string {
+        const inView = Array.from(this.metadata.values())
+            .filter(m => m.viewportStatus === 'in-viewport')
+            .map(m => m.index)
+
+        const scrollY = window.scrollY
+        return `VIEWPORT: Scrolled ${scrollY}px, ${inView.length} elements visible [${inView.join(', ')}]`
+    }
+
+    toTextRepresentation(includeViewport = true): string {
         const lines: string[] = []
+        const pageHeight = document.documentElement.scrollHeight
+
         for (const [index, el] of this.elementMap) {
             const tag = el.tagName.toLowerCase()
             const type = el.getAttribute('type')
@@ -119,6 +170,43 @@ export class ElementIndexer {
 
             const role = el.getAttribute('role')
             if (role) parts.push(`role="${role}"`)
+
+            // Add parent context
+            const parent = el.parentElement
+            if (parent && parent.tagName !== 'BODY' && parent.tagName !== 'HTML') {
+                const parentTag = parent.tagName.toLowerCase()
+                const parentId = parent.getAttribute('id')
+                if (parentId) {
+                    parts.push(`in-${parentTag}#${parentId}`)
+                } else {
+                    parts.push(`in-${parentTag}`)
+                }
+            }
+
+            // Add position hint (page location)
+            if (this.metadata.has(index)) {
+                const meta = this.metadata.get(index)!
+                const elementTop = meta.rect.top + window.scrollY
+                const percentDown = (elementTop / pageHeight) * 100
+
+                if (percentDown < 33) {
+                    parts.push('[TOP-SECTION]')
+                } else if (percentDown < 66) {
+                    parts.push('[MID-SECTION]')
+                } else {
+                    parts.push('[BOTTOM-SECTION]')
+                }
+            }
+
+            // Add viewport annotation
+            if (includeViewport && this.metadata.has(index)) {
+                const meta = this.metadata.get(index)!
+                if (meta.viewportStatus === 'in-viewport') {
+                    parts.push('[VISIBLE]')
+                } else if (meta.viewportStatus === 'below-fold') {
+                    parts.push('[BELOW-SCROLL]')
+                }
+            }
 
             lines.push(parts.join(' '))
         }
