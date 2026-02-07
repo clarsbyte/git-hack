@@ -147,7 +147,7 @@ export class ElementIndexer {
             const parts: string[] = [`[${index}] ${tagDisplay}`]
 
             // Add text content (truncated)
-            const text = this.getDirectText(el).trim()
+            const text = this.getDisplayText(el).trim()
             if (text) {
                 parts.push(`"${text.substring(0, 60)}"`)
             }
@@ -171,6 +171,11 @@ export class ElementIndexer {
             const role = el.getAttribute('role')
             if (role) parts.push(`role="${role}"`)
 
+            const accessibleName = this.getAccessibleName(el)
+            if (accessibleName) {
+                parts.push(`a11y-name="${accessibleName.substring(0, 80)}"`)
+            }
+
             // Add parent context
             const parent = el.parentElement
             if (parent && parent.tagName !== 'BODY' && parent.tagName !== 'HTML') {
@@ -181,6 +186,16 @@ export class ElementIndexer {
                 } else {
                     parts.push(`in-${parentTag}`)
                 }
+            }
+
+            const contextPath = this.getContextPath(el)
+            if (contextPath) {
+                parts.push(`path="${contextPath}"`)
+            }
+
+            const rolePath = this.getRolePath(el)
+            if (rolePath) {
+                parts.push(`role-path="${rolePath}"`)
             }
 
             // Add position hint (page location)
@@ -213,18 +228,96 @@ export class ElementIndexer {
         return lines.join('\n')
     }
 
-    private getDirectText(el: HTMLElement): string {
-        let text = ''
+    private getDisplayText(el: HTMLElement): string {
+        const chunks: string[] = []
+
+        let direct = ''
         for (const node of Array.from(el.childNodes)) {
             if (node.nodeType === Node.TEXT_NODE) {
-                text += node.textContent ?? ''
+                direct += node.textContent ?? ''
             }
         }
-        // If no direct text nodes, fall back to textContent but cap it
-        if (!text.trim() && el.textContent) {
-            text = el.textContent.substring(0, 80)
+
+        if (direct.trim()) {
+            chunks.push(direct)
         }
-        return text.replace(/\s+/g, ' ').trim()
+
+        // Include first-level child text to better represent nested labels (e.g. <a><span>Label</span></a>)
+        const firstLevelText: string[] = []
+        for (const child of Array.from(el.children)) {
+            const childText = child.textContent?.trim()
+            if (!childText) continue
+            firstLevelText.push(childText)
+            if (firstLevelText.length >= 2) break
+        }
+        if (firstLevelText.length > 0) {
+            chunks.push(firstLevelText.join(' '))
+        }
+
+        // If still no useful text, fall back to full textContent
+        if (chunks.join(' ').trim().length === 0 && el.textContent) {
+            chunks.push(el.textContent)
+        }
+
+        return chunks
+            .join(' ')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .substring(0, 120)
+    }
+
+    private getAccessibleName(el: HTMLElement): string {
+        const ariaLabel = el.getAttribute('aria-label')?.trim()
+        if (ariaLabel) return ariaLabel
+
+        const labelledBy = el.getAttribute('aria-labelledby')
+        if (labelledBy) {
+            const ids = labelledBy.split(/\s+/).filter(Boolean)
+            const labelledText = ids
+                .map(id => document.getElementById(id)?.textContent?.trim() || '')
+                .filter(Boolean)
+                .join(' ')
+                .trim()
+            if (labelledText) return labelledText
+        }
+
+        const title = el.getAttribute('title')?.trim()
+        if (title) return title
+
+        const value = el.getAttribute('value')?.trim()
+        if (value) return value
+
+        return this.getDisplayText(el)
+    }
+
+    private getContextPath(el: HTMLElement): string {
+        const segments: string[] = []
+        let cursor: HTMLElement | null = el
+        let depth = 0
+        while (cursor && depth < 4) {
+            const tag = cursor.tagName.toLowerCase()
+            if (tag === 'html' || tag === 'body') break
+            const id = cursor.id ? `#${cursor.id}` : ''
+            const dataTestId = cursor.getAttribute('data-testid')
+            const testHint = dataTestId ? `[data-testid=${dataTestId}]` : ''
+            segments.unshift(`${tag}${id}${testHint}`)
+            cursor = cursor.parentElement
+            depth += 1
+        }
+        return segments.join(' > ')
+    }
+
+    private getRolePath(el: HTMLElement): string {
+        const segments: string[] = []
+        let cursor: HTMLElement | null = el
+        let depth = 0
+        while (cursor && depth < 4) {
+            const role = cursor.getAttribute('role') || cursor.tagName.toLowerCase()
+            segments.unshift(role)
+            cursor = cursor.parentElement
+            depth += 1
+        }
+        return segments.join(' > ')
     }
 
     isStale(): boolean {
@@ -236,5 +329,40 @@ export class ElementIndexer {
 
     get size(): number {
         return this.elementMap.size
+    }
+
+    /**
+     * Get all visible elements with their metadata.
+     * Used for VLM bounding box mapping via IoU.
+     */
+    getVisibleElements(): Array<{ index: number; element: HTMLElement; rect: DOMRect }> {
+        const results: Array<{ index: number; element: HTMLElement; rect: DOMRect }> = []
+
+        for (const [index, meta] of this.metadata) {
+            if (meta.viewportStatus === 'in-viewport') {
+                results.push({
+                    index,
+                    element: meta.element,
+                    rect: meta.rect
+                })
+            }
+        }
+
+        return results
+    }
+
+    /**
+     * Get all indexed elements with their metadata (visible and non-visible).
+     * Used for VLM bounding box mapping when visible elements don't match.
+     */
+    getAllElements(): Array<{ index: number; element: HTMLElement; rect: DOMRect }> {
+        const results: Array<{ index: number; element: HTMLElement; rect: DOMRect }> = []
+
+        for (const [index, el] of this.elementMap) {
+            const rect = el.getBoundingClientRect()
+            results.push({ index, element: el, rect })
+        }
+
+        return results
     }
 }

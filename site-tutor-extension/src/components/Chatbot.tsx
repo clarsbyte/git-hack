@@ -86,6 +86,83 @@ const compressScreenshot = async (dataUrl: string): Promise<Blob> => {
     })
 }
 
+const captureScreenshotDataUrl = async (): Promise<string> => {
+    let screenshotDataUrl = ''
+
+    // Prefer desktop capture for full-context screenshots.
+    console.log('[Screenshot] Using desktop capture')
+    try {
+        const desktopResponse = await fetch('http://localhost:8000/capture-desktop')
+        if (desktopResponse.ok) {
+            const desktopData = await desktopResponse.json()
+            screenshotDataUrl = `data:image/png;base64,${desktopData.screenshot}`
+            console.log('[Screenshot] Desktop screenshot captured successfully')
+        } else {
+            console.error('[Screenshot] Desktop capture failed, falling back to tab capture')
+        }
+    } catch (error) {
+        console.error('[Screenshot] Desktop capture error:', error)
+    }
+
+    if (!screenshotDataUrl) {
+        console.log('[Screenshot] Using Chrome tab capture as fallback')
+        screenshotDataUrl = await new Promise<string>((resolve) => {
+            chrome.runtime.sendMessage({ action: 'captureScreen' }, (response) => {
+                if (chrome.runtime.lastError) {
+                    console.error('[Screenshot] Tab capture error:', chrome.runtime.lastError)
+                    resolve('')
+                } else {
+                    resolve(response?.dataUrl || '')
+                }
+            })
+        })
+    }
+
+    return screenshotDataUrl
+}
+
+const getDataUrlDimensions = async (dataUrl: string): Promise<{ width: number; height: number } | null> => {
+    return new Promise((resolve) => {
+        if (!dataUrl) {
+            resolve(null)
+            return
+        }
+        const img = new Image()
+        img.onload = () => resolve({ width: img.width, height: img.height })
+        img.onerror = () => resolve(null)
+        img.src = dataUrl
+    })
+}
+
+const buildViewportInfo = (
+    viewportSummary: string,
+    screenshotDimensions?: { width: number; height: number } | null
+): string => {
+    const payload = {
+        viewportWidth: window.innerWidth,
+        viewportHeight: window.innerHeight,
+        scrollX: window.scrollX,
+        scrollY: window.scrollY,
+        devicePixelRatio: window.devicePixelRatio,
+        screenshotWidth: screenshotDimensions?.width ?? null,
+        screenshotHeight: screenshotDimensions?.height ?? null,
+        summary: viewportSummary || '',
+    }
+    return JSON.stringify(payload)
+}
+
+const computeDomSignature = (): string => {
+    const indexer = getIndexer()
+    indexer.indexPage(document)
+    const domText = indexer.toTextRepresentation(true)
+    let hash = 0
+    const sample = domText.slice(0, 3000)
+    for (let i = 0; i < sample.length; i += 1) {
+        hash = ((hash << 5) - hash + sample.charCodeAt(i)) | 0
+    }
+    return `${domText.length}:${hash}:${window.location.href}`
+}
+
 const STORAGE_KEY_PREFIX = 'siteTutorState'
 const FALLBACK_STORAGE_KEY = `${STORAGE_KEY_PREFIX}:default`
 const GLOBAL_UI_STATE_KEY = `${STORAGE_KEY_PREFIX}:ui`
@@ -140,20 +217,78 @@ const inferActionType = (text: string): TutorialActionType => {
     if (lower.includes('go to') || lower.includes('navigate') || lower.includes('open')) {
         return 'navigate'
     }
+    if (lower.includes('wait for') || lower.includes('observe') || lower.includes('confirm') || lower.includes('you are on')) {
+        return 'observe'
+    }
     return 'click'
+}
+
+const normalizeActionType = (rawActionType: string | undefined, instruction: string): TutorialActionType => {
+    const normalized = (rawActionType ?? '').toLowerCase()
+    if (normalized === 'click' || normalized === 'input' || normalized === 'wait' || normalized === 'navigate' || normalized === 'scroll' || normalized === 'observe') {
+        return normalized
+    }
+    return inferActionType(instruction)
+}
+
+const inferExpectedResult = (instruction: string, actionType: TutorialActionType): string => {
+    const quoted = instruction.match(/"([^"]+)"/)?.[1]
+
+    if (actionType === 'input') {
+        return quoted
+            ? `The "${quoted}" field shows the value you entered.`
+            : 'The field shows the value you entered.'
+    }
+
+    if (actionType === 'navigate') {
+        return quoted
+            ? `The "${quoted}" page or section opens.`
+            : 'The requested page opens.'
+    }
+
+    if (actionType === 'scroll') {
+        return quoted
+            ? `The "${quoted}" section is visible on screen.`
+            : 'The target section is visible on screen.'
+    }
+
+    if (actionType === 'wait') {
+        return 'The page finishes loading and the target content is visible.'
+    }
+
+    if (actionType === 'observe') {
+        return quoted
+            ? `Confirm "${quoted}" is visible on the page.`
+            : 'Confirm the expected page state is visible.'
+    }
+
+    if (quoted) {
+        return `The "${quoted}" target opens or becomes active.`
+    }
+
+    const instructionText = instruction.trim().replace(/[.]+$/, '')
+    if (instructionText.length > 0) {
+        return `The result of this step is visible: ${instructionText}.`
+    }
+    return 'The step outcome is visible on the page.'
 }
 
 const buildTutorialFromSteps = (steps: string[], highlights?: Highlight[]): TutorialPayload => {
     return {
         title: 'Step-by-step guide',
-        steps: steps.map((instruction, index) => ({
+        steps: steps.map((instruction, index) => {
+            const actionType = inferActionType(instruction)
+            return {
             stepNumber: index + 1,
             selector: highlights?.[index]?.selector ?? '',
             instruction,
-            actionType: inferActionType(instruction),
-            expectedResult: undefined,
+            actionType,
+            expectedResult: inferExpectedResult(instruction, actionType),
+            selectionReason: highlights?.[index]?.explanation,
+            isTerminal: index === steps.length - 1,
             elementIndex: highlights?.[index]?.elementIndex
-        }))
+            }
+        })
     }
 }
 
@@ -165,7 +300,98 @@ const buildHighlightsFromSteps = (steps: TutorialPayload['steps'], highlights?: 
     }))
 }
 
+const normalizeText = (value: string): string =>
+    value.toLowerCase().replace(/\s+/g, ' ').trim()
+
+const extractSignals = (step: TutorialStep): string[] => {
+    const signals = new Set<string>()
+    const quotedInstruction = step.instruction.match(/"([^"]+)"/g) ?? []
+    quotedInstruction.forEach((part) => {
+        const cleaned = part.replace(/"/g, '').trim()
+        if (cleaned) signals.add(cleaned)
+    })
+
+    const quotedExpected = step.expectedResult?.match(/"([^"]+)"/g) ?? []
+    quotedExpected.forEach((part) => {
+        const cleaned = part.replace(/"/g, '').trim()
+        if (cleaned) signals.add(cleaned)
+    })
+
+    if (step.expectedResult) {
+        const compact = step.expectedResult
+            .replace(/the result of this step is visible:\s*/i, '')
+            .replace(/confirm\s*/i, '')
+            .replace(/[.]/g, '')
+            .trim()
+        if (compact.length >= 4) signals.add(compact)
+    }
+
+    return Array.from(signals)
+}
+
+const isStepAlreadySatisfied = (step: TutorialStep): boolean => {
+    const url = normalizeText(window.location.href)
+    const title = normalizeText(document.title || '')
+    const bodyText = normalizeText(document.body?.textContent || '')
+    const signals = extractSignals(step).map(normalizeText).filter(signal => signal.length >= 3)
+
+    if (step.actionType === 'input') {
+        const selector = step.selector
+        if (selector) {
+            try {
+                const input = document.querySelector(selector)
+                if (
+                    input instanceof HTMLInputElement ||
+                    input instanceof HTMLTextAreaElement
+                ) {
+                    return input.value.trim().length > 0
+                }
+            } catch {
+                // ignore invalid selector
+            }
+        }
+        return false
+    }
+
+    const hasSignalMatch = signals.some(signal =>
+        url.includes(signal) || title.includes(signal) || bodyText.includes(signal)
+    )
+
+    if (hasSignalMatch) return true
+
+    if (step.actionType === 'observe' || step.actionType === 'wait') {
+        return signals.length === 0 ? true : hasSignalMatch
+    }
+
+    return false
+}
+
+const findFirstActionableStep = (steps: TutorialStep[]): number => {
+    if (!steps.length) return 0
+    const next = steps.findIndex(step => !isStepAlreadySatisfied(step))
+    if (next >= 0) return next
+    return Math.max(steps.length - 1, 0)
+}
+
 const SESSION_STORE_KEY = `${STORAGE_KEY_PREFIX}:sessions`
+
+const isTutorialIntent = (message: string): boolean => {
+    const normalized = message.toLowerCase().trim()
+    const tutorialPatterns = [
+        'tutorial',
+        'step by step',
+        'step-by-step',
+        'walk me through',
+        'guide me',
+        'show me how',
+        'teach me how',
+        'how to ',
+        'how do i ',
+        'help me do',
+        'what should i click',
+    ]
+    return tutorialPatterns.some(pattern => normalized.includes(pattern))
+}
 
 const escapeHtml = (text: string): string =>
     text
@@ -250,48 +476,6 @@ const renderMarkdown = (raw: string): string => {
     return html
 }
 
-// Hardcoded example tutorial for creating a new GitHub repository
-const EXAMPLE_CREATE_REPO_TUTORIAL: TutorialPayload = {
-    title: 'Create a New GitHub Repository',
-    steps: [
-        {
-            stepNumber: 1,
-            selector: 'a[href="/new"]',
-            instruction: 'Click the "New" button or repository creation link in the top right corner of GitHub.',
-            actionType: 'click',
-            expectedResult: 'repository creation form'
-        },
-        {
-            stepNumber: 2,
-            selector: 'input[name="repository[name]"]',
-            instruction: 'Enter a name for your repository in the "Repository name" field.',
-            actionType: 'input',
-            expectedResult: 'repository name'
-        },
-        {
-            stepNumber: 3,
-            selector: 'input[name="repository[description]"]',
-            instruction: '(Optional) Add a description for your repository.',
-            actionType: 'input',
-            expectedResult: 'description'
-        },
-        {
-            stepNumber: 4,
-            selector: 'input[name="repository[visibility]"][value="public"]',
-            instruction: 'Choose the visibility: Public (anyone can see) or Private (only you).',
-            actionType: 'click',
-            expectedResult: 'visibility'
-        },
-        {
-            stepNumber: 5,
-            selector: 'button[type="submit"]',
-            instruction: 'Click the "Create repository" button at the bottom of the form.',
-            actionType: 'click',
-            expectedResult: '/new'
-        }
-    ]
-}
-
 interface StoredState {
     tutorial: TutorialPayload | null
     currentTutorialStep: number
@@ -340,7 +524,9 @@ const Chatbot: React.FC = () => {
     const llmVerifierRef = useRef<LLMVerifier | null>(null)
     const routeTrackerRef = useRef<RouteTracker | null>(null)
     const dynamicRecalcInFlightRef = useRef(false)
-    const lastDynamicRecalcUrlRef = useRef('')
+    const lastDynamicRecalcKeyRef = useRef('')
+    const lastDomSignatureRef = useRef('')
+    const lastDomRecalcAtRef = useRef(0)
 
     const messagesEndRef = useRef<HTMLDivElement>(null)
     const totalTutorialSteps = tutorial?.steps.length ?? 0
@@ -394,16 +580,17 @@ const Chatbot: React.FC = () => {
         }
     }, [tutorialFingerprint])
 
-    const recalculateTutorialForCurrentPage = useCallback(async (reason: string = 'page-changed') => {
+    const recalculateTutorialForCurrentPage = useCallback(async (reason: string = 'page-changed', dedupeKey?: string) => {
         if (mode !== 'tutorial' || !tutorial) return
 
         const currentUrl = window.location.href
+        const recalcKey = `${currentUrl}::${dedupeKey || reason}`
         if (dynamicRecalcInFlightRef.current) return
-        if (lastDynamicRecalcUrlRef.current === currentUrl) return
+        if (lastDynamicRecalcKeyRef.current === recalcKey) return
 
         console.log(`🔄 [Site Tutor] Dynamic recalculation start | reason=${reason} | url=${currentUrl}`)
         dynamicRecalcInFlightRef.current = true
-        lastDynamicRecalcUrlRef.current = currentUrl
+        lastDynamicRecalcKeyRef.current = recalcKey
 
         try {
             const formData = new FormData()
@@ -411,6 +598,16 @@ const Chatbot: React.FC = () => {
                 'message',
                 'Continue the active tutorial on this current page. Recalculate the next actionable steps for this page and return accurate highlights.'
             )
+
+            const screenshotDataUrl = await captureScreenshotDataUrl()
+            const screenshotDimensions = await getDataUrlDimensions(screenshotDataUrl)
+            if (screenshotDataUrl) {
+                const compressedBlob = await compressScreenshot(screenshotDataUrl)
+                formData.append('screenshot', compressedBlob, 'screenshot.jpg')
+                console.log('[Screenshot] Screenshot attached to dynamic /chat request')
+            } else {
+                console.warn('[Screenshot] No screenshot available for dynamic /chat request')
+            }
 
             if (sessionId) {
                 formData.append('sessionId', sessionId)
@@ -431,8 +628,15 @@ const Chatbot: React.FC = () => {
             indexer.indexPage(document)
             const domText = indexer.toTextRepresentation(true)
             const viewportSummary = indexer.getViewportSummary()
+            const viewportInfo = buildViewportInfo(viewportSummary, screenshotDimensions)
             formData.append('dom', domText)
-            formData.append('viewportInfo', viewportSummary)
+            formData.append('viewportInfo', viewportInfo)
+            formData.append('viewportWidth', String(window.innerWidth))
+            formData.append('viewportHeight', String(window.innerHeight))
+            if (screenshotDimensions?.width && screenshotDimensions?.height) {
+                formData.append('screenshotWidth', String(screenshotDimensions.width))
+                formData.append('screenshotHeight', String(screenshotDimensions.height))
+            }
             formData.append('scrollPosition', String(window.scrollY))
             console.log(`🧠 [Site Tutor] DOM forwarded to /chat (dynamic) | chars=${domText.length} | url=${currentUrl}`)
 
@@ -468,8 +672,10 @@ const Chatbot: React.FC = () => {
                     stepNumber: ps.stepNumber,
                     selector: normalizedHighlights[idx]?.selector ?? '',
                     instruction: ps.instruction,
-                    actionType: ps.actionType ?? inferActionType(ps.instruction),
-                    expectedResult: ps.expectedResult,
+                    actionType: normalizeActionType(ps.actionType, ps.instruction),
+                    expectedResult: ps.expectedResult ?? inferExpectedResult(ps.instruction, normalizeActionType(ps.actionType, ps.instruction)),
+                    selectionReason: normalizedHighlights[idx]?.explanation,
+                    isTerminal: Boolean(ps.isTerminal),
                     elementIndex: normalizedHighlights[idx]?.elementIndex,
                 }))
 
@@ -482,7 +688,7 @@ const Chatbot: React.FC = () => {
 
                 setMode('tutorial')
                 setTutorial(tutorialPayload)
-                setCurrentTutorialStep(0)
+                setCurrentTutorialStep(findFirstActionableStep(currentPageTutorialSteps))
                 setHighlights(buildHighlightsFromSteps(currentPageTutorialSteps, normalizedHighlights))
                 console.log(`✅ [Site Tutor] Dynamic recalculation applied | newSteps=${currentPageTutorialSteps.length}`)
                 return
@@ -493,14 +699,14 @@ const Chatbot: React.FC = () => {
                 const tutorialPayload = buildTutorialFromSteps(parsedSteps, data.highlights)
                 setMode('tutorial')
                 setTutorial(tutorialPayload)
-                setCurrentTutorialStep(0)
+                setCurrentTutorialStep(findFirstActionableStep(tutorialPayload.steps))
                 setHighlights(buildHighlightsFromSteps(tutorialPayload.steps, data.highlights))
                 console.log(`✅ [Site Tutor] Dynamic recalculation applied from text steps | newSteps=${parsedSteps.length}`)
             }
         } catch (error) {
             console.warn('❌ [Site Tutor] Dynamic tutorial recalculation failed', error)
             // Allow retry on next page-change signal if this attempt failed.
-            lastDynamicRecalcUrlRef.current = ''
+            lastDynamicRecalcKeyRef.current = ''
         } finally {
             console.log('🏁 [Site Tutor] Dynamic recalculation finished')
             dynamicRecalcInFlightRef.current = false
@@ -532,10 +738,68 @@ const Chatbot: React.FC = () => {
         }
     }, [tutorial, mode, sessionId, recalculateTutorialForCurrentPage])
 
+    // Recalculate tutorial instructions when DOM changes significantly on the same URL.
+    useEffect(() => {
+        if (mode !== 'tutorial' || !tutorial) return
+
+        let debounceTimer: number | null = null
+        const mutationObserver = new MutationObserver(() => {
+            if (debounceTimer !== null) {
+                window.clearTimeout(debounceTimer)
+            }
+
+            debounceTimer = window.setTimeout(() => {
+                try {
+                    const signature = computeDomSignature()
+                    if (!lastDomSignatureRef.current) {
+                        lastDomSignatureRef.current = signature
+                        return
+                    }
+                    if (signature === lastDomSignatureRef.current) {
+                        return
+                    }
+                    const now = Date.now()
+                    if (now - lastDomRecalcAtRef.current < 3000) {
+                        lastDomSignatureRef.current = signature
+                        return
+                    }
+
+                    lastDomSignatureRef.current = signature
+                    lastDomRecalcAtRef.current = now
+                    console.log(`🧩 [Site Tutor] DOM changed -> triggering fresh instruction recalculation`)
+                    void recalculateTutorialForCurrentPage('dom-changed', `dom:${signature}`)
+                } catch (error) {
+                    console.warn('⚠️ [Site Tutor] DOM signature compute failed', error)
+                }
+            }, 900)
+        })
+
+        if (document.body) {
+            mutationObserver.observe(document.body, {
+                childList: true,
+                subtree: true,
+                attributes: true,
+                characterData: true,
+            })
+            try {
+                lastDomSignatureRef.current = computeDomSignature()
+            } catch {
+                lastDomSignatureRef.current = ''
+            }
+        }
+
+        return () => {
+            mutationObserver.disconnect()
+            if (debounceTimer !== null) window.clearTimeout(debounceTimer)
+        }
+    }, [mode, tutorial, recalculateTutorialForCurrentPage])
+
     useEffect(() => {
         if (mode !== 'tutorial' || !tutorial) {
             dynamicRecalcInFlightRef.current = false
-            lastDynamicRecalcUrlRef.current = ''
+            lastDynamicRecalcKeyRef.current = ''
+            lastDomSignatureRef.current = ''
+            lastDomRecalcAtRef.current = 0
         }
     }, [mode, tutorial])
 
@@ -664,23 +928,6 @@ const Chatbot: React.FC = () => {
         })
     }, [tutorial, currentTutorialStep, isOpen, tabId, isRestoring])
 
-    const isCreateRepoRequest = (message: string): boolean => {
-        const normalized = message.toLowerCase().trim()
-        const patterns = [
-            'create a new repo',
-            'create new repo',
-            'create a repo',
-            'create repo',
-            'make a new repo',
-            'make new repo',
-            'new repository',
-            'create repository',
-            'create a new repository',
-            'create new repository'
-        ]
-        return patterns.some(pattern => normalized.includes(pattern))
-    }
-
     const exitTutorial = () => {
         setTutorial(null)
         setCurrentTutorialStep(0)
@@ -714,57 +961,18 @@ const Chatbot: React.FC = () => {
         if (!input.trim()) return
 
         const userMessage = input
+        const shouldStartTutorial = isTutorialIntent(userMessage)
         console.log(`💬 [Site Tutor] User message -> /chat | url=${window.location.href} | text="${userMessage}"`)
         setInput('')
         setLoading(true)
         setHighlights([])
 
-        // Check for hardcoded tutorial request
-        if (isCreateRepoRequest(userMessage)) {
-            setLoading(false)
-            setMode('tutorial')
-            setRestoredLastUrl(null)
-            setTutorial(EXAMPLE_CREATE_REPO_TUTORIAL)
-            setHighlights(buildHighlightsFromSteps(EXAMPLE_CREATE_REPO_TUTORIAL.steps))
-            setCurrentTutorialStep(0)
-            return
-        }
-
         setMode('idle')
         setMessages(prev => [...prev, { sender: 'user', text: userMessage }])
 
         try {
-            let screenshotDataUrl = ''
-
-            // Always try desktop screenshot first for better context
-            console.log('[Screenshot] Using desktop capture')
-            try {
-                const desktopResponse = await fetch('http://localhost:8000/capture-desktop')
-                if (desktopResponse.ok) {
-                    const desktopData = await desktopResponse.json()
-                    screenshotDataUrl = `data:image/png;base64,${desktopData.screenshot}`
-                    console.log('[Screenshot] Desktop screenshot captured successfully')
-                } else {
-                    console.error('[Screenshot] Desktop capture failed, falling back to tab capture')
-                }
-            } catch (error) {
-                console.error('[Screenshot] Desktop capture error:', error)
-            }
-
-            // Fallback to Chrome tab capture if desktop capture failed
-            if (!screenshotDataUrl) {
-                console.log('[Screenshot] Using Chrome tab capture as fallback')
-                screenshotDataUrl = await new Promise<string>((resolve) => {
-                    chrome.runtime.sendMessage({ action: 'captureScreen' }, (response) => {
-                        if (chrome.runtime.lastError) {
-                            console.error('[Screenshot] Tab capture error:', chrome.runtime.lastError)
-                            resolve('')
-                        } else {
-                            resolve(response?.dataUrl || '')
-                        }
-                    })
-                })
-            }
+            const screenshotDataUrl = await captureScreenshotDataUrl()
+            const screenshotDimensions = await getDataUrlDimensions(screenshotDataUrl)
 
             // Prepare Form Data
             const formData = new FormData()
@@ -801,8 +1009,15 @@ const Chatbot: React.FC = () => {
                 indexer.indexPage(document)
                 const domText = indexer.toTextRepresentation(true)  // Include viewport annotations
                 const viewportSummary = indexer.getViewportSummary()
+                const viewportInfo = buildViewportInfo(viewportSummary, screenshotDimensions)
                 formData.append('dom', domText)
-                formData.append('viewportInfo', viewportSummary)
+                formData.append('viewportInfo', viewportInfo)
+                formData.append('viewportWidth', String(window.innerWidth))
+                formData.append('viewportHeight', String(window.innerHeight))
+                if (screenshotDimensions?.width && screenshotDimensions?.height) {
+                    formData.append('screenshotWidth', String(screenshotDimensions.width))
+                    formData.append('screenshotHeight', String(screenshotDimensions.height))
+                }
                 formData.append('scrollPosition', String(window.scrollY))
                 console.log(`🧠 [Site Tutor] DOM forwarded to /chat | chars=${domText.length} | scrollY=${window.scrollY}`)
             } catch (err) {
@@ -838,7 +1053,7 @@ const Chatbot: React.FC = () => {
             // Check if the response includes a tutorial plan (two-tier response)
             const planData = data.tutorialPlan as TutorialPlan | undefined
 
-            if (planData && planData.planSteps && planData.planSteps.length > 0) {
+            if (shouldStartTutorial && planData && planData.planSteps && planData.planSteps.length > 0) {
                 // Two-tier plan response: build tutorial from current-page steps only
                 const currentRange = planData.currentPageRange ?? { startIndex: 0, endIndex: 0 }
                 const currentPagePlanSteps = planData.planSteps.slice(
@@ -851,8 +1066,10 @@ const Chatbot: React.FC = () => {
                     stepNumber: ps.stepNumber,
                     selector: currentPageHighlights[idx]?.selector ?? '',
                     instruction: ps.instruction,
-                    actionType: ps.actionType ?? inferActionType(ps.instruction),
-                    expectedResult: ps.expectedResult,
+                    actionType: normalizeActionType(ps.actionType, ps.instruction),
+                    expectedResult: ps.expectedResult ?? inferExpectedResult(ps.instruction, normalizeActionType(ps.actionType, ps.instruction)),
+                    selectionReason: currentPageHighlights[idx]?.explanation,
+                    isTerminal: Boolean(ps.isTerminal),
                     elementIndex: currentPageHighlights[idx]?.elementIndex,
                 }))
 
@@ -904,10 +1121,13 @@ const Chatbot: React.FC = () => {
                 setMode('tutorial')
                 setRestoredLastUrl(null)
                 setTutorial(tutorialPayload)
-                setCurrentTutorialStep(Math.min(resumeStep, currentPageTutorialSteps.length - 1))
+                setCurrentTutorialStep(Math.max(
+                    Math.min(resumeStep, currentPageTutorialSteps.length - 1),
+                    findFirstActionableStep(currentPageTutorialSteps)
+                ))
                 setHighlights(buildHighlightsFromSteps(currentPageTutorialSteps))
                 setMessages(prev => [...prev, { sender: 'bot', text: resumeStep > 0 ? `Resuming tutorial from step ${resumeStep + 1}.` : 'Starting step-by-step tutorial. Use Next to move through each step.' }])
-            } else {
+            } else if (shouldStartTutorial) {
                 // Fallback: try legacy flat step parsing
                 const parsedSteps = extractNumberedSteps(data.text || '')
                 if (parsedSteps) {
@@ -951,7 +1171,7 @@ const Chatbot: React.FC = () => {
                     setMode('tutorial')
                     setRestoredLastUrl(null)
                     setTutorial(tutorialPayload)
-                    setCurrentTutorialStep(resumeStep)
+                    setCurrentTutorialStep(Math.max(resumeStep, findFirstActionableStep(tutorialPayload.steps)))
                     setHighlights(buildHighlightsFromSteps(tutorialPayload.steps, data.highlights))
                     setMessages(prev => [...prev, { sender: 'bot', text: resumeStep > 0 ? `Resuming tutorial from step ${resumeStep + 1}.` : 'Starting step-by-step tutorial. Use Next to move through each step.' }])
                 } else {
@@ -962,6 +1182,14 @@ const Chatbot: React.FC = () => {
                         setHighlights(data.highlights)
                         console.log('Site Tutor: Received highlights:', data.highlights)
                     }
+                }
+            } else {
+                // Non-tutorial request: stay in chat mode, show normal response and highlights.
+                setMode('idle')
+                setMessages(prev => [...prev, { sender: 'bot', text: data.text }])
+                if (data.highlights && data.highlights.length > 0) {
+                    setHighlights(data.highlights)
+                    console.log('Site Tutor: Received highlights (non-tutorial mode):', data.highlights)
                 }
             }
 
@@ -1077,7 +1305,7 @@ const Chatbot: React.FC = () => {
                                                 steps: newSteps,
                                                 planStepOffset: newOffset,
                                             } : null)
-                                            setCurrentTutorialStep(0)
+                                            setCurrentTutorialStep(findFirstActionableStep(newSteps))
                                             setHighlights(buildHighlightsFromSteps(newSteps))
                                         }}
                                         onComplete={handleTutorialComplete}

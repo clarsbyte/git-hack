@@ -5,3 +5,14 @@ pillow>=10.0.0
 python-multipart>=0.0.20
 pydantic>=2.0.0
 cerebras-cloud-sdk>=1.0.0
+
+# Cloud VLM - Anthropic Claude API (no local model download)
+anthropic>=0.39.0
+
+# Optional: Local VLM (Qwen2.5-VL-8B) - requires ~8GB download
+# Uncomment these if you want to use local model instead of cloud API:
+# torch>=2.0.0
+# torchvision>=0.15.0
+# transformers>=4.35.0
+# accelerate>=0.25.0
+# sentencepiece>=0.1.99

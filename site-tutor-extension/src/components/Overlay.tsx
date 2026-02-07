@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import type { ElementIndexer } from '../utils/elementIndexer'
-import { elementMatchesInstruction, findBestElementByInstruction } from '../utils/stepElementResolver'
+import { elementMatchesInstruction, findBestElementByInstructionSync } from '../utils/stepElementResolver'
 
 interface Highlight {
     selector: string
@@ -12,6 +12,25 @@ interface Highlight {
 interface OverlayProps {
     highlights: Highlight[]
     currentStepIndex?: number
+}
+
+const buildCompactLabel = (explanation: string): string => {
+    const raw = (explanation || '').replace(/\s+/g, ' ').trim()
+    if (!raw) return 'Target'
+
+    const quoted = raw.match(/"([^"]+)"/)?.[1] || raw.match(/'([^']+)'/)?.[1]
+    if (quoted && quoted.trim()) {
+        return quoted.trim().slice(0, 72)
+    }
+
+    const cleaned = raw
+        .replace(/^(click|tap|press|select|choose|open|go to|navigate to|enter|type|fill)\s+/i, '')
+        .replace(/\b(button|link|field)\b/gi, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+
+    const candidate = cleaned || raw
+    return candidate.slice(0, 72)
 }
 
 const findButtonLikeElements = (explanation: string): Element[] => {
@@ -200,6 +219,21 @@ const findElementByExplanation = (explanation: string, selector: string): Elemen
             style.opacity !== '0'
 
         if (!isVisible) score = 0
+
+        // Specificity penalty: penalize elements whose text has many extra words
+        // beyond the query keywords, to prefer tighter matches
+        if (score > 0) {
+            const allKw = [...strongKeywords, ...keywords]
+            const kwWordCount = allKw.join(' ').split(/\s+/).filter(w => w.length > 0).length
+            const elWordCount = elementText.trim().split(/\s+/).filter(w => w.length > 0).length
+            if (elWordCount > 0 && kwWordCount > 0) {
+                const ratio = kwWordCount / elWordCount
+                if (ratio < 0.3) {
+                    // Element text is far longer than query — penalize
+                    score = Math.round(score * ratio)
+                }
+            }
+        }
 
         return { element, score, searchText, contextText }
     })
@@ -546,7 +580,7 @@ const Overlay: React.FC<OverlayProps> = ({ highlights, currentStepIndex }) => {
                 }
 
                 if (!el) {
-                    const resolved = findBestElementByInstruction(h.explanation)
+                    const resolved = findBestElementByInstructionSync(h.explanation)
                     if (resolved) el = resolved
                 }
 
@@ -616,6 +650,7 @@ const Overlay: React.FC<OverlayProps> = ({ highlights, currentStepIndex }) => {
                 {expandedHighlights.map(({ highlight, rect }, i) => {
                     if (rect.width === 0 || rect.height === 0) return null
 
+                    const compactLabel = buildCompactLabel(highlight.explanation)
                     const isGuidedStep = typeof currentStepIndex === 'number'
                     const stepLabel = isGuidedStep ? `Step ${currentStepIndex + 1}` : null
                     const viewportWidth = typeof window !== 'undefined' ? window.innerWidth : 0
@@ -623,7 +658,10 @@ const Overlay: React.FC<OverlayProps> = ({ highlights, currentStepIndex }) => {
                     const labelMaxWidth = Math.min(360, Math.max(200, viewportWidth - 16))
                     const labelLeft = Math.min(Math.max(8, rect.left), Math.max(8, viewportWidth - labelMaxWidth - 8))
                     const labelGap = 10
-                    const labelHeightEstimate = isGuidedStep ? 52 : 44
+                    const explanationLength = compactLabel.length
+                    const approxCharsPerLine = Math.max(24, Math.floor(labelMaxWidth / 7))
+                    const estimatedLines = Math.max(1, Math.ceil(explanationLength / approxCharsPerLine))
+                    const labelHeightEstimate = (isGuidedStep ? 22 : 8) + (estimatedLines * 18) + 14
                     const spaceAbove = rect.top
                     const spaceBelow = viewportHeight - rect.bottom
                     const canPlaceAbove = spaceAbove >= labelHeightEstimate + labelGap
@@ -651,17 +689,14 @@ const Overlay: React.FC<OverlayProps> = ({ highlights, currentStepIndex }) => {
                                     top: labelTop,
                                     left: labelLeft - rect.left,
                                     maxWidth: labelMaxWidth,
-                                    overflow: 'hidden',
-                                    textOverflow: 'ellipsis',
-                                    display: '-webkit-box',
-                                    WebkitLineClamp: 2,
-                                    WebkitBoxOrient: 'vertical',
                                     whiteSpace: 'normal',
+                                    overflowWrap: 'anywhere',
+                                    wordBreak: 'break-word',
                                     transform: placeAbove ? 'translateY(-100%)' : 'none',
                                 }}
                             >
                                 {stepLabel && <span className="text-[10px] uppercase tracking-wide text-white/80">{stepLabel}</span>}
-                                <span>{highlight.explanation}</span>
+                                <span>{compactLabel}</span>
                             </div>
                         </motion.div>
                     )

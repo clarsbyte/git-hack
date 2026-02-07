@@ -7,6 +7,73 @@ import { ElementIndexer } from '../utils/elementIndexer'
 
 const PAGE_CHANGED_EVENT = 'siteTutor:pageChanged'
 
+type TransitionContext = {
+    previousUrl: string | null
+    currentUrl: string | null
+    transitionSource: string
+    observedAt: number
+}
+
+type ForceReanalyzeMessage = {
+    action: 'forceReanalyzeDom'
+    reason?: string
+    attempt?: number
+    previousUrl?: string | null
+    currentUrl?: string | null
+    transitionSource?: string
+    observedAt?: number
+}
+
+let pendingForceMessages: ForceReanalyzeMessage[] = []
+let latestTransitionContext: TransitionContext | null = null
+let reanalyzeHandler: ((reason: string, detail?: Record<string, unknown>) => void) | null = null
+
+const updateTransitionContextFromMessage = (message: ForceReanalyzeMessage) => {
+    latestTransitionContext = {
+        previousUrl: typeof message.previousUrl === 'string' ? message.previousUrl : null,
+        currentUrl: typeof message.currentUrl === 'string' ? message.currentUrl : window.location.href,
+        transitionSource: message.transitionSource || message.reason || 'background-force',
+        observedAt: typeof message.observedAt === 'number' ? message.observedAt : Date.now(),
+    }
+}
+
+const notifyBackgroundContentReady = (source: string) => {
+    try {
+        chrome.runtime.sendMessage({
+            action: 'contentScriptReady',
+            source,
+            url: window.location.href,
+        })
+    } catch {
+        // Ignore failures (e.g., extension reload races).
+    }
+}
+
+const installForceReanalyzeBridge = () => {
+    const win = window as typeof window & { __siteTutorForceBridgeInstalled?: boolean }
+    if (win.__siteTutorForceBridgeInstalled) return
+    win.__siteTutorForceBridgeInstalled = true
+
+    chrome.runtime.onMessage.addListener((message) => {
+        if (message?.action !== 'forceReanalyzeDom') return
+        const typed = message as ForceReanalyzeMessage
+        updateTransitionContextFromMessage(typed)
+
+        if (reanalyzeHandler) {
+            reanalyzeHandler(typed.reason || 'background-force', {
+                attempt: typed.attempt,
+                previousUrl: latestTransitionContext?.previousUrl ?? null,
+                currentUrl: latestTransitionContext?.currentUrl ?? window.location.href,
+                transitionSource: latestTransitionContext?.transitionSource || 'background-force',
+                observedAt: latestTransitionContext?.observedAt ?? Date.now(),
+            })
+            return
+        }
+
+        pendingForceMessages.push(typed)
+    })
+}
+
 /**
  * Inject a history patcher into the page's MAIN WORLD.
  *
@@ -79,7 +146,10 @@ function injectInlineHistoryPatcher() {
  * for the React components living in the same content-script world.
  */
 function startPageChangeWatcher() {
-    let lastUrl = window.location.href
+    const bootstrapPreviousUrl = latestTransitionContext?.previousUrl
+    let lastUrl = bootstrapPreviousUrl && bootstrapPreviousUrl !== window.location.href
+        ? bootstrapPreviousUrl
+        : window.location.href
     let lastBodySignature = getBodySignature()
     let debounceTimer: ReturnType<typeof setTimeout> | null = null
 
@@ -99,6 +169,13 @@ function startPageChangeWatcher() {
     }
 
     function reanalyzeDom(reason: string, detail?: Record<string, unknown>) {
+        const currentUrl = window.location.href
+        const previousUrl =
+            (typeof detail?.previousUrl === 'string' ? detail.previousUrl : null)
+            ?? (lastUrl !== currentUrl ? lastUrl : null)
+            ?? latestTransitionContext?.previousUrl
+            ?? null
+
         lastUrl = window.location.href
         lastBodySignature = getBodySignature()
         console.log(`Site Tutor: Re-analyzing DOM (${reason}) →`, lastUrl)
@@ -106,7 +183,16 @@ function startPageChangeWatcher() {
         if (indexer) {
             indexer.indexPage(document)
         }
-        window.dispatchEvent(new CustomEvent(PAGE_CHANGED_EVENT, { detail: { url: lastUrl, reason, ...detail } }))
+        window.dispatchEvent(new CustomEvent(PAGE_CHANGED_EVENT, {
+            detail: {
+                url: currentUrl,
+                previousUrl,
+                reason,
+                transitionSource: latestTransitionContext?.transitionSource || detail?.transitionSource || reason,
+                observedAt: latestTransitionContext?.observedAt || detail?.observedAt || Date.now(),
+                ...detail,
+            }
+        }))
     }
 
     function handlePageShift(reason: string = 'page-shift') {
@@ -149,12 +235,26 @@ function startPageChangeWatcher() {
         }
     })
 
-    // Background-triggered fallback for tab updates/new page loads.
-    chrome.runtime.onMessage.addListener((message) => {
-        if (message?.action === 'forceReanalyzeDom') {
-            reanalyzeDom(message?.reason || 'background-force')
-        }
-    })
+    // Hook the bridge handler now that the watcher can perform re-analysis.
+    reanalyzeHandler = (reason: string, detail?: Record<string, unknown>) => {
+        reanalyzeDom(reason, detail)
+    }
+
+    if (pendingForceMessages.length > 0) {
+        const queued = [...pendingForceMessages]
+        pendingForceMessages = []
+        queued.forEach((message) => {
+            updateTransitionContextFromMessage(message)
+            reanalyzeDom(message.reason || 'background-force', {
+                attempt: message.attempt,
+                previousUrl: latestTransitionContext?.previousUrl ?? null,
+                currentUrl: latestTransitionContext?.currentUrl ?? window.location.href,
+                transitionSource: latestTransitionContext?.transitionSource || 'background-force',
+                observedAt: latestTransitionContext?.observedAt ?? Date.now(),
+                queued: true,
+            })
+        })
+    }
 
     // ── 3. MutationObserver for major DOM changes ──
     if (document.body) {
@@ -210,7 +310,13 @@ function startPageChangeWatcher() {
     setInterval(checkUrl, 400)
 
     // Ensure we always do one fresh analysis when watcher starts.
-    reanalyzeDom('watcher-start')
+    reanalyzeDom('watcher-start', {
+        previousUrl: bootstrapPreviousUrl ?? null,
+        currentUrl: window.location.href,
+        transitionSource: latestTransitionContext?.transitionSource || 'watcher-bootstrap',
+        observedAt: latestTransitionContext?.observedAt ?? Date.now(),
+    })
+    notifyBackgroundContentReady('watcher-started')
 }
 
 // Initialize extension when DOM is ready
@@ -326,6 +432,9 @@ function startPersistenceWatchdog() {
 }
 
 // Start initialization
+installForceReanalyzeBridge()
+notifyBackgroundContentReady('script-loaded')
+
 if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => {
         initExtension()

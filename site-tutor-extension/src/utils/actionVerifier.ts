@@ -2,7 +2,7 @@ import type { TutorialStep, StepError } from '../types/tutorial'
 import type { ElementIndexer } from './elementIndexer'
 import { LLMVerifier, type VerificationResponse } from './llmVerifier'
 import { RouteTracker } from './routeTracker'
-import { elementMatchesInstruction, findBestElementByInstruction } from './stepElementResolver'
+import { elementMatchesInstruction, findBestElementByInstructionSync } from './stepElementResolver'
 
 type MatchHandler = () => void
 type ErrorHandler = (error: StepError) => void
@@ -139,6 +139,47 @@ const elementMatchesSelector = (element: Element | null, selector: string): bool
     return false
 }
 
+const isGenericInputOutcome = (expectedResult: string): boolean => {
+    const lower = expectedResult.toLowerCase()
+    // Only accept truly specific outcome descriptions, not vague terms
+    return (
+        lower.includes('contains') ||
+        lower.includes('filled') ||
+        lower.includes('typed')
+    )
+}
+
+const WAIT_FOR_ELEMENT_MAX_MS = 3000
+const WAIT_FOR_ELEMENT_POLL_MS = 300
+
+/**
+ * Poll for an element that may appear after animations, lazy loading, or async renders.
+ * Returns the element if found within maxMs, otherwise null.
+ */
+export const waitForElement = (step: TutorialStep, maxMs: number = WAIT_FOR_ELEMENT_MAX_MS): Promise<Element | null> => {
+    return new Promise((resolve) => {
+        const el = resolveElement(step)
+        if (el) {
+            resolve(el)
+            return
+        }
+
+        const startTime = Date.now()
+        const interval = setInterval(() => {
+            const el = resolveElement(step)
+            if (el) {
+                clearInterval(interval)
+                resolve(el)
+                return
+            }
+            if (Date.now() - startTime >= maxMs) {
+                clearInterval(interval)
+                resolve(null)
+            }
+        }, WAIT_FOR_ELEMENT_POLL_MS)
+    })
+}
+
 // Resolve element by index first, then selector fallback
 const resolveElement = (step: TutorialStep): Element | null => {
     // Primary: element index
@@ -178,7 +219,7 @@ const resolveElement = (step: TutorialStep): Element | null => {
         }
     }
 
-    const resolved = findBestElementByInstruction(step.instruction)
+    const resolved = findBestElementByInstructionSync(step.instruction)
     if (resolved) return resolved
 
     return null
@@ -240,6 +281,13 @@ export class ActionVerifier {
             case 'navigate':
                 this.attachNavigationListener(handleMatch, step.expectedResult)
                 break
+            case 'observe': {
+                // Observe steps: show instruction text, auto-complete after a short delay
+                // No element highlighting needed
+                const observeComplete = window.setTimeout(handleMatch, 2000)
+                this.cleanupFns.push(() => window.clearTimeout(observeComplete))
+                break
+            }
             case 'wait':
             default: {
                 const autoComplete = window.setTimeout(handleMatch, 600)
@@ -258,12 +306,18 @@ export class ActionVerifier {
     }
 
     private attachClickListener(step: TutorialStep, handler: MatchHandler, expectedResult?: string) {
-        let clickDetected = false
         const initialUrl = window.location.href
 
-        const targetElement = resolveElement(step)
+        let targetElement = resolveElement(step)
         if (!targetElement) {
-            console.warn('Site Tutor: Target element not found for click listener', { selector: step.selector, elementIndex: step.elementIndex })
+            console.warn('Site Tutor: Target element not found for click listener, starting poll...', { selector: step.selector, elementIndex: step.elementIndex })
+            // Fix 3: Wait-for-element polling for dynamic elements
+            waitForElement(step).then(el => {
+                if (el) {
+                    targetElement = el
+                    console.log('Site Tutor: Target element found via polling')
+                }
+            })
         }
 
         const listener = async (event: MouseEvent) => {
@@ -291,60 +345,100 @@ export class ActionVerifier {
             const clickedEl = event.target as HTMLElement
 
             if (expectedResult && this.llmVerifier) {
-                // NEW: LLM-based verification flow
-                clickDetected = true
-
+                // LLM-based verification flow
                 // Wait for page to update
                 await new Promise(resolve => setTimeout(resolve, 500))
 
                 // Verify with LLM
                 const verification = await this.verifyActionWithLLM(clickedEl, expectedResult)
 
-                if (verification.isCorrect || verification.confidence > 0.7) {
+                if (verification.isCorrect || verification.confidence > 0.85) {
                     handler()
                 } else {
                     const options = this.getCurrentOptions()
                     this.handleVerificationFailure(verification, clickedEl, options)
                 }
-            } else if (expectedResult) {
-                // OLD: Local verification fallback
-                clickDetected = true
-                setTimeout(() => {
-                    if (this.matched) return
-                    if (this.verifyExpectedResult(expectedResult)) {
-                        handler()
-                        return
-                    }
-                    if (window.location.href !== initialUrl) {
-                        handler()
-                    }
-                }, 300)
             } else {
-                // No verification needed
-                handler()
+                // Click detected — start persistent URL + DOM polling
+                this.startPostClickPolling(initialUrl, expectedResult, handler)
             }
         }
 
         document.addEventListener('click', listener, true)
         this.cleanupFns.push(() => document.removeEventListener('click', listener, true))
+    }
 
-        if (expectedResult && !this.llmVerifier) {
-            // Fallback interval check (only when no LLM)
-            const checkInterval = window.setInterval(() => {
-                if (this.matched) return
-                if (!clickDetected) return
-                if (this.verifyExpectedResult(expectedResult) || window.location.href !== initialUrl) {
-                    handler()
-                }
-            }, 500)
-            this.cleanupFns.push(() => window.clearInterval(checkInterval))
+    /**
+     * After a click is detected, persistently poll for URL or DOM changes.
+     * Fires a custom event so the frontend can track what's happening.
+     */
+    private startPostClickPolling(
+        initialUrl: string,
+        _expectedResult: string | undefined,
+        handler: MatchHandler
+    ): void {
+        const initialDomLength = document.body.innerHTML.length
+        const POLL_MS = 200
+        const MAX_POLL_MS = 15000
+
+        const emit = (detail: { type: string; elapsed: number; from?: string; to?: string }) => {
+            window.dispatchEvent(new CustomEvent('siteTutor:clickPollUpdate', { detail }))
         }
+
+        let elapsed = 0
+        emit({ type: 'started', elapsed: 0, from: initialUrl })
+
+        const pollInterval = window.setInterval(() => {
+            if (this.matched) {
+                window.clearInterval(pollInterval)
+                return
+            }
+            elapsed += POLL_MS
+
+            const currentUrl = window.location.href
+            const currentDomLength = document.body.innerHTML.length
+            const urlChanged = currentUrl !== initialUrl
+            const domChanged = Math.abs(currentDomLength - initialDomLength) > 100
+
+            if (urlChanged) {
+                emit({ type: 'url-changed', elapsed, from: initialUrl, to: currentUrl })
+                window.clearInterval(pollInterval)
+                handler()
+                return
+            }
+
+            if (domChanged) {
+                emit({ type: 'dom-changed', elapsed })
+                window.clearInterval(pollInterval)
+                handler()
+                return
+            }
+
+            // Periodic heartbeat so frontend knows we're still watching
+            if (elapsed % 1000 === 0) {
+                emit({ type: 'polling', elapsed })
+            }
+
+            if (elapsed >= MAX_POLL_MS) {
+                emit({ type: 'timeout', elapsed })
+                window.clearInterval(pollInterval)
+                handler()
+            }
+        }, POLL_MS)
+
+        this.cleanupFns.push(() => window.clearInterval(pollInterval))
     }
 
     private attachInputListener(step: TutorialStep, handler: MatchHandler, expectedResult?: string) {
-        const targetElement = resolveElement(step)
+        let targetElement = resolveElement(step)
         if (!targetElement) {
-            console.warn('Site Tutor: Target element not found for input listener', { selector: step.selector, elementIndex: step.elementIndex })
+            console.warn('Site Tutor: Target element not found for input listener, starting poll...', { selector: step.selector, elementIndex: step.elementIndex })
+            waitForElement(step).then(el => {
+                if (el) {
+                    targetElement = el
+                    console.log('Site Tutor: Input target element found via polling')
+                }
+            })
         }
 
         const listener = (event: Event) => {
@@ -369,7 +463,10 @@ export class ActionVerifier {
                 if (expectedResult) {
                     const inputValue = event.target.value.toLowerCase()
                     const expectedLower = expectedResult.toLowerCase()
-                    if (inputValue.includes(expectedLower) || expectedLower.includes(inputValue)) {
+                    const valueMatchesOutcome =
+                        inputValue.includes(expectedLower) ||
+                        expectedLower.includes(inputValue)
+                    if (valueMatchesOutcome || isGenericInputOutcome(expectedResult)) {
                         handler()
                     }
                 } else {
@@ -552,12 +649,35 @@ export class ActionVerifier {
 
     private urlMatchesPattern(currentUrl: string, pattern: string): boolean {
         if (currentUrl === pattern) return true
-        if (currentUrl.includes(pattern)) return true
 
-        const currentPath = new URL(currentUrl).pathname
-        const patternLower = pattern.toLowerCase()
-        if (currentPath.toLowerCase().includes(patternLower)) return true
+        // Try parsing pattern as a URL for proper comparison
+        try {
+            const currentParsed = new URL(currentUrl)
+            // If pattern looks like a full URL, compare structurally
+            if (pattern.startsWith('http://') || pattern.startsWith('https://')) {
+                const patternParsed = new URL(pattern)
+                return currentParsed.origin === patternParsed.origin &&
+                       currentParsed.pathname === patternParsed.pathname
+            }
 
+            // Pattern is a path fragment — compare pathname segments, not substrings
+            const currentSegments = currentParsed.pathname.split('/').filter(Boolean)
+            const patternSegments = pattern.replace(/^\//, '').split('/').filter(Boolean)
+
+            if (patternSegments.length === 0) return false
+
+            // Check if pattern segments appear as contiguous segments in current path
+            for (let i = 0; i <= currentSegments.length - patternSegments.length; i++) {
+                const allMatch = patternSegments.every((seg, j) =>
+                    currentSegments[i + j].toLowerCase() === seg.toLowerCase()
+                )
+                if (allMatch) return true
+            }
+        } catch {
+            // Not valid URLs, fall through
+        }
+
+        // Regex fallback
         try {
             const regex = new RegExp(pattern)
             if (regex.test(currentUrl)) return true

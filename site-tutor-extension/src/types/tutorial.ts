@@ -1,4 +1,4 @@
-export type TutorialActionType = 'click' | 'input' | 'wait' | 'navigate' | 'scroll'
+export type TutorialActionType = 'click' | 'input' | 'wait' | 'navigate' | 'scroll' | 'observe'
 
 export interface TutorialStep {
     stepNumber: number
@@ -6,6 +6,8 @@ export interface TutorialStep {
     instruction: string
     actionType: TutorialActionType
     expectedResult?: string
+    selectionReason?: string
+    isTerminal?: boolean
     elementIndex?: number
     scrollTarget?: number  // For 'scroll' actionType - element index to scroll to
 }
@@ -23,6 +25,7 @@ export interface PlanStep {
     instruction: string
     actionType: TutorialActionType
     expectedResult?: string
+    isTerminal?: boolean
     expectsPageChange: boolean
     pageDescription?: string
     scrollTarget?: number  // For 'scroll' actionType - element index to scroll to
@@ -95,7 +98,7 @@ export interface RouteHistory {
 
 export interface ActionHistoryEntry {
   stepNumber: number
-  action: 'click' | 'input' | 'navigate' | 'wait'
+  action: 'click' | 'input' | 'navigate' | 'wait' | 'observe'
   elementXPath: string
   elementSelector: string
   pageUrlBefore: string

@@ -1,9 +1,10 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react'
-import { AlertCircle, CheckCircle2, ChevronLeft, ChevronRight, Loader2, Sparkles, X, AlertTriangle } from 'lucide-react'
+import { CheckCircle2, Loader2, Sparkles, X, AlertTriangle } from 'lucide-react'
 import type { TutorialPayload, TutorialStep, TutorialActionType, StepError } from '../types/tutorial'
 import { ActionVerifier } from '../utils/actionVerifier'
 import type { ElementIndexer } from '../utils/elementIndexer'
 import { saveStepError } from '../utils/tutorialMemory'
+import { findBestElementByInstructionSync } from '../utils/stepElementResolver'
 import type { LLMVerifier } from '../utils/llmVerifier'
 import type { RouteTracker } from '../utils/routeTracker'
 
@@ -28,6 +29,7 @@ const DOM_READY_TIMEOUT_MS = 8000
 const DOM_QUIET_TIMEOUT_MS = 5000
 const DOM_QUIET_WINDOW_MS = 450
 const HARD_RELOAD_ROUTE_KEY = 'siteTutor:lastHardReloadRoute'
+const INACTIVITY_TIMEOUT_MS = 60000 // 60s inactivity timeout for page transitions
 
 const statusCopy: Record<string, string> = {
     waiting: 'Waiting for you to complete this step...',
@@ -50,7 +52,31 @@ const inferActionType = (text: string): TutorialActionType => {
     if (lower.includes('go to') || lower.includes('navigate') || lower.includes('open')) {
         return 'navigate'
     }
+    if (lower.includes('wait for') || lower.includes('observe') || lower.includes('read the') || lower.includes('confirm you')) {
+        return 'observe'
+    }
     return 'click'
+}
+
+const normalizeActionType = (rawActionType: string | undefined, instruction: string): TutorialActionType => {
+    const normalized = (rawActionType ?? '').toLowerCase()
+    if (normalized === 'click' || normalized === 'input' || normalized === 'wait' || normalized === 'navigate' || normalized === 'scroll' || normalized === 'observe') {
+        return normalized
+    }
+    return inferActionType(instruction)
+}
+
+const STOP_WORDS = new Set([
+    'click', 'press', 'select', 'choose', 'open', 'go', 'navigate', 'enter', 'type',
+    'fill', 'complete', 'continue', 'next', 'previous', 'back', 'button', 'link',
+    'the', 'a', 'an', 'to', 'for', 'on', 'of', 'and', 'or', 'with', 'this', 'that',
+    'it', 'its', 'your', 'you', 'from', 'in', 'new', 'page', 'section', 'tab'
+])
+
+const extractInstructionKeywords = (instruction: string): string[] => {
+    const tokens = instruction.toLowerCase().match(/[a-z0-9]+/g) ?? []
+    const filtered = tokens.filter(token => token.length >= 3 && !STOP_WORDS.has(token))
+    return Array.from(new Set(filtered)).slice(0, 6)
 }
 
 const routeSignature = (url: string): string => {
@@ -148,6 +174,29 @@ const scrollToElement = (elementIndex: number): boolean => {
     }
 }
 
+const describeTargetElement = (step: TutorialStep): string => {
+    if (step.elementIndex == null) return ''
+    const indexer = getIndexer()
+    const element = indexer?.getElement(step.elementIndex)
+    if (!element) return `Element #${step.elementIndex}`
+
+    const tag = element.tagName.toLowerCase()
+    const label =
+        element.textContent?.trim() ||
+        element.getAttribute('aria-label') ||
+        element.getAttribute('title') ||
+        element.getAttribute('name') ||
+        element.getAttribute('id') ||
+        ''
+
+    if (label) {
+        const compact = label.replace(/\s+/g, ' ').slice(0, 80)
+        return `Element #${step.elementIndex} (${tag} "${compact}")`
+    }
+
+    return `Element #${step.elementIndex} (${tag})`
+}
+
 const compressScreenshot = async (dataUrl: string): Promise<Blob> => {
     return new Promise((resolve, reject) => {
         const img = new Image()
@@ -213,27 +262,9 @@ const tryLocalResolution = (step: TutorialStep): boolean => {
         } catch { /* invalid selector */ }
     }
 
-    // Try instruction-based fuzzy match on interactive elements
-    const instruction = step.instruction.toLowerCase()
-    const allInteractive = document.querySelectorAll(
-        'button, a, input, select, textarea, [role="button"], [role="link"], [role="tab"]'
-    )
-    const instructionWords = instruction.split(/\s+/).filter(w => w.length > 3)
-    if (instructionWords.length === 0) return false
-
-    for (const el of Array.from(allInteractive)) {
-        const text = (el.textContent ?? '').toLowerCase()
-        const ariaLabel = (el.getAttribute('aria-label') ?? '').toLowerCase()
-        const placeholder = (el.getAttribute('placeholder') ?? '').toLowerCase()
-        const combined = `${text} ${ariaLabel} ${placeholder}`
-
-        const matchCount = instructionWords.filter(w => combined.includes(w)).length
-        if (matchCount >= 2 || (instructionWords.length === 1 && matchCount === 1)) {
-            return true
-        }
-    }
-
-    return false
+    // Use shared resolver with specificity scoring
+    const resolved = findBestElementByInstructionSync(step.instruction)
+    return resolved !== null
 }
 
 
@@ -267,6 +298,9 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
     // Page transition tracking
     const lastKnownUrlRef = useRef(window.location.href)
     const transitionInProgressRef = useRef(false)
+    const inactivityTimerRef = useRef<ReturnType<typeof window.setTimeout> | null>(null)
+    const [showInactivityPrompt, setShowInactivityPrompt] = useState(false)
+    const [pollStatus, setPollStatus] = useState<string | null>(null)
 
     const steps = tutorial.steps
     const activeStep: TutorialStep | undefined = steps[currentStepIndex]
@@ -366,8 +400,10 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
                 stepNumber: ps.stepNumber,
                 selector: '',
                 instruction: ps.instruction,
-                actionType: ps.actionType ?? inferActionType(ps.instruction),
+                actionType: normalizeActionType(ps.actionType, ps.instruction),
                 expectedResult: ps.expectedResult,
+                selectionReason: `Using plan step #${ps.stepNumber} while real targets load for this page.`,
+                isTerminal: Boolean(ps.isTerminal),
                 // No elementIndex yet - will be filled in by backend
             })
             // If this step itself expects a page change, include it but stop after
@@ -579,8 +615,10 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
                 stepNumber: planStep?.stepNumber ?? (planStepIdx + 1),
                 selector: h.selector ?? '',
                 instruction: planStep?.instruction ?? h.explanation,
-                actionType: planStep?.actionType ?? inferActionType(h.explanation),
+                actionType: normalizeActionType(planStep?.actionType, planStep?.instruction ?? h.explanation),
                 expectedResult: planStep?.expectedResult,
+                selectionReason: h.explanation,
+                isTerminal: Boolean(planStep?.isTerminal),
                 elementIndex: h.elementIndex,
             }
         })
@@ -651,19 +689,11 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
                     } catch {
                         // Ignore removal errors.
                     }
-                } else {
-                    try {
-                        if (sessionStorage.getItem(HARD_RELOAD_ROUTE_KEY) !== currentRoute) {
-                            sessionStorage.setItem(HARD_RELOAD_ROUTE_KEY, currentRoute)
-                            console.log(`[Site Tutor] Hard reload for new route: ${currentRoute}`)
-                            transitionInProgressRef.current = false
-                            window.location.reload()
-                            return
-                        }
-                    } catch (err) {
-                        console.warn('Site Tutor: hard-reload marker unavailable', err)
-                    }
                 }
+
+                // No hard reload — let the browser navigate naturally and
+                // re-index the new page DOM without destroying the content script.
+                console.log(`[Site Tutor] Route changed: ${previousUrl} -> ${currentUrl}`)
 
                 const nextIndex = (wasExpected || isNavigateAction)
                     ? currentGlobalStep + 1
@@ -718,6 +748,35 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
     // Step navigation
     // ──────────────────────────────────────────────
     const goToNextStep = useCallback(() => {
+        const completedStep = steps[currentStepIndex]
+        const completedGlobalIndex = planOffset + currentStepIndex
+        const isTerminalByPlan = Boolean(plan && completedGlobalIndex >= Math.max(plan.totalSteps - 1, 0))
+        const shouldCompleteNow = Boolean(completedStep?.isTerminal || isTerminalByPlan)
+        const hasMorePlanSteps = Boolean(plan && (planOffset + totalSteps) < plan.totalSteps)
+
+        if (shouldCompleteNow) {
+            clearAutoAdvance()
+            setStatus('matched')
+            onComplete?.()
+            return
+        }
+
+        // If we exhausted local steps but still have remaining plan steps on the same page,
+        // fetch the next segment immediately instead of waiting for a URL transition.
+        if (currentStepIndex === totalSteps - 1 && hasMorePlanSteps && plan) {
+            const currentPlanStep = plan.planSteps[completedGlobalIndex]
+            if (currentPlanStep?.expectsPageChange) {
+                clearAutoAdvance()
+                setStatus('waiting')
+                return
+            }
+
+            clearAutoAdvance()
+            setStatus('matched')
+            void handlePageTransition(completedGlobalIndex + 1, completedStep?.instruction)
+            return
+        }
+
         clearAutoAdvance()
         setStatus('waiting')
         setCurrentStepIndex(prev => {
@@ -732,16 +791,7 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
             }
             return nextIndex
         })
-    }, [onComplete, totalSteps, plan, planOffset])
-
-    const goToPreviousStep = useCallback(() => {
-        if (currentStepIndex === 0 && planOffset > 0) {
-            return
-        }
-        clearAutoAdvance()
-        setStatus('waiting')
-        setCurrentStepIndex(prev => Math.max(prev - 1, 0))
-    }, [currentStepIndex, planOffset])
+    }, [currentStepIndex, handlePageTransition, onComplete, plan, planOffset, steps, totalSteps])
 
     const cancelTutorial = useCallback(() => {
         setError(null)
@@ -811,7 +861,53 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
         }
 
         verifierRef.current?.watchStep(activeStep, getWatchStepOptions())
+
+        // Start inactivity timeout for navigate steps
+        if (activeStep.actionType === 'navigate') {
+            if (inactivityTimerRef.current) window.clearTimeout(inactivityTimerRef.current)
+            setShowInactivityPrompt(false)
+            inactivityTimerRef.current = window.setTimeout(() => {
+                setShowInactivityPrompt(true)
+            }, INACTIVITY_TIMEOUT_MS)
+        } else {
+            if (inactivityTimerRef.current) {
+                window.clearTimeout(inactivityTimerRef.current)
+                inactivityTimerRef.current = null
+            }
+            setShowInactivityPrompt(false)
+        }
     }, [activeStep, getWatchStepOptions])
+
+    // ──────────────────────────────────────────────
+    // Post-click poll status tracking
+    // ──────────────────────────────────────────────
+    useEffect(() => {
+        const handler = (e: Event) => {
+            const detail = (e as CustomEvent).detail
+            if (!detail) return
+            switch (detail.type) {
+                case 'started':
+                    setPollStatus('Watching for page changes...')
+                    break
+                case 'polling':
+                    setPollStatus(`Watching... (${Math.round(detail.elapsed / 1000)}s)`)
+                    break
+                case 'url-changed':
+                    setPollStatus('URL changed — advancing!')
+                    setTimeout(() => setPollStatus(null), 1000)
+                    break
+                case 'dom-changed':
+                    setPollStatus('Page updated — advancing!')
+                    setTimeout(() => setPollStatus(null), 1000)
+                    break
+                case 'timeout':
+                    setPollStatus(null)
+                    break
+            }
+        }
+        window.addEventListener('siteTutor:clickPollUpdate', handler)
+        return () => window.removeEventListener('siteTutor:clickPollUpdate', handler)
+    }, [])
 
     // ──────────────────────────────────────────────
     // Page/DOM change detection (works for ALL tutorials, even without a plan)
@@ -870,6 +966,7 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
         verifierRef.current?.stopWatching()
         clearAutoAdvance()
         clearStepAdvanceFlash()
+        if (inactivityTimerRef.current) window.clearTimeout(inactivityTimerRef.current)
     }, [])
 
     if (!activeStep && !isLoadingNewPage) return null
@@ -915,6 +1012,11 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
                                     <Loader2 size={12} className="animate-spin" />
                                     Finding element on page...
                                 </span>
+                            ) : pollStatus ? (
+                                <span style={{ color: '#60a5fa', display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
+                                    <Loader2 size={12} className="animate-spin" />
+                                    {pollStatus}
+                                </span>
                             ) : (
                                 <span style={{ color: '#71717a' }}>
                                     {statusCopy[status] ?? 'Waiting for you to complete this step...'}
@@ -929,10 +1031,48 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
                         )}
                         {activeStep.elementIndex != null && (
                             <div className="step-selector">
-                                Target: <code>Element #{activeStep.elementIndex}</code>
+                                Target: <code>{describeTargetElement(activeStep)}</code>
                             </div>
                         )}
+                        <div className="step-selector" style={{ marginTop: '10px', opacity: 0.9 }}>
+                            <strong>Selection logic:</strong>{' '}
+                            {activeStep.selectionReason || 'No backend explanation provided for this step.'}
+                            <br />
+                            <span>
+                                Keywords: {extractInstructionKeywords(activeStep.instruction).join(', ') || 'none'}
+                            </span>
+                            <br />
+                            <span>
+                                Control type: {activeStep.actionType}
+                            </span>
+                            {activeStep.selector && (
+                                <>
+                                    <br />
+                                    <span>
+                                        Fallback selector: <code>{activeStep.selector}</code>
+                                    </span>
+                                </>
+                            )}
+                        </div>
                     </div>
+
+                    {showInactivityPrompt && (
+                        <div className="error-box" style={{ borderColor: '#f59e0b' }}>
+                            <AlertTriangle size={20} style={{ color: '#f59e0b' }} />
+                            <div className="error-content">
+                                <h4 className="error-title" style={{ color: '#f59e0b' }}>Still waiting for navigation</h4>
+                                <p className="error-message">It's been a while. Need help completing this step?</p>
+                                <div className="error-actions">
+                                    <button onClick={() => { setShowInactivityPrompt(false); retryStep() }} className="retry-btn">
+                                        &circlearrowleft; Retry This Step
+                                    </button>
+                                    <button onClick={cancelTutorial} className="cancel-btn">
+                                        End Tutorial
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
 
                     {error && isPaused && (
                         <div className="error-box">
@@ -971,35 +1111,6 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
                 </div>
             ) : null}
 
-            <div className="tutorial-nav">
-                <button
-                    onClick={goToPreviousStep}
-                    disabled={currentStepIndex === 0 && planOffset === 0}
-                    className="nav-btn"
-                >
-                    <ChevronLeft size={16} /> Previous
-                </button>
-                <div className="nav-right">
-                    <button
-                        className="nav-btn"
-                        onClick={() => {
-                            verifierRef.current?.stopWatching()
-                            startWatchingStep()
-                        }}
-                        disabled={isLoadingNewPage}
-                    >
-                        <AlertCircle size={16} /> Reset watcher
-                    </button>
-                    <button
-                        onClick={goToNextStep}
-                        className="nav-btn nav-btn-primary"
-                        disabled={isLoadingNewPage}
-                    >
-                        {currentStepIndex === totalSteps - 1 && (!plan || (planOffset + totalSteps) >= plan.totalSteps) ? 'Finish' : 'Next'}
-                        <ChevronRight size={16} />
-                    </button>
-                </div>
-            </div>
         </div>
     )
 }
