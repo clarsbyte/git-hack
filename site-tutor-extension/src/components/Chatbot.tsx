@@ -7,6 +7,7 @@ import type { TutorialActionType, TutorialPayload, TutorialPlan, TutorialStep } 
 import { ElementIndexer } from '../utils/elementIndexer'
 import { LLMVerifier } from '../utils/llmVerifier'
 import { RouteTracker } from '../utils/routeTracker'
+import { findBestElementByInstructionSync } from '../utils/stepElementResolver'
 import {
     generateFingerprint,
     saveTutorialRecord,
@@ -27,12 +28,27 @@ interface Highlight {
     selector: string
     explanation: string
     elementIndex?: number
+    selectionReason?: string
+    planStepNumber?: number
 }
 
 interface AutomationAction {
     type: string
     url?: string
     selector?: string
+}
+
+interface NextStepApiResponse {
+    text?: string
+    step?: {
+        instruction?: string
+        actionType?: string
+        isTerminal?: boolean
+    }
+    highlights?: Highlight[]
+    sessionId?: string
+    reasoning?: string
+    done?: boolean
 }
 
 const getIndexer = (): ElementIndexer => {
@@ -43,112 +59,66 @@ const getIndexer = (): ElementIndexer => {
     return win.__siteTutorElementIndexer
 }
 
-const compressScreenshot = async (dataUrl: string): Promise<Blob> => {
-    return new Promise((resolve, reject) => {
-        const img = new Image()
-        img.onload = () => {
-            const canvas = document.createElement('canvas')
-            const ctx = canvas.getContext('2d')
-            if (!ctx) {
-                reject(new Error('Could not get canvas context'))
-                return
-            }
-
-            const maxWidth = 1920
-            const maxHeight = 1080
-            let width = img.width
-            let height = img.height
-
-            if (width > maxWidth || height > maxHeight) {
-                const ratio = Math.min(maxWidth / width, maxHeight / height)
-                width = Math.floor(width * ratio)
-                height = Math.floor(height * ratio)
-            }
-
-            canvas.width = width
-            canvas.height = height
-            ctx.drawImage(img, 0, 0, width, height)
-
-            canvas.toBlob(
-                (blob) => {
-                    if (blob) {
-                        resolve(blob)
-                    } else {
-                        reject(new Error('Failed to compress image'))
-                    }
-                },
-                'image/jpeg',
-                0.75
-            )
-        }
-        img.onerror = () => reject(new Error('Failed to load image'))
-        img.src = dataUrl
-    })
-}
-
-const captureScreenshotDataUrl = async (): Promise<string> => {
-    let screenshotDataUrl = ''
-
-    // Prefer desktop capture for full-context screenshots.
-    console.log('[Screenshot] Using desktop capture')
-    try {
-        const desktopResponse = await fetch('http://localhost:8000/capture-desktop')
-        if (desktopResponse.ok) {
-            const desktopData = await desktopResponse.json()
-            screenshotDataUrl = `data:image/png;base64,${desktopData.screenshot}`
-            console.log('[Screenshot] Desktop screenshot captured successfully')
-        } else {
-            console.error('[Screenshot] Desktop capture failed, falling back to tab capture')
-        }
-    } catch (error) {
-        console.error('[Screenshot] Desktop capture error:', error)
-    }
-
-    if (!screenshotDataUrl) {
-        console.log('[Screenshot] Using Chrome tab capture as fallback')
-        screenshotDataUrl = await new Promise<string>((resolve) => {
-            chrome.runtime.sendMessage({ action: 'captureScreen' }, (response) => {
-                if (chrome.runtime.lastError) {
-                    console.error('[Screenshot] Tab capture error:', chrome.runtime.lastError)
-                    resolve('')
-                } else {
-                    resolve(response?.dataUrl || '')
-                }
-            })
-        })
-    }
-
-    return screenshotDataUrl
-}
-
-const getDataUrlDimensions = async (dataUrl: string): Promise<{ width: number; height: number } | null> => {
-    return new Promise((resolve) => {
-        if (!dataUrl) {
-            resolve(null)
-            return
-        }
-        const img = new Image()
-        img.onload = () => resolve({ width: img.width, height: img.height })
-        img.onerror = () => resolve(null)
-        img.src = dataUrl
-    })
-}
-
-const buildViewportInfo = (
-    viewportSummary: string,
-    screenshotDimensions?: { width: number; height: number } | null
-): string => {
+const buildViewportInfo = (viewportSummary: string): string => {
     const payload = {
         viewportWidth: window.innerWidth,
         viewportHeight: window.innerHeight,
         scrollX: window.scrollX,
         scrollY: window.scrollY,
         devicePixelRatio: window.devicePixelRatio,
-        screenshotWidth: screenshotDimensions?.width ?? null,
-        screenshotHeight: screenshotDimensions?.height ?? null,
+        screenshotWidth: null,
+        screenshotHeight: null,
         summary: viewportSummary || '',
     }
     return JSON.stringify(payload)
+}
+
+const compressScreenshot = async (dataUrl: string): Promise<Blob | null> => {
+    try {
+        const response = await fetch(dataUrl)
+        const blob = await response.blob()
+        return blob
+    } catch {
+        return null
+    }
+}
+
+const captureScreenshot = async (): Promise<Blob | null> => {
+    // Import the screenshot helper (dynamic import to avoid circular deps)
+    const { hideSiteTutorUI, restoreSiteTutorUI } = await import('../utils/screenshotHelper')
+
+    // Hide Site Tutor UI before capture
+    const hiddenState = hideSiteTutorUI()
+
+    try {
+        // Wait a frame to ensure UI is hidden
+        await new Promise(resolve => requestAnimationFrame(resolve))
+
+        // Try fast Chrome tab capture first (minimizes visible hide duration).
+        const tabCapture = await new Promise<Blob | null>((resolve) => {
+            try {
+                chrome.runtime.sendMessage({ action: 'captureScreen' }, (response) => {
+                    if (chrome.runtime.lastError || !response?.dataUrl) {
+                        resolve(null)
+                        return
+                    }
+                    compressScreenshot(response.dataUrl).then(resolve).catch(() => resolve(null))
+                })
+            } catch {
+                resolve(null)
+            }
+        })
+        if (tabCapture) return tabCapture
+
+        // No fallback to desktop capture — desktop screenshots include non-browser
+        // content (IDE, terminal, etc.) which confuses the VLM. If captureVisibleTab
+        // failed (e.g. tab not focused), skip VLM for this request.
+        console.warn('📸 [Site Tutor] captureVisibleTab failed; skipping screenshot (no desktop fallback)')
+        return null
+    } finally {
+        // Always restore UI
+        restoreSiteTutorUI(hiddenState)
+    }
 }
 
 const computeDomSignature = (): string => {
@@ -167,6 +137,10 @@ const STORAGE_KEY_PREFIX = 'siteTutorState'
 const FALLBACK_STORAGE_KEY = `${STORAGE_KEY_PREFIX}:default`
 const GLOBAL_UI_STATE_KEY = `${STORAGE_KEY_PREFIX}:ui`
 const PENDING_NAV_KEY = 'siteTutor:pendingNavigation'
+const ADAPTIVE_SCREEN_MODE = true
+const ADAPTIVE_STEP_WINDOW = 1
+const AUTO_RECALCULATE_ON_PAGE_CHANGE = false
+const AUTO_RECALCULATE_ON_DOM_MUTATION = false
 const DEFAULT_MESSAGES: Message[] = [
     { sender: 'bot', text: "Hi! I'm your Site Tutor. I can teach you anything about this website. Ask a question or request a tutorial!" }
 ]
@@ -181,6 +155,26 @@ const clearPendingNavigationForTab = (tabId: number | null) => {
         chrome.storage.local.set({ [PENDING_NAV_KEY]: store })
     })
 }
+
+const isTutorialIntentMessage = (message: string): boolean => {
+    const normalized = message.toLowerCase().trim()
+    if (!normalized) return false
+    const tutorialIntentPatterns = [
+        'tutorial',
+        'step by step',
+        'step-by-step',
+        'walk me through',
+        'guide me',
+        'show me how',
+        'teach me how',
+        'how to ',
+        'how do i ',
+        'help me do',
+        'what should i click',
+    ]
+    return tutorialIntentPatterns.some(pattern => normalized.includes(pattern))
+}
+
 const extractNumberedSteps = (text: string): string[] | null => {
     const lines = text.split(/\r?\n/).map(line => line.trim())
     const steps: string[] = []
@@ -206,7 +200,14 @@ const extractNumberedSteps = (text: string): string[] | null => {
         steps.push(current.trim())
     }
 
-    return steps.length >= 2 ? steps : null
+    const minSteps = ADAPTIVE_SCREEN_MODE ? 1 : 2
+    return steps.length >= minSteps ? steps : null
+}
+
+const limitAdaptiveSteps = (steps: string[]): string[] => {
+    if (!ADAPTIVE_SCREEN_MODE) return steps
+    const windowSize = Math.max(1, ADAPTIVE_STEP_WINDOW)
+    return steps.slice(0, windowSize)
 }
 
 const inferActionType = (text: string): TutorialActionType => {
@@ -231,48 +232,6 @@ const normalizeActionType = (rawActionType: string | undefined, instruction: str
     return inferActionType(instruction)
 }
 
-const inferExpectedResult = (instruction: string, actionType: TutorialActionType): string => {
-    const quoted = instruction.match(/"([^"]+)"/)?.[1]
-
-    if (actionType === 'input') {
-        return quoted
-            ? `The "${quoted}" field shows the value you entered.`
-            : 'The field shows the value you entered.'
-    }
-
-    if (actionType === 'navigate') {
-        return quoted
-            ? `The "${quoted}" page or section opens.`
-            : 'The requested page opens.'
-    }
-
-    if (actionType === 'scroll') {
-        return quoted
-            ? `The "${quoted}" section is visible on screen.`
-            : 'The target section is visible on screen.'
-    }
-
-    if (actionType === 'wait') {
-        return 'The page finishes loading and the target content is visible.'
-    }
-
-    if (actionType === 'observe') {
-        return quoted
-            ? `Confirm "${quoted}" is visible on the page.`
-            : 'Confirm the expected page state is visible.'
-    }
-
-    if (quoted) {
-        return `The "${quoted}" target opens or becomes active.`
-    }
-
-    const instructionText = instruction.trim().replace(/[.]+$/, '')
-    if (instructionText.length > 0) {
-        return `The result of this step is visible: ${instructionText}.`
-    }
-    return 'The step outcome is visible on the page.'
-}
-
 const buildTutorialFromSteps = (steps: string[], highlights?: Highlight[]): TutorialPayload => {
     return {
         title: 'Step-by-step guide',
@@ -283,8 +242,7 @@ const buildTutorialFromSteps = (steps: string[], highlights?: Highlight[]): Tuto
             selector: highlights?.[index]?.selector ?? '',
             instruction,
             actionType,
-            expectedResult: inferExpectedResult(instruction, actionType),
-            selectionReason: highlights?.[index]?.explanation,
+            selectionReason: highlights?.[index]?.selectionReason || highlights?.[index]?.explanation,
             isTerminal: index === steps.length - 1,
             elementIndex: highlights?.[index]?.elementIndex
             }
@@ -296,8 +254,188 @@ const buildHighlightsFromSteps = (steps: TutorialPayload['steps'], highlights?: 
     return steps.map((step, index) => ({
         selector: highlights?.[index]?.selector ?? step.selector ?? '',
         explanation: step.instruction,
-        elementIndex: highlights?.[index]?.elementIndex ?? step.elementIndex
+        elementIndex: highlights?.[index]?.elementIndex ?? step.elementIndex,
+        selectionReason: highlights?.[index]?.selectionReason ?? step.selectionReason,
+        planStepNumber: highlights?.[index]?.planStepNumber,
     }))
+}
+
+const buildAdaptiveTutorialFromNextStep = (
+    data: NextStepApiResponse,
+    fallbackTitle: string
+): { tutorialPayload: TutorialPayload; highlights: Highlight[]; botText: string } | null => {
+    const rawInstruction = data?.step?.instruction ?? ''
+    const fallbackText = typeof data?.text === 'string' ? data.text.trim() : ''
+    const instruction = (rawInstruction || fallbackText).trim()
+    if (!instruction) return null
+
+    const actionType = normalizeActionType(data?.step?.actionType, instruction)
+    const isTerminal = Boolean(data?.step?.isTerminal)
+    const rawHighlights = Array.isArray(data?.highlights) ? data.highlights : []
+    const firstHighlight = rawHighlights[0] ?? {}
+
+    let adaptiveSteps: TutorialStep[] = [{
+        stepNumber: 1,
+        selector: typeof firstHighlight.selector === 'string' ? firstHighlight.selector : '',
+        instruction,
+        actionType,
+        selectionReason: firstHighlight.selectionReason || firstHighlight.explanation || instruction,
+        isTerminal,
+        elementIndex: typeof firstHighlight.elementIndex === 'number' ? firstHighlight.elementIndex : undefined,
+    }]
+
+    adaptiveSteps = fillMissingStepElementIndices(adaptiveSteps)
+    const adaptiveHighlights = buildHighlightsFromSteps(adaptiveSteps, rawHighlights.slice(0, 1))
+    const tutorialPayload: TutorialPayload = {
+        title: fallbackTitle || 'Step-by-step guide',
+        steps: adaptiveSteps,
+        plan: undefined,
+        planStepOffset: 0,
+    }
+
+    return {
+        tutorialPayload,
+        highlights: adaptiveHighlights,
+        botText: fallbackText || instruction,
+    }
+}
+
+type PagePlanStep = TutorialPlan['planSteps'][number]
+
+const normalizePlanHighlights = (rawHighlights: any[]): Highlight[] => {
+    if (!Array.isArray(rawHighlights)) return []
+    return rawHighlights
+        .filter((item) => item && typeof item === 'object')
+        .map((h) => ({
+            selector: typeof h.selector === 'string' ? h.selector : '',
+            explanation: typeof h.explanation === 'string' ? h.explanation : '',
+            elementIndex: typeof h.elementIndex === 'number' ? h.elementIndex : undefined,
+            selectionReason: typeof h.selectionReason === 'string' ? h.selectionReason : '',
+            planStepNumber: typeof h.planStepNumber === 'number' ? h.planStepNumber : undefined,
+        }))
+}
+
+const alignHighlightsToPlanSteps = (
+    currentPagePlanSteps: PagePlanStep[],
+    rawHighlights: any[]
+): Highlight[] => {
+    const normalized = normalizePlanHighlights(rawHighlights)
+    if (currentPagePlanSteps.length === 0) return []
+    if (normalized.length === 0) {
+        return currentPagePlanSteps.map((step) => ({
+            selector: '',
+            explanation: '',
+            elementIndex: undefined,
+            selectionReason: '',
+            planStepNumber: step.stepNumber,
+        }))
+    }
+
+    const stepNumbers = new Set(currentPagePlanSteps.map((step) => step.stepNumber))
+    const byStepNumber = new Map<number, Highlight>()
+    const sequential: Highlight[] = []
+
+    for (const highlight of normalized) {
+        const stepNumber = highlight.planStepNumber
+        if (typeof stepNumber === 'number' && stepNumbers.has(stepNumber) && !byStepNumber.has(stepNumber)) {
+            byStepNumber.set(stepNumber, highlight)
+            continue
+        }
+        sequential.push(highlight)
+    }
+
+    let sequentialCursor = 0
+    return currentPagePlanSteps.map((step) => {
+        const explicit = byStepNumber.get(step.stepNumber)
+        if (explicit) {
+            return {
+                ...explicit,
+                planStepNumber: step.stepNumber,
+            }
+        }
+        const fallback = sequential[sequentialCursor]
+        if (fallback) {
+            sequentialCursor += 1
+            return {
+                ...fallback,
+                planStepNumber: step.stepNumber,
+            }
+        }
+        return {
+            selector: '',
+            explanation: '',
+            elementIndex: undefined,
+            selectionReason: '',
+            planStepNumber: step.stepNumber,
+        }
+    })
+}
+
+const fillMissingStepElementIndices = (steps: TutorialStep[]): TutorialStep[] => {
+    if (!steps.some((step) => step.elementIndex == null && step.actionType !== 'observe' && step.actionType !== 'wait')) {
+        return steps
+    }
+
+    const indexer = getIndexer()
+    try {
+        indexer.indexPage(document)
+    } catch {
+        return steps
+    }
+
+    const indexedElements = indexer.getAllElements()
+    if (!indexedElements.length) return steps
+
+    const elementToIndex = new Map<HTMLElement, number>()
+    for (const entry of indexedElements) {
+        elementToIndex.set(entry.element, entry.index)
+    }
+
+    const getIndexForElement = (el: Element | null): number | undefined => {
+        if (!(el instanceof HTMLElement)) return undefined
+        return elementToIndex.get(el)
+    }
+
+    let filledCount = 0
+    let unresolvedCount = 0
+
+    const hydrated = steps.map((step) => {
+        if (step.elementIndex != null) return step
+        if (step.actionType === 'observe' || step.actionType === 'wait') return step
+
+        let resolvedIndex: number | undefined
+
+        if (step.selector) {
+            try {
+                resolvedIndex = getIndexForElement(document.querySelector(step.selector))
+            } catch {
+                resolvedIndex = undefined
+            }
+        }
+
+        if (resolvedIndex == null) {
+            const resolvedElement = findBestElementByInstructionSync(step.instruction)
+            resolvedIndex = getIndexForElement(resolvedElement)
+        }
+
+        if (resolvedIndex == null) {
+            unresolvedCount += 1
+            return step
+        }
+        filledCount += 1
+
+        return {
+            ...step,
+            elementIndex: resolvedIndex,
+            selectionReason: step.selectionReason || 'Resolved from current page DOM fallback.',
+        }
+    })
+
+    if (filledCount > 0 || unresolvedCount > 0) {
+        console.log(`[Site Tutor] Step target hydration | filled=${filledCount} unresolved=${unresolvedCount}`)
+    }
+
+    return hydrated
 }
 
 const normalizeText = (value: string): string =>
@@ -310,21 +448,6 @@ const extractSignals = (step: TutorialStep): string[] => {
         const cleaned = part.replace(/"/g, '').trim()
         if (cleaned) signals.add(cleaned)
     })
-
-    const quotedExpected = step.expectedResult?.match(/"([^"]+)"/g) ?? []
-    quotedExpected.forEach((part) => {
-        const cleaned = part.replace(/"/g, '').trim()
-        if (cleaned) signals.add(cleaned)
-    })
-
-    if (step.expectedResult) {
-        const compact = step.expectedResult
-            .replace(/the result of this step is visible:\s*/i, '')
-            .replace(/confirm\s*/i, '')
-            .replace(/[.]/g, '')
-            .trim()
-        if (compact.length >= 4) signals.add(compact)
-    }
 
     return Array.from(signals)
 }
@@ -375,23 +498,6 @@ const findFirstActionableStep = (steps: TutorialStep[]): number => {
 
 const SESSION_STORE_KEY = `${STORAGE_KEY_PREFIX}:sessions`
 
-const isTutorialIntent = (message: string): boolean => {
-    const normalized = message.toLowerCase().trim()
-    const tutorialPatterns = [
-        'tutorial',
-        'step by step',
-        'step-by-step',
-        'walk me through',
-        'guide me',
-        'show me how',
-        'teach me how',
-        'how to ',
-        'how do i ',
-        'help me do',
-        'what should i click',
-    ]
-    return tutorialPatterns.some(pattern => normalized.includes(pattern))
-}
 
 const escapeHtml = (text: string): string =>
     text
@@ -499,6 +605,21 @@ type SessionStore = Record<string, SessionSnapshot>
 
 type ChatMode = 'tutorial' | 'idle'
 
+const isReloadNavigation = (): boolean => {
+    try {
+        const navEntries = performance.getEntriesByType('navigation')
+        const first = navEntries[0] as PerformanceNavigationTiming | undefined
+        if (first?.type) {
+            return first.type === 'reload'
+        }
+    } catch {
+        // Ignore and fall back to legacy API.
+    }
+
+    const legacyNav = (performance as Performance & { navigation?: { type?: number } }).navigation
+    return legacyNav?.type === 1
+}
+
 const Chatbot: React.FC = () => {
     const [isOpen, setIsOpen] = useState(false)
     const [mode, setMode] = useState<ChatMode>('idle')
@@ -527,6 +648,9 @@ const Chatbot: React.FC = () => {
     const lastDynamicRecalcKeyRef = useRef('')
     const lastDomSignatureRef = useRef('')
     const lastDomRecalcAtRef = useRef(0)
+    const storedLinkRef = useRef(window.location.href)
+    const didLinkChangeRef = useRef(false)
+    const activeTutorialGoalRef = useRef('')
 
     const messagesEndRef = useRef<HTMLDivElement>(null)
     const totalTutorialSteps = tutorial?.steps.length ?? 0
@@ -580,13 +704,13 @@ const Chatbot: React.FC = () => {
         }
     }, [tutorialFingerprint])
 
-    const recalculateTutorialForCurrentPage = useCallback(async (reason: string = 'page-changed', dedupeKey?: string) => {
-        if (mode !== 'tutorial' || !tutorial) return
+    const recalculateTutorialForCurrentPage = useCallback(async (reason: string = 'page-changed', dedupeKey?: string): Promise<boolean> => {
+        if (mode !== 'tutorial' || !tutorial) return false
 
         const currentUrl = window.location.href
         const recalcKey = `${currentUrl}::${dedupeKey || reason}`
-        if (dynamicRecalcInFlightRef.current) return
-        if (lastDynamicRecalcKeyRef.current === recalcKey) return
+        if (dynamicRecalcInFlightRef.current) return false
+        if (lastDynamicRecalcKeyRef.current === recalcKey) return false
 
         console.log(`🔄 [Site Tutor] Dynamic recalculation start | reason=${reason} | url=${currentUrl}`)
         dynamicRecalcInFlightRef.current = true
@@ -594,20 +718,8 @@ const Chatbot: React.FC = () => {
 
         try {
             const formData = new FormData()
-            formData.append(
-                'message',
-                'Continue the active tutorial on this current page. Recalculate the next actionable steps for this page and return accurate highlights.'
-            )
-
-            const screenshotDataUrl = await captureScreenshotDataUrl()
-            const screenshotDimensions = await getDataUrlDimensions(screenshotDataUrl)
-            if (screenshotDataUrl) {
-                const compressedBlob = await compressScreenshot(screenshotDataUrl)
-                formData.append('screenshot', compressedBlob, 'screenshot.jpg')
-                console.log('[Screenshot] Screenshot attached to dynamic /chat request')
-            } else {
-                console.warn('[Screenshot] No screenshot available for dynamic /chat request')
-            }
+            const globalStepIndex = (tutorial.planStepOffset ?? 0) + currentTutorialStep
+            const canUseContinueEndpoint = Boolean(tutorial.plan && sessionId)
 
             if (sessionId) {
                 formData.append('sessionId', sessionId)
@@ -616,45 +728,129 @@ const Chatbot: React.FC = () => {
             const tutorialContext = {
                 title: tutorial.title,
                 currentStepIndex: currentTutorialStep,
+                currentGlobalStepIndex: globalStepIndex,
                 totalSteps: tutorial.steps.length,
                 currentStep: tutorial.steps[currentTutorialStep]?.instruction ?? '',
+                currentActionType: tutorial.steps[currentTutorialStep]?.actionType ?? 'click',
                 steps: tutorial.steps.map(step => step.instruction),
                 recalculationReason: reason,
                 currentUrl,
             }
-            formData.append('tutorialContext', JSON.stringify(tutorialContext))
 
             const indexer = getIndexer()
             indexer.indexPage(document)
             const domText = indexer.toTextRepresentation(true)
             const viewportSummary = indexer.getViewportSummary()
-            const viewportInfo = buildViewportInfo(viewportSummary, screenshotDimensions)
+            const viewportInfo = buildViewportInfo(viewportSummary)
             formData.append('dom', domText)
             formData.append('viewportInfo', viewportInfo)
             formData.append('viewportWidth', String(window.innerWidth))
             formData.append('viewportHeight', String(window.innerHeight))
-            if (screenshotDimensions?.width && screenshotDimensions?.height) {
-                formData.append('screenshotWidth', String(screenshotDimensions.width))
-                formData.append('screenshotHeight', String(screenshotDimensions.height))
-            }
             formData.append('scrollPosition', String(window.scrollY))
+
+            if (ADAPTIVE_SCREEN_MODE) {
+                const adaptiveGoal = activeTutorialGoalRef.current.trim()
+                    || tutorial.title.trim()
+                    || tutorial.steps[0]?.instruction?.trim()
+                if (!adaptiveGoal) return false
+                activeTutorialGoalRef.current = adaptiveGoal
+
+                formData.append('goal', adaptiveGoal)
+                formData.append('currentUrl', currentUrl)
+                formData.append('tutorialContext', JSON.stringify(tutorialContext))
+                const completedInstruction = tutorial.steps[currentTutorialStep]?.instruction ?? ''
+                if (completedInstruction) {
+                    formData.append('completedStepInstruction', completedInstruction)
+                }
+
+                try {
+                    const screenshotBlob = await captureScreenshot()
+                    if (screenshotBlob) {
+                        formData.append('screenshot', screenshotBlob, 'screenshot.png')
+                    }
+                } catch (screenshotError) {
+                    console.warn('📸 [Site Tutor] Screenshot capture failed for /next-step recalculation', screenshotError)
+                }
+
+                console.log(`🧠 [Site Tutor] DOM forwarded to /next-step (dynamic) | chars=${domText.length} | url=${currentUrl}`)
+                console.log('📡 [Site Tutor] POST /next-step (dynamic recalculation)')
+                const response = await fetch('http://localhost:8000/next-step', {
+                    method: 'POST',
+                    body: formData,
+                })
+                if (!response.ok) {
+                    const errorText = await response.text().catch(() => '')
+                    throw new Error(`Adaptive recalculation failed: ${response.status} ${errorText}`)
+                }
+                const data: NextStepApiResponse = await response.json()
+                if (data.sessionId && !sessionId) {
+                    setSessionId(data.sessionId)
+                }
+                const adaptive = buildAdaptiveTutorialFromNextStep(data, tutorial.title || 'Step-by-step guide')
+                if (!adaptive) {
+                    if (data.done) return false
+                    throw new Error('No adaptive next step returned')
+                }
+
+                setMode('tutorial')
+                setTutorial(adaptive.tutorialPayload)
+                setCurrentTutorialStep(findFirstActionableStep(adaptive.tutorialPayload.steps))
+                setHighlights(adaptive.highlights)
+                console.log('✅ [Site Tutor] Dynamic adaptive recalculation applied | newSteps=1')
+                return true
+            }
+
+            if (!canUseContinueEndpoint) {
+                formData.append(
+                    'message',
+                    'Continue the active tutorial on this current page. Recalculate the next actionable steps for this page and return accurate highlights.'
+                )
+                formData.append('tutorialContext', JSON.stringify(tutorialContext))
+            }
+
             console.log(`🧠 [Site Tutor] DOM forwarded to /chat (dynamic) | chars=${domText.length} | url=${currentUrl}`)
 
-            console.log('📡 [Site Tutor] POST /chat (dynamic recalculation)')
-            const response = await fetch('http://localhost:8000/chat', {
-                method: 'POST',
-                body: formData,
-            })
-            if (!response.ok) {
-                throw new Error(`Recalculation failed: ${response.status}`)
-            }
+            let data: any
+            if (canUseContinueEndpoint && tutorial.plan) {
+                const completedIndices = Array.from({ length: Math.max(0, globalStepIndex) }, (_, i) => i)
+                formData.append('currentPlanStepIndex', String(globalStepIndex))
+                formData.append('completedSteps', JSON.stringify(completedIndices))
+                formData.append('currentUrl', currentUrl)
+                formData.append('completedStepInstruction', tutorial.steps[Math.max(0, currentTutorialStep - 1)]?.instruction ?? '')
 
-            const data = await response.json()
+                console.log('📡 [Site Tutor] POST /continue-tutorial (dynamic recalculation with VLM)')
+                const response = await fetch('http://localhost:8000/continue-tutorial', {
+                    method: 'POST',
+                    body: formData,
+                })
+                if (!response.ok) {
+                    const errorText = await response.text().catch(() => '')
+                    console.warn(`❌ [Site Tutor] /continue-tutorial error ${response.status}: ${errorText}`)
+                    throw new Error(`Continue recalculation failed: ${response.status} ${errorText}`)
+                }
+                data = await response.json()
+            } else {
+                console.log('📡 [Site Tutor] POST /chat (dynamic recalculation)')
+                const response = await fetch('http://localhost:8000/chat', {
+                    method: 'POST',
+                    body: formData,
+                })
+                if (!response.ok) {
+                    throw new Error(`Recalculation failed: ${response.status}`)
+                }
+                data = await response.json()
+            }
             if (data.sessionId && !sessionId) {
                 setSessionId(data.sessionId)
             }
 
-            const planData = data.tutorialPlan as TutorialPlan | undefined
+            const planData = canUseContinueEndpoint && tutorial.plan
+                ? {
+                    ...tutorial.plan,
+                    currentPageHighlights: data.currentPageHighlights ?? [],
+                    currentPageRange: data.currentPageRange ?? { startIndex: globalStepIndex, endIndex: globalStepIndex },
+                } as TutorialPlan
+                : (data.tutorialPlan as TutorialPlan | undefined)
             if (planData && planData.planSteps && planData.planSteps.length > 0) {
                 const currentRange = planData.currentPageRange ?? { startIndex: 0, endIndex: 0 }
                 const currentPagePlanSteps = planData.planSteps.slice(
@@ -662,72 +858,104 @@ const Chatbot: React.FC = () => {
                     currentRange.endIndex + 1
                 )
                 const currentPageHighlights = planData.currentPageHighlights ?? data.highlights ?? []
-                const normalizedHighlights: Highlight[] = currentPageHighlights.map((h: any) => ({
-                    selector: h?.selector ?? '',
-                    explanation: h?.explanation ?? '',
-                    elementIndex: h?.elementIndex,
-                }))
+                const alignedHighlights = alignHighlightsToPlanSteps(currentPagePlanSteps, currentPageHighlights)
 
-                const currentPageTutorialSteps: TutorialStep[] = currentPagePlanSteps.map((ps, idx) => ({
+                let currentPageTutorialSteps: TutorialStep[] = currentPagePlanSteps.map((ps, idx) => ({
                     stepNumber: ps.stepNumber,
-                    selector: normalizedHighlights[idx]?.selector ?? '',
+                    selector: alignedHighlights[idx]?.selector ?? '',
                     instruction: ps.instruction,
                     actionType: normalizeActionType(ps.actionType, ps.instruction),
-                    expectedResult: ps.expectedResult ?? inferExpectedResult(ps.instruction, normalizeActionType(ps.actionType, ps.instruction)),
-                    selectionReason: normalizedHighlights[idx]?.explanation,
+                    selectionReason: alignedHighlights[idx]?.selectionReason || alignedHighlights[idx]?.explanation,
                     isTerminal: Boolean(ps.isTerminal),
-                    elementIndex: normalizedHighlights[idx]?.elementIndex,
+                    elementIndex: alignedHighlights[idx]?.elementIndex,
                 }))
+                currentPageTutorialSteps = fillMissingStepElementIndices(currentPageTutorialSteps)
+
+                const windowedSteps = ADAPTIVE_SCREEN_MODE
+                    ? currentPageTutorialSteps.slice(0, Math.max(1, ADAPTIVE_STEP_WINDOW))
+                    : currentPageTutorialSteps
+                const windowedHighlights = ADAPTIVE_SCREEN_MODE
+                    ? alignedHighlights.slice(0, windowedSteps.length)
+                    : alignedHighlights
 
                 const tutorialPayload: TutorialPayload = {
                     title: planData.title || tutorial.title || 'Step-by-step guide',
-                    steps: currentPageTutorialSteps,
-                    plan: planData,
-                    planStepOffset: currentRange.startIndex,
+                    steps: windowedSteps,
+                    plan: ADAPTIVE_SCREEN_MODE ? undefined : planData,
+                    planStepOffset: ADAPTIVE_SCREEN_MODE ? 0 : currentRange.startIndex,
                 }
 
                 setMode('tutorial')
                 setTutorial(tutorialPayload)
-                setCurrentTutorialStep(findFirstActionableStep(currentPageTutorialSteps))
-                setHighlights(buildHighlightsFromSteps(currentPageTutorialSteps, normalizedHighlights))
-                console.log(`✅ [Site Tutor] Dynamic recalculation applied | newSteps=${currentPageTutorialSteps.length}`)
-                return
+                setCurrentTutorialStep(findFirstActionableStep(windowedSteps))
+                setHighlights(buildHighlightsFromSteps(windowedSteps, windowedHighlights))
+                console.log(`✅ [Site Tutor] Dynamic recalculation applied | newSteps=${windowedSteps.length}`)
+                return true
             }
 
             const parsedSteps = extractNumberedSteps(data.text || '')
             if (parsedSteps && parsedSteps.length > 0) {
-                const tutorialPayload = buildTutorialFromSteps(parsedSteps, data.highlights)
+                const adaptiveSteps = limitAdaptiveSteps(parsedSteps)
+                const adaptiveHighlights = Array.isArray(data.highlights)
+                    ? data.highlights.slice(0, adaptiveSteps.length)
+                    : data.highlights
+                const tutorialPayload = buildTutorialFromSteps(adaptiveSteps, adaptiveHighlights)
                 setMode('tutorial')
                 setTutorial(tutorialPayload)
                 setCurrentTutorialStep(findFirstActionableStep(tutorialPayload.steps))
-                setHighlights(buildHighlightsFromSteps(tutorialPayload.steps, data.highlights))
-                console.log(`✅ [Site Tutor] Dynamic recalculation applied from text steps | newSteps=${parsedSteps.length}`)
+                setHighlights(buildHighlightsFromSteps(tutorialPayload.steps, adaptiveHighlights))
+                console.log(`✅ [Site Tutor] Dynamic recalculation applied from text steps | newSteps=${adaptiveSteps.length}`)
+                return true
             }
         } catch (error) {
             console.warn('❌ [Site Tutor] Dynamic tutorial recalculation failed', error)
             // Allow retry on next page-change signal if this attempt failed.
             lastDynamicRecalcKeyRef.current = ''
+            return true
         } finally {
             console.log('🏁 [Site Tutor] Dynamic recalculation finished')
             dynamicRecalcInFlightRef.current = false
         }
+        return false
     }, [mode, tutorial, sessionId, currentTutorialStep])
 
-    // Re-index DOM and refresh highlights when the URL changes (SPA or traditional navigation)
+    // Re-index DOM on page change. Do not auto-recalculate steps unless explicitly enabled.
     useEffect(() => {
-        const handlePageChanged = () => {
-            console.log(`🧭 [Site Tutor] siteTutor:pageChanged | url=${window.location.href}`)
+        const handlePageChanged = (event: Event) => {
+            const custom = event as CustomEvent<{ currentUrl?: string; previousUrl?: string; reason?: string }>
+            const currentUrl = custom?.detail?.currentUrl || window.location.href
+            const previousUrl = custom?.detail?.previousUrl || storedLinkRef.current
+            const linkChanged = previousUrl !== currentUrl
+            const triggerReason = (custom?.detail?.reason || 'page-changed').toLowerCase()
+
+            didLinkChangeRef.current = linkChanged
+            storedLinkRef.current = currentUrl
+
+            console.log(`🧭 [Site Tutor] siteTutor:pageChanged | url=${currentUrl} | changed=${linkChanged} | reason=${triggerReason}`)
             console.log('🧠 [Site Tutor] Re-indexing DOM due to page change')
             const indexer = getIndexer()
             indexer.indexPage(document)
 
             // If in tutorial mode, refresh the highlights from the current tutorial steps
             if (tutorial && mode === 'tutorial') {
-                setHighlights(buildHighlightsFromSteps(tutorial.steps))
-                // Fallback for static/no-plan sessions: re-query backend for fresh page steps.
-                if (!tutorial.plan || !sessionId) {
-                    console.log('🆘 [Site Tutor] No plan/session transition path; triggering dynamic /chat fallback recalculation')
-                    void recalculateTutorialForCurrentPage('page-changed-fallback')
+                // On real navigation, clear selected DOM targets so stale indices are never carried across pages.
+                if (linkChanged) {
+                    setHighlights([])
+                    setTutorial(prev => prev ? {
+                        ...prev,
+                        steps: prev.steps.map(step => ({
+                            ...step,
+                            elementIndex: undefined,
+                            selector: '',
+                        })),
+                    } : null)
+                    console.log('🧼 [Site Tutor] URL changed during tutorial -> cleared selected DOM targets')
+                    if (AUTO_RECALCULATE_ON_PAGE_CHANGE) {
+                        void recalculateTutorialForCurrentPage(
+                            'page-changed-fallback',
+                            `url:${currentUrl}:changed:${String(linkChanged)}`
+                        )
+                    }
                 }
             }
         }
@@ -736,11 +964,14 @@ const Chatbot: React.FC = () => {
         return () => {
             window.removeEventListener('siteTutor:pageChanged', handlePageChanged)
         }
-    }, [tutorial, mode, sessionId, recalculateTutorialForCurrentPage])
+    }, [tutorial, mode, recalculateTutorialForCurrentPage])
 
-    // Recalculate tutorial instructions when DOM changes significantly on the same URL.
+    // Optional auto-recalculation path for same-URL DOM mutations.
     useEffect(() => {
+        if (!AUTO_RECALCULATE_ON_DOM_MUTATION) return
         if (mode !== 'tutorial' || !tutorial) return
+        // Plan/session flow already has dedicated page-transition handling in TutorialController.
+        if (tutorial.plan && sessionId) return
 
         let debounceTimer: number | null = null
         const mutationObserver = new MutationObserver(() => {
@@ -750,6 +981,13 @@ const Chatbot: React.FC = () => {
 
             debounceTimer = window.setTimeout(() => {
                 try {
+                    const activeEl = document.activeElement as HTMLElement | null
+                    if (
+                        activeEl &&
+                        (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA' || activeEl.isContentEditable)
+                    ) {
+                        return
+                    }
                     const signature = computeDomSignature()
                     if (!lastDomSignatureRef.current) {
                         lastDomSignatureRef.current = signature
@@ -800,6 +1038,8 @@ const Chatbot: React.FC = () => {
             lastDynamicRecalcKeyRef.current = ''
             lastDomSignatureRef.current = ''
             lastDomRecalcAtRef.current = 0
+            didLinkChangeRef.current = false
+            storedLinkRef.current = window.location.href
         }
     }, [mode, tutorial])
 
@@ -829,6 +1069,47 @@ const Chatbot: React.FC = () => {
             const session = tabId !== null ? sessionStore?.[String(tabId)] : undefined
 
             const restoredUrl = stored?.lastUrl ?? session?.lastUrl ?? null
+            if (isReloadNavigation()) {
+                const openState = stored?.isOpen ?? session?.isOpen ?? globalIsOpen
+                activeTutorialGoalRef.current = ''
+                setIsOpen(!!openState)
+                setTutorial(null)
+                setCurrentTutorialStep(0)
+                setMode('idle')
+                setHighlights([])
+                setSessionId(null)
+                setRestoredLastUrl(window.location.href)
+                setMessages(DEFAULT_MESSAGES)
+                setInput('')
+                setLoading(false)
+
+                const clearedState: StoredState = {
+                    tutorial: null,
+                    currentTutorialStep: 0,
+                    isOpen: !!openState,
+                    origin: window.location.origin,
+                    lastUrl: window.location.href,
+                    sessionId: null,
+                }
+                chrome.storage.local.set({ [storageKey]: clearedState })
+                if (tabId !== null) {
+                    const store = sessionStore ?? {}
+                    store[String(tabId)] = {
+                        tutorial: null,
+                        currentTutorialStep: 0,
+                        isOpen: !!openState,
+                        origin: window.location.origin,
+                        lastUrl: window.location.href,
+                        updatedAt: Date.now(),
+                        sessionId: null,
+                    }
+                    chrome.storage.local.set({ [SESSION_STORE_KEY]: store })
+                }
+
+                setIsRestoring(false)
+                return
+            }
+
             if (stored && stored.origin === window.location.origin) {
                 setTutorial(stored.tutorial)
                 setCurrentTutorialStep(stored.currentTutorialStep)
@@ -836,9 +1117,11 @@ const Chatbot: React.FC = () => {
                 setRestoredLastUrl(restoredUrl)
                 setSessionId(stored.sessionId ?? null)
                 if (stored.tutorial) {
+                    activeTutorialGoalRef.current = stored.tutorial.title || ''
                     setMode('tutorial')
                     setHighlights(buildHighlightsFromSteps(stored.tutorial.steps))
                 } else {
+                    activeTutorialGoalRef.current = ''
                     setHighlights([])
                 }
             } else if (session && session.origin === window.location.origin) {
@@ -854,9 +1137,11 @@ const Chatbot: React.FC = () => {
                 setRestoredLastUrl(restoredUrl)
                 setSessionId(session.sessionId ?? null)
                 if (session.tutorial) {
+                    activeTutorialGoalRef.current = session.tutorial.title || ''
                     setMode('tutorial')
                     setHighlights(buildHighlightsFromSteps(session.tutorial.steps))
                 } else {
+                    activeTutorialGoalRef.current = ''
                     setHighlights([])
                 }
                 if (didAdvanceForUrlChange) {
@@ -864,6 +1149,7 @@ const Chatbot: React.FC = () => {
                 }
             } else {
                 const openState = stored?.isOpen ?? session?.isOpen ?? globalIsOpen
+                activeTutorialGoalRef.current = ''
                 setIsOpen(!!openState)
                 setTutorial(null)
                 setCurrentTutorialStep(0)
@@ -929,6 +1215,7 @@ const Chatbot: React.FC = () => {
     }, [tutorial, currentTutorialStep, isOpen, tabId, isRestoring])
 
     const exitTutorial = () => {
+        activeTutorialGoalRef.current = ''
         setTutorial(null)
         setCurrentTutorialStep(0)
         setMode('idle')
@@ -943,12 +1230,14 @@ const Chatbot: React.FC = () => {
                 markStepCompleted(tutorialFingerprint, i).catch(() => {})
             }
         }
+        activeTutorialGoalRef.current = ''
         setTutorialFingerprint(null)
         exitTutorial()
         setHighlights([])
     }
 
     const handleReset = () => {
+        activeTutorialGoalRef.current = ''
         exitTutorial()
         setHighlights([])
         setInput('')
@@ -961,8 +1250,8 @@ const Chatbot: React.FC = () => {
         if (!input.trim()) return
 
         const userMessage = input
-        const shouldStartTutorial = isTutorialIntent(userMessage)
-        console.log(`💬 [Site Tutor] User message -> /chat | url=${window.location.href} | text="${userMessage}"`)
+        const useAdaptiveNextStep = ADAPTIVE_SCREEN_MODE && isTutorialIntentMessage(userMessage)
+        console.log(`💬 [Site Tutor] User message -> ${useAdaptiveNextStep ? '/next-step' : '/chat'} | url=${window.location.href} | text="${userMessage}"`)
         setInput('')
         setLoading(true)
         setHighlights([])
@@ -971,12 +1260,14 @@ const Chatbot: React.FC = () => {
         setMessages(prev => [...prev, { sender: 'user', text: userMessage }])
 
         try {
-            const screenshotDataUrl = await captureScreenshotDataUrl()
-            const screenshotDimensions = await getDataUrlDimensions(screenshotDataUrl)
-
             // Prepare Form Data
             const formData = new FormData()
-            formData.append('message', userMessage)
+            if (useAdaptiveNextStep) {
+                formData.append('goal', userMessage)
+                formData.append('currentUrl', window.location.href)
+            } else {
+                formData.append('message', userMessage)
+            }
 
             // Include session ID if we have one
             if (sessionId) {
@@ -984,23 +1275,30 @@ const Chatbot: React.FC = () => {
             }
 
             if (tutorial && mode === 'tutorial') {
+                const globalStepIndex = (tutorial.planStepOffset ?? 0) + currentTutorialStep
                 const tutorialContext = {
                     title: tutorial.title,
                     currentStepIndex: currentTutorialStep,
+                    currentGlobalStepIndex: globalStepIndex,
                     totalSteps: tutorial.steps.length,
                     currentStep: tutorial.steps[currentTutorialStep]?.instruction ?? '',
+                    currentActionType: tutorial.steps[currentTutorialStep]?.actionType ?? 'click',
                     steps: tutorial.steps.map(step => step.instruction),
                 }
                 formData.append('tutorialContext', JSON.stringify(tutorialContext))
             }
 
-            if (screenshotDataUrl) {
-                // Compress and convert data URL to blob
-                const compressedBlob = await compressScreenshot(screenshotDataUrl)
-                formData.append('screenshot', compressedBlob, 'screenshot.jpg')
-                console.log('[Screenshot] Screenshot attached to request')
-            } else {
-                console.warn('[Screenshot] No screenshot available to send')
+            // Capture screenshot for VLM-enhanced initial tutorial generation
+            try {
+                const screenshotBlob = await captureScreenshot()
+                if (screenshotBlob) {
+                    formData.append('screenshot', screenshotBlob, 'screenshot.png')
+                    console.log(`📸 [Site Tutor] Screenshot captured for ${useAdaptiveNextStep ? '/next-step' : '/chat'} VLM analysis`)
+                } else {
+                    console.warn(`📸 [Site Tutor] Screenshot capture failed for ${useAdaptiveNextStep ? '/next-step' : '/chat'}, proceeding without VLM`)
+                }
+            } catch (screenshotError) {
+                console.warn(`📸 [Site Tutor] Screenshot error on ${useAdaptiveNextStep ? '/next-step' : '/chat'}:`, screenshotError)
             }
 
             // Add indexed DOM context with viewport information
@@ -1009,35 +1307,34 @@ const Chatbot: React.FC = () => {
                 indexer.indexPage(document)
                 const domText = indexer.toTextRepresentation(true)  // Include viewport annotations
                 const viewportSummary = indexer.getViewportSummary()
-                const viewportInfo = buildViewportInfo(viewportSummary, screenshotDimensions)
+                const viewportInfo = buildViewportInfo(viewportSummary)
                 formData.append('dom', domText)
                 formData.append('viewportInfo', viewportInfo)
                 formData.append('viewportWidth', String(window.innerWidth))
                 formData.append('viewportHeight', String(window.innerHeight))
-                if (screenshotDimensions?.width && screenshotDimensions?.height) {
-                    formData.append('screenshotWidth', String(screenshotDimensions.width))
-                    formData.append('screenshotHeight', String(screenshotDimensions.height))
-                }
                 formData.append('scrollPosition', String(window.scrollY))
-                console.log(`🧠 [Site Tutor] DOM forwarded to /chat | chars=${domText.length} | scrollY=${window.scrollY}`)
+                console.log(`🧠 [Site Tutor] DOM forwarded to ${useAdaptiveNextStep ? '/next-step' : '/chat'} | chars=${domText.length} | scrollY=${window.scrollY}`)
             } catch (err) {
                 console.warn('⚠️ [Site Tutor] Unable to generate indexed DOM', err)
             }
 
-            // Add completion history
-            try {
-                const history = await getCompletionHistory(window.location.origin)
-                if (history.length > 0) {
-                    const summary = history.map(h => `- ${h.title}`).join('\n')
-                    formData.append('completionHistory', summary)
+            // Add completion history for /chat tutorials
+            if (!useAdaptiveNextStep) {
+                try {
+                    const history = await getCompletionHistory(window.location.origin)
+                    if (history.length > 0) {
+                        const summary = history.map(h => `- ${h.title}`).join('\n')
+                        formData.append('completionHistory', summary)
+                    }
+                } catch (err) {
+                    console.warn('Site Tutor: unable to load completion history', err)
                 }
-            } catch (err) {
-                console.warn('Site Tutor: unable to load completion history', err)
             }
 
             // Call Backend
-            console.log('📡 [Site Tutor] POST /chat')
-            const response = await fetch('http://localhost:8000/chat', {
+            const endpoint = useAdaptiveNextStep ? 'http://localhost:8000/next-step' : 'http://localhost:8000/chat'
+            console.log(`📡 [Site Tutor] POST ${useAdaptiveNextStep ? '/next-step' : '/chat'}`)
+            const response = await fetch(endpoint, {
                 method: 'POST',
                 body: formData
             })
@@ -1050,10 +1347,37 @@ const Chatbot: React.FC = () => {
                 console.log('Session ID received:', data.sessionId)
             }
 
+            if (useAdaptiveNextStep) {
+                activeTutorialGoalRef.current = userMessage
+                setTutorialFingerprint(null)
+
+                const adaptive = buildAdaptiveTutorialFromNextStep(
+                    data as NextStepApiResponse,
+                    'Step-by-step guide'
+                )
+                if (adaptive) {
+                    setMode('tutorial')
+                    setRestoredLastUrl(null)
+                    setTutorial(adaptive.tutorialPayload)
+                    setCurrentTutorialStep(findFirstActionableStep(adaptive.tutorialPayload.steps))
+                    setHighlights(adaptive.highlights)
+                    setMessages(prev => [...prev, {
+                        sender: 'bot',
+                        text: adaptive.botText || 'Starting adaptive tutorial for this screen.',
+                    }])
+                } else {
+                    setMode('idle')
+                    setMessages(prev => [...prev, { sender: 'bot', text: data.text || 'I could not determine the next step on this screen.' }])
+                    setHighlights(Array.isArray(data.highlights) ? data.highlights : [])
+                }
+                return
+            }
+
             // Check if the response includes a tutorial plan (two-tier response)
             const planData = data.tutorialPlan as TutorialPlan | undefined
 
-            if (shouldStartTutorial && planData && planData.planSteps && planData.planSteps.length > 0) {
+            const hasTutorialPlan = !ADAPTIVE_SCREEN_MODE && !!(planData && planData.planSteps && planData.planSteps.length > 0)
+            if (hasTutorialPlan) {
                 // Two-tier plan response: build tutorial from current-page steps only
                 const currentRange = planData.currentPageRange ?? { startIndex: 0, endIndex: 0 }
                 const currentPagePlanSteps = planData.planSteps.slice(
@@ -1062,22 +1386,30 @@ const Chatbot: React.FC = () => {
                 )
                 const currentPageHighlights = planData.currentPageHighlights ?? data.highlights ?? []
 
-                const currentPageTutorialSteps: TutorialStep[] = currentPagePlanSteps.map((ps, idx) => ({
+                const alignedHighlights = alignHighlightsToPlanSteps(currentPagePlanSteps, currentPageHighlights)
+                let currentPageTutorialSteps: TutorialStep[] = currentPagePlanSteps.map((ps, idx) => ({
                     stepNumber: ps.stepNumber,
-                    selector: currentPageHighlights[idx]?.selector ?? '',
+                    selector: alignedHighlights[idx]?.selector ?? '',
                     instruction: ps.instruction,
                     actionType: normalizeActionType(ps.actionType, ps.instruction),
-                    expectedResult: ps.expectedResult ?? inferExpectedResult(ps.instruction, normalizeActionType(ps.actionType, ps.instruction)),
-                    selectionReason: currentPageHighlights[idx]?.explanation,
+                    selectionReason: alignedHighlights[idx]?.selectionReason || alignedHighlights[idx]?.explanation,
                     isTerminal: Boolean(ps.isTerminal),
-                    elementIndex: currentPageHighlights[idx]?.elementIndex,
+                    elementIndex: alignedHighlights[idx]?.elementIndex,
                 }))
+                currentPageTutorialSteps = fillMissingStepElementIndices(currentPageTutorialSteps)
+
+                const windowedSteps = ADAPTIVE_SCREEN_MODE
+                    ? currentPageTutorialSteps.slice(0, Math.max(1, ADAPTIVE_STEP_WINDOW))
+                    : currentPageTutorialSteps
+                const windowedHighlights = ADAPTIVE_SCREEN_MODE
+                    ? alignedHighlights.slice(0, windowedSteps.length)
+                    : alignedHighlights
 
                 const tutorialPayload: TutorialPayload = {
                     title: planData.title || 'Step-by-step guide',
-                    steps: currentPageTutorialSteps,
-                    plan: planData,
-                    planStepOffset: currentRange.startIndex,
+                    steps: windowedSteps,
+                    plan: ADAPTIVE_SCREEN_MODE ? undefined : planData,
+                    planStepOffset: ADAPTIVE_SCREEN_MODE ? 0 : currentRange.startIndex,
                 }
 
                 // Check for prior progress
@@ -1122,16 +1454,20 @@ const Chatbot: React.FC = () => {
                 setRestoredLastUrl(null)
                 setTutorial(tutorialPayload)
                 setCurrentTutorialStep(Math.max(
-                    Math.min(resumeStep, currentPageTutorialSteps.length - 1),
-                    findFirstActionableStep(currentPageTutorialSteps)
+                    Math.min(resumeStep, windowedSteps.length - 1),
+                    findFirstActionableStep(windowedSteps)
                 ))
-                setHighlights(buildHighlightsFromSteps(currentPageTutorialSteps))
+                setHighlights(buildHighlightsFromSteps(windowedSteps, windowedHighlights))
                 setMessages(prev => [...prev, { sender: 'bot', text: resumeStep > 0 ? `Resuming tutorial from step ${resumeStep + 1}.` : 'Starting step-by-step tutorial. Use Next to move through each step.' }])
-            } else if (shouldStartTutorial) {
+            } else if (!hasTutorialPlan) {
                 // Fallback: try legacy flat step parsing
                 const parsedSteps = extractNumberedSteps(data.text || '')
                 if (parsedSteps) {
-                    const tutorialPayload = buildTutorialFromSteps(parsedSteps, data.highlights)
+                    const adaptiveSteps = limitAdaptiveSteps(parsedSteps)
+                    const adaptiveHighlights = Array.isArray(data.highlights)
+                        ? data.highlights.slice(0, adaptiveSteps.length)
+                        : data.highlights
+                    const tutorialPayload = buildTutorialFromSteps(adaptiveSteps, adaptiveHighlights)
 
                     const fp = generateFingerprint(
                         window.location.origin,
@@ -1172,7 +1508,7 @@ const Chatbot: React.FC = () => {
                     setRestoredLastUrl(null)
                     setTutorial(tutorialPayload)
                     setCurrentTutorialStep(Math.max(resumeStep, findFirstActionableStep(tutorialPayload.steps)))
-                    setHighlights(buildHighlightsFromSteps(tutorialPayload.steps, data.highlights))
+                    setHighlights(buildHighlightsFromSteps(tutorialPayload.steps, adaptiveHighlights))
                     setMessages(prev => [...prev, { sender: 'bot', text: resumeStep > 0 ? `Resuming tutorial from step ${resumeStep + 1}.` : 'Starting step-by-step tutorial. Use Next to move through each step.' }])
                 } else {
                     setMessages(prev => [...prev, { sender: 'bot', text: data.text }])
@@ -1299,14 +1635,21 @@ const Chatbot: React.FC = () => {
                                             }
                                             setCurrentTutorialStep(index)
                                         }}
+                                        onAdaptiveRecalculate={async () => {
+                                            return recalculateTutorialForCurrentPage(
+                                                'manual-verified-step',
+                                                `manual:${window.location.href}:${Date.now()}`
+                                            )
+                                        }}
                                         onPageTransitionSteps={(newSteps: TutorialStep[], newOffset: number) => {
+                                            const hydratedSteps = fillMissingStepElementIndices(newSteps)
                                             setTutorial(prev => prev ? {
                                                 ...prev,
-                                                steps: newSteps,
+                                                steps: hydratedSteps,
                                                 planStepOffset: newOffset,
                                             } : null)
-                                            setCurrentTutorialStep(findFirstActionableStep(newSteps))
-                                            setHighlights(buildHighlightsFromSteps(newSteps))
+                                            setCurrentTutorialStep(findFirstActionableStep(hydratedSteps))
+                                            setHighlights(buildHighlightsFromSteps(hydratedSteps))
                                         }}
                                         onComplete={handleTutorialComplete}
                                         onClose={handleReset}

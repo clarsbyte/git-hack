@@ -6,18 +6,26 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict, Any, Tuple
 import json
 from dotenv import load_dotenv
-from PIL import ImageGrab, Image
+from PIL import Image
 import io
 import asyncio
+from contextlib import asynccontextmanager
+from time import perf_counter
 from session_manager import SessionManager, TutorialPlanState
 import base64
 import re
+from urllib.parse import urlparse
 from cerebras.cloud.sdk import Cerebras
 from cerebras.cloud.sdk import APIError, APIConnectionError, RateLimitError
 
 # VLM imports - using cloud Claude API
 try:
-    from vlm_detector_cloud import detect_elements, decode_base64_image, initialize_claude
+    from vlm_detector_cloud import (
+        detect_elements,
+        decode_base64_image,
+        ensure_vlm_debug_dir,
+        initialize_claude,
+    )
     VLM_AVAILABLE = True
     print("✅ Using Cloud VLM (Claude API)")
 except ImportError as e:
@@ -126,6 +134,8 @@ def _extract_visible_dom_candidates(dom: Optional[str]) -> List[Dict[str, Any]]:
         name_match = re.search(r'name="([^"]+)"', line)
         type_match = re.search(r'\btype="([^"]+)"', line)
         role_match = re.search(r'\brole="([^"]+)"', line)
+        bbox_match = re.search(r'\bbbox="(-?\d+),(-?\d+),(\d+),(\d+)"', line)
+        screen_bbox_match = re.search(r'\bscreen-bbox="(-?\d+),(-?\d+),(\d+),(\d+)"', line)
         path_match = re.search(r'path="([^"]+)"', line)
         role_path_match = re.search(r'role-path="([^"]+)"', line)
         has_href = 'href="' in line
@@ -149,6 +159,23 @@ def _extract_visible_dom_candidates(dom: Optional[str]) -> List[Dict[str, Any]]:
             path_match.group(1).strip() if path_match else "",
             role_path_match.group(1).strip() if role_path_match else "",
         ]).strip().lower()
+        bbox_abs = None
+        # Prefer desktop/screen-space bbox when available so VLM detections from
+        # full-desktop screenshots map in the same coordinate system.
+        selected_bbox = screen_bbox_match or bbox_match
+        bbox_source = "screen" if screen_bbox_match else ("viewport" if bbox_match else "")
+        if selected_bbox:
+            bbox_x = int(selected_bbox.group(1))
+            bbox_y = int(selected_bbox.group(2))
+            bbox_w = int(selected_bbox.group(3))
+            bbox_h = int(selected_bbox.group(4))
+            if bbox_w > 0 and bbox_h > 0:
+                bbox_abs = {
+                    "x": bbox_x,
+                    "y": bbox_y,
+                    "width": bbox_w,
+                    "height": bbox_h,
+                }
         candidates.append({
             "index": idx,
             "tag": tag,
@@ -165,6 +192,8 @@ def _extract_visible_dom_candidates(dom: Optional[str]) -> List[Dict[str, Any]]:
             "name": name_match.group(1).strip() if name_match else "",
             "path": path_match.group(1).strip() if path_match else "",
             "role_path": role_path_match.group(1).strip() if role_path_match else "",
+            "bbox_absolute": bbox_abs,
+            "bbox_source": bbox_source,
             "is_inputish": is_inputish,
             "is_buttonish": is_buttonish,
             "is_linkish": is_linkish,
@@ -172,6 +201,65 @@ def _extract_visible_dom_candidates(dom: Optional[str]) -> List[Dict[str, Any]]:
         })
 
     return candidates
+
+
+def _is_sticky_or_global_nav_candidate(candidate: Dict[str, Any]) -> bool:
+    """Heuristic flag for sticky/global nav controls that often duplicate in-page CTAs."""
+    if not isinstance(candidate, dict):
+        return False
+
+    text = " ".join([
+        str(candidate.get("line", "")),
+        str(candidate.get("path", "")),
+        str(candidate.get("role_path", "")),
+        str(candidate.get("aria_label", "")),
+        str(candidate.get("label", "")),
+    ]).lower()
+    tag = str(candidate.get("tag", "")).lower()
+    role = str(candidate.get("role", "")).lower()
+    box = candidate.get("bbox_absolute") if isinstance(candidate.get("bbox_absolute"), dict) else {}
+    y = float(box.get("y", 9999) or 9999)
+    width = float(box.get("width", 0) or 0)
+
+    nav_hints = (
+        "sticky",
+        "fixed",
+        "globalnav",
+        "global-nav",
+        "subnav",
+        "sub-nav",
+        "masthead",
+        "top-nav",
+        "header",
+        "navigation",
+    )
+    has_nav_hint = any(h in text for h in nav_hints)
+    top_header_like = y <= 170 and (tag in {"nav", "header"} or role in {"navigation", "menubar"} or width >= 700)
+    return bool(has_nav_hint or top_header_like)
+
+
+def _is_explicit_nav_request(instruction: str) -> bool:
+    lower = (instruction or "").lower()
+    nav_terms = (
+        "nav",
+        "navigation",
+        "menu",
+        "header",
+        "sticky bar",
+        "top bar",
+        "subnav",
+    )
+    return any(term in lower for term in nav_terms)
+
+
+def _customer_pov_penalty(candidate: Dict[str, Any], instruction: str) -> float:
+    """
+    In customer POV mode, avoid selecting sticky/global nav duplicates unless
+    the instruction explicitly asks for nav/header UI.
+    """
+    if _is_explicit_nav_request(instruction):
+        return 0.0
+    return 95.0 if _is_sticky_or_global_nav_candidate(candidate) else 0.0
 
 def _pick_specific_model_candidate(candidates: List[Dict[str, Any]], topic: str) -> Optional[Tuple[int, str]]:
     """
@@ -358,15 +446,38 @@ def _render_numbered_steps(steps: List[str]) -> str:
     return "\n".join(f"{i + 1}. {step}" for i, step in enumerate(steps))
 
 def _infer_expected_control_from_instruction(instruction: str) -> str:
-    lower = instruction.lower()
-    if any(k in lower for k in ("type ", "enter ", "fill ", "input ", "search", "email", "password", "name", "address", "zip", "code", "phone")):
-        return "input"
+    lower = (instruction or "").lower()
+    if not lower:
+        return "any"
+
+    # Action verbs should win over noun-like tokens to avoid misclassifying
+    # click steps containing words like "iPhone" as input steps.
+    if any(k in lower for k in ("click", "tap", "press", "buy", "add to", "checkout", "submit", "place order", "continue")):
+        return "button"
     if any(k in lower for k in ("open ", "go to", "navigate", "visit ", "link", " tab", "menu item")):
         return "link"
     if any(k in lower for k in ("select ", "choose ", "pick ")):
         return "select"
-    if any(k in lower for k in ("click", "tap", "press", "buy", "add to", "checkout", "submit", "place order", "continue")):
-        return "button"
+
+    input_patterns = [
+        r"\btype\b",
+        r"\benter\b",
+        r"\bfill\b",
+        r"\binput\b",
+        r"\bsearch\b",
+        r"\bemail\b",
+        r"\bpassword\b",
+        r"\busername\b",
+        r"\baddress\b",
+        r"\bzip\b",
+        r"\bpostal\b",
+        r"\bphone\b",
+        r"\bphone number\b",
+        r"\bname\b",
+        r"\bcode\b",
+    ]
+    if any(re.search(pattern, lower) for pattern in input_patterns):
+        return "input"
     return "any"
 
 _SYNONYM_MAP: Dict[str, List[str]] = {
@@ -506,6 +617,7 @@ def _score_candidate_for_instruction(candidate: Dict[str, Any], instruction: str
         score -= 120
     if len(label) > 50:
         score -= 15
+    score -= _customer_pov_penalty(candidate, instruction)
 
     return score
 
@@ -533,6 +645,109 @@ def _explanation_for_expected_control(expected: str, chosen_label: str) -> str:
     if expected == "select":
         return f'Select "{chosen_label}"'
     return f'Click "{chosen_label}"'
+
+
+def _apply_vlm_first_highlight_selection(
+    highlights: List[Dict[str, Any]],
+    vlm_mapped: List[Dict[str, Any]],
+    dom: Optional[str],
+    instruction_hints: List[str],
+    action_hints: Optional[List[str]] = None,
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """
+    Prefer VLM-mapped DOM candidates as the source of truth for step targets.
+    This avoids the "pick twice" behavior where heuristics choose one element
+    first and VLM overrides it later.
+    """
+    if not isinstance(highlights, list) or not highlights:
+        return highlights, False
+    if not isinstance(vlm_mapped, list) or not vlm_mapped:
+        return highlights, False
+
+    candidates = _extract_visible_dom_candidates(dom)
+    if not candidates:
+        return highlights, False
+
+    by_index = {int(c["index"]): c for c in candidates if c.get("index") is not None}
+    mapped_scored: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []
+    for item in vlm_mapped:
+        try:
+            idx = int(item.get("dom_index"))
+        except (TypeError, ValueError):
+            continue
+        cand = by_index.get(idx)
+        if not cand:
+            continue
+        mapped_scored.append((float(item.get("score", 0.0) or 0.0), item, cand))
+
+    if not mapped_scored:
+        return highlights, False
+
+    changed = False
+    used_indices: set[int] = set()
+    for i, h in enumerate(highlights):
+        if not isinstance(h, dict):
+            continue
+
+        hint = instruction_hints[i] if i < len(instruction_hints) else str(h.get("explanation", "")).strip()
+        if not hint:
+            hint = ""
+
+        expected = _infer_expected_control_from_instruction(hint)
+        if expected == "any" and isinstance(action_hints, list) and i < len(action_hints):
+            action_hint = str(action_hints[i]).strip().lower()
+            if action_hint in {"click", "navigate"}:
+                expected = "button"
+            elif action_hint == "input":
+                expected = "input"
+
+        hint_tokens = _tokenize_instruction_for_vlm(hint)
+        best_total = float("-inf")
+        best_item: Optional[Dict[str, Any]] = None
+        best_candidate: Optional[Dict[str, Any]] = None
+        for base_score, item, cand in mapped_scored:
+            idx = int(cand.get("index", -1))
+            if idx < 0:
+                continue
+            dom_label = str(cand.get("label", "")).lower()
+            det_label = str(item.get("det_label", "")).lower()
+            token_hits = sum(1 for t in hint_tokens if t in dom_label or t in det_label)
+
+            total = base_score + (token_hits * 22.0)
+            if expected != "any":
+                total += 48.0 if _matches_expected_control(cand, expected) else -90.0
+            if cand.get("is_interactive"):
+                total += 8.0
+            total -= _customer_pov_penalty(cand, hint)
+            if idx in used_indices and len(mapped_scored) > 1:
+                total -= 25.0
+
+            if total > best_total:
+                best_total = total
+                best_item = item
+                best_candidate = cand
+
+        if not best_item or not best_candidate:
+            continue
+
+        chosen_idx = int(best_candidate.get("index", -1))
+        if chosen_idx < 0:
+            continue
+        chosen_label = str(best_candidate.get("label") or best_item.get("det_label") or f"Element {chosen_idx}")
+
+        prev_idx = h.get("elementIndex")
+        if not isinstance(prev_idx, int) or prev_idx != chosen_idx:
+            h["elementIndex"] = chosen_idx
+            h["explanation"] = _explanation_for_expected_control(expected, chosen_label) if expected != "any" else f'Select "{chosen_label}"'
+            h["selectionReason"] = (
+                f'VLM-first selection: step matched to "{chosen_label}" '
+                f'(elementIndex={chosen_idx}, score={best_item.get("score")}, iou={best_item.get("iou")}).'
+            )
+            changed = True
+        used_indices.add(chosen_idx)
+
+    return highlights, changed
+
 
 def _refine_highlights_to_control_type(
     highlights: List[Dict[str, Any]],
@@ -697,7 +912,6 @@ def _build_purchase_flow_plan(
             "stepNumber": 1,
             "instruction": f'Click "{topic_label}"',
             "actionType": "click",
-            "expectedResult": f'The {topic_label} model list page is visible.',
             "expectsPageChange": True,
             "pageDescription": f"{topic_label} category page",
             "isTerminal": False,
@@ -706,7 +920,6 @@ def _build_purchase_flow_plan(
             "stepNumber": 2,
             "instruction": f'Click "{model_label}"',
             "actionType": "click",
-            "expectedResult": f'The "{model_label}" product page opens.',
             "expectsPageChange": True,
             "pageDescription": f"{model_label} product page",
             "isTerminal": False,
@@ -715,7 +928,6 @@ def _build_purchase_flow_plan(
             "stepNumber": 3,
             "instruction": f'Confirm you are on the buy page for "{model_label}"',
             "actionType": "wait",
-            "expectedResult": f'A Buy or Add to Bag option for "{model_label}" is visible.',
             "expectsPageChange": False,
             "pageDescription": "Buy page confirmation",
             "isTerminal": True,
@@ -810,26 +1022,6 @@ def _normalize_action_type(action_type: str, instruction: str) -> str:
         return "click"
     return "click"
 
-def _derive_expected_result(instruction: str, action_type: str) -> str:
-    quoted = re.search(r'"([^"]+)"', instruction or "")
-    label = quoted.group(1).strip() if quoted else ""
-
-    if action_type == "input":
-        return f'The "{label}" field contains your entered value.' if label else "The target field contains your entered value."
-    if action_type == "navigate":
-        return f'The "{label}" page or section is open.' if label else "The requested page is open."
-    if action_type == "scroll":
-        return f'The "{label}" section is visible in the viewport.' if label else "The target section is visible in the viewport."
-    if action_type == "wait":
-        return "The page finishes loading and the target content is visible."
-    if label:
-        return f'The "{label}" target opens or becomes active.'
-
-    instruction_text = (instruction or "").strip().rstrip(".")
-    if instruction_text:
-        return f'The result of this step is visible: {instruction_text}.'
-    return "The step outcome is visible on the page."
-
 def _normalize_tutorial_plan_schema(tutorial_plan_data: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(tutorial_plan_data, dict):
         return tutorial_plan_data
@@ -848,9 +1040,6 @@ def _normalize_tutorial_plan_schema(tutorial_plan_data: Dict[str, Any]) -> Dict[
             continue
 
         action_type = _normalize_action_type(str(raw_step.get("actionType", "")), instruction)
-        expected_result = str(raw_step.get("expectedResult", "")).strip()
-        if not expected_result:
-            expected_result = _derive_expected_result(instruction, action_type)
 
         expects_page_change_raw = raw_step.get("expectsPageChange")
         expects_page_change = bool(expects_page_change_raw) if isinstance(expects_page_change_raw, bool) else (action_type == "navigate")
@@ -859,7 +1048,6 @@ def _normalize_tutorial_plan_schema(tutorial_plan_data: Dict[str, Any]) -> Dict[
             "stepNumber": len(normalized_steps) + 1,
             "instruction": instruction,
             "actionType": action_type,
-            "expectedResult": expected_result,
             "expectsPageChange": expects_page_change,
             "pageDescription": str(raw_step.get("pageDescription", "")).strip(),
             "isTerminal": False,
@@ -1092,20 +1280,515 @@ def _rank_vlm_detections(detections: List[Dict[str, Any]], instruction: str) -> 
     return [det for _, det in ranked]
 
 
+def _safe_box_from_candidate(candidate: Dict[str, Any]) -> Optional[Dict[str, float]]:
+    raw = candidate.get("bbox_absolute")
+    if not isinstance(raw, dict):
+        return None
+    try:
+        x = float(raw.get("x", 0))
+        y = float(raw.get("y", 0))
+        width = float(raw.get("width", 0))
+        height = float(raw.get("height", 0))
+    except (TypeError, ValueError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return {"x": x, "y": y, "width": width, "height": height}
+
+
+def _safe_box_from_detection(det: Dict[str, Any]) -> Optional[Dict[str, float]]:
+    raw = det.get("bbox_absolute")
+    if not isinstance(raw, dict):
+        return None
+    try:
+        x = float(raw.get("x", 0))
+        y = float(raw.get("y", 0))
+        width = float(raw.get("width", 0))
+        height = float(raw.get("height", 0))
+    except (TypeError, ValueError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return {"x": x, "y": y, "width": width, "height": height}
+
+
+def _bbox_iou(a: Dict[str, float], b: Dict[str, float]) -> float:
+    ax1, ay1 = a["x"], a["y"]
+    ax2, ay2 = ax1 + a["width"], ay1 + a["height"]
+    bx1, by1 = b["x"], b["y"]
+    bx2, by2 = bx1 + b["width"], by1 + b["height"]
+
+    inter_w = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+    inter_h = max(0.0, min(ay2, by2) - max(ay1, by1))
+    inter = inter_w * inter_h
+    if inter <= 0:
+        return 0.0
+
+    union = (a["width"] * a["height"]) + (b["width"] * b["height"]) - inter
+    if union <= 0:
+        return 0.0
+    return inter / union
+
+
+def _map_vlm_detections_to_dom_indices(
+    detections: List[Dict[str, Any]],
+    dom_text: Optional[str],
+    query: str
+) -> List[Dict[str, Any]]:
+    dom_candidates = _extract_visible_dom_candidates(dom_text)
+    if not dom_candidates:
+        return []
+
+    query_tokens = _tokenize_instruction_for_vlm(query)
+    mapped: List[Dict[str, Any]] = []
+    for det in detections[:5]:
+        det_label = str(det.get("label", "")).strip().lower()
+        if not det_label:
+            continue
+        det_box = _safe_box_from_detection(det)
+
+        best_score = float("-inf")
+        best_candidate: Optional[Dict[str, Any]] = None
+        best_iou = 0.0
+        for candidate in dom_candidates:
+            idx = int(candidate.get("index", -1))
+            if idx < 0:
+                continue
+            dom_label = str(candidate.get("label", "")).strip()
+            dom_lower = dom_label.lower()
+            token_hits = sum(1 for t in query_tokens if t in dom_lower)
+            label_overlap = 50.0 if det_label in dom_lower or dom_lower in det_label else 0.0
+            dom_len_penalty = min(len(dom_lower) / 40.0, 6.0)
+            score = (token_hits * 18.0) + label_overlap - dom_len_penalty
+
+            # Primary signal when available: geometric overlap between VLM box and DOM box.
+            dom_box = _safe_box_from_candidate(candidate)
+            iou_score = 0.0
+            if det_box and dom_box:
+                iou = _bbox_iou(det_box, dom_box)
+                iou_score = iou * 120.0
+                score += iou_score
+            else:
+                iou = 0.0
+
+            if candidate.get("is_interactive"):
+                score += 6.0
+            score -= _customer_pov_penalty(candidate, query)
+
+            if score > best_score:
+                best_score = score
+                best_candidate = candidate
+                best_iou = iou
+        if best_candidate is not None:
+            best_idx = int(best_candidate.get("index"))
+            best_dom_label = str(best_candidate.get("label", ""))
+            method = "geometry+text" if best_iou > 0 else "text-only"
+            mapped.append({
+                "det_label": det.get("label"),
+                "det_bbox_absolute": det.get("bbox_absolute"),
+                "det_source_query": det.get("source_query"),
+                "dom_index": best_idx,
+                "dom_label": best_dom_label,
+                "dom_bbox_source": best_candidate.get("bbox_source"),
+                "score": round(best_score, 2),
+                "iou": round(best_iou, 4),
+                "method": method,
+            })
+
+    mapped.sort(key=lambda item: item["score"], reverse=True)
+    return mapped
+
+
+def _constrain_highlights_to_vlm_bounds(
+    highlights: List[Dict[str, Any]],
+    dom_text: Optional[str],
+    vlm_detections: List[Dict[str, Any]],
+    vlm_mapped: List[Dict[str, Any]],
+    iou_threshold: float = 0.0,
+) -> List[Dict[str, Any]]:
+    """
+    Post-process highlights: if VLM detected elements with bounding boxes,
+    verify that chosen elementIndices overlap with VLM detections.
+    If not, override with VLM's best mapped DOM suggestion.
+    """
+    if not vlm_detections or not vlm_mapped:
+        return highlights
+    if not isinstance(highlights, list) or not highlights:
+        return highlights
+
+    candidates = _extract_visible_dom_candidates(dom_text)
+    by_index = {int(c["index"]): c for c in candidates if c.get("index") is not None}
+
+    # Build VLM detection boxes
+    det_boxes = []
+    for det in vlm_detections:
+        box = _safe_box_from_detection(det)
+        if box:
+            det_boxes.append(box)
+
+    if not det_boxes:
+        return highlights
+
+    result = []
+    for h in highlights:
+        if not isinstance(h, dict):
+            result.append(h)
+            continue
+
+        elem_idx = h.get("elementIndex")
+        if elem_idx is None:
+            result.append(h)
+            continue
+
+        candidate = by_index.get(int(elem_idx))
+        dom_box = _safe_box_from_candidate(candidate) if candidate else None
+
+        # Check if this element's bbox overlaps with any VLM detection
+        overlaps = False
+        if dom_box:
+            for det_box in det_boxes:
+                iou = _bbox_iou(dom_box, det_box)
+                if iou > iou_threshold:
+                    overlaps = True
+                    break
+
+        if overlaps:
+            result.append(h)
+        else:
+            # Override with VLM's best mapped DOM index
+            best_mapped = vlm_mapped[0] if vlm_mapped else None
+            if best_mapped:
+                new_idx = best_mapped.get("dom_index")
+                new_label = best_mapped.get("dom_label", "")
+                print(
+                    f"🎯 [vlm-constrain] elementIndex {elem_idx} has no VLM bbox overlap; "
+                    f"overriding -> index {new_idx} \"{new_label}\" "
+                    f"(VLM label=\"{best_mapped.get('det_label')}\", iou={best_mapped.get('iou', 0)})"
+                )
+                h = dict(h)
+                h["elementIndex"] = new_idx
+                if not h.get("explanation") and new_label:
+                    h["explanation"] = f'Select "{new_label}"'
+            result.append(h)
+
+    return result
+
+
+def _annotate_highlights_with_vlm_trace(
+    highlights: List[Dict[str, Any]],
+    vlm_mapped: List[Dict[str, Any]],
+    vlm_detections: List[Dict[str, Any]],
+    screenshot_provided: bool = False,
+    vlm_context: str = "",
+) -> List[Dict[str, Any]]:
+    if not isinstance(highlights, list) or not highlights:
+        return highlights
+
+    context_payload: Dict[str, Any] = {}
+    if isinstance(vlm_context, str) and "VLM_CONTEXT_JSON:" in vlm_context:
+        try:
+            json_part = vlm_context.split("VLM_CONTEXT_JSON:", 1)[1].strip()
+            first_line = json_part.splitlines()[0].strip()
+            context_payload = json.loads(first_line) if first_line else {}
+            if not isinstance(context_payload, dict):
+                context_payload = {}
+        except Exception:
+            context_payload = {}
+
+    def _format_diag_summary(payload: Dict[str, Any]) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        diagnostics = payload.get("diagnostics")
+        diag: Dict[str, Any] = {}
+        if isinstance(diagnostics, list) and diagnostics:
+            first = diagnostics[0]
+            if isinstance(first, dict):
+                diag = first
+        elif isinstance(diagnostics, dict):
+            diag = diagnostics
+        if not diag:
+            return ""
+
+        raw_count = diag.get("raw_detection_count")
+        filtered_count = diag.get("filtered_detection_count")
+        filt = diag.get("filter") if isinstance(diag.get("filter"), dict) else {}
+        drop_reasons = filt.get("drop_reasons") if isinstance(filt, dict) else {}
+
+        parts: List[str] = []
+        if isinstance(raw_count, int) or isinstance(filtered_count, int):
+            parts.append(f"raw={raw_count}, filtered={filtered_count}")
+        if isinstance(drop_reasons, dict) and drop_reasons:
+            nonzero = [(str(k), int(v)) for k, v in drop_reasons.items() if isinstance(v, int) and v > 0]
+            if nonzero:
+                nonzero.sort(key=lambda kv: kv[1], reverse=True)
+                top = ", ".join(f"{k}:{v}" for k, v in nonzero[:3])
+                parts.append(f"top_drops={top}")
+        return "; ".join(parts)
+
+    if not vlm_detections:
+        if not screenshot_provided:
+            reason = "VLM not checked: no screenshot was provided for this request."
+        else:
+            if context_payload.get("error"):
+                reason = f'VLM checked: screenshot received, but VLM failed ({context_payload.get("error")}).'
+            else:
+                q = context_payload.get("query", "")
+                count = context_payload.get("detectionCount", 0)
+                diag_summary = _format_diag_summary(context_payload)
+                suffix = f"; {diag_summary}" if diag_summary else ""
+                reason = (
+                    f'VLM checked: screenshot received, query="{q}", detections={count} '
+                    f"(no usable visual match{suffix})."
+                )
+        for h in highlights:
+            if isinstance(h, dict):
+                h["selectionReason"] = reason
+        return highlights
+
+    by_dom_index: Dict[int, Dict[str, Any]] = {}
+    for item in vlm_mapped:
+        try:
+            idx = int(item.get("dom_index"))
+        except (TypeError, ValueError):
+            continue
+        existing = by_dom_index.get(idx)
+        if existing is None or float(item.get("score", 0.0) or 0.0) > float(existing.get("score", 0.0) or 0.0):
+            by_dom_index[idx] = item
+
+    top_mapped = vlm_mapped[0] if vlm_mapped else None
+
+    for h in highlights:
+        if not isinstance(h, dict):
+            continue
+        elem_idx = h.get("elementIndex")
+        mapped = None
+        if isinstance(elem_idx, int):
+            mapped = by_dom_index.get(elem_idx)
+
+        if mapped:
+            det_bbox = mapped.get("det_bbox_absolute") if isinstance(mapped.get("det_bbox_absolute"), dict) else {}
+            source_query = str(mapped.get("det_source_query", "")).strip()
+            h["selectionReason"] = (
+                f'VLM checked: picked elementIndex {mapped.get("dom_index")} '
+                f'from visual label "{mapped.get("det_label", "")}" '
+                f'(bbox={det_bbox}, dom="{mapped.get("dom_label", "")}", '
+                f'score={mapped.get("score")}, iou={mapped.get("iou")}, method={mapped.get("method")}, '
+                f'query="{source_query}").'
+            )
+        else:
+            if top_mapped:
+                top_bbox = top_mapped.get("det_bbox_absolute") if isinstance(top_mapped.get("det_bbox_absolute"), dict) else {}
+                h["selectionReason"] = (
+                    f'VLM checked: no direct match for this step; used DOM fallback. '
+                    f'Best visual candidate was "{top_mapped.get("det_label", "")}" '
+                    f'(bbox={top_bbox}, suggestedIndex={top_mapped.get("dom_index")}, '
+                    f'score={top_mapped.get("score")}, iou={top_mapped.get("iou")}).'
+                )
+            else:
+                h["selectionReason"] = "VLM checked: no direct match for this step, used DOM fallback."
+
+    return highlights
+
+
+def _build_vlm_query_for_step(step: Dict[str, Any]) -> Optional[str]:
+    if not isinstance(step, dict):
+        return None
+    instruction = str(step.get("instruction", "")).strip()
+    if not instruction:
+        return None
+    action = str(step.get("actionType", "")).strip().lower() or "click"
+    if action == "input":
+        expected = "input"
+    elif action in {"navigate"}:
+        expected = "link"
+    elif action in {"click"}:
+        expected = "button"
+    elif action in {"wait", "observe"}:
+        expected = "any"
+    else:
+        expected = _infer_expected_control_from_instruction(instruction)
+    instruction_json = json.dumps(instruction, ensure_ascii=True)
+    return (
+        f'action={action}; expected_control={expected}; '
+        f"target_instruction={instruction_json}"
+    )
+
+
+def _filter_extension_ui_detections(detections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Filter out Site Tutor extension UI elements from VLM detections."""
+    extension_keywords = [
+        "site tutor",
+        "tutorial step",
+        "verify step",
+        "click verify",
+        "selection logic",
+        "keywords:",
+        "control type:",
+        "guided tutorial",
+    ]
+
+    filtered = []
+    for det in detections:
+        label = str(det.get("label", "")).lower()
+        # Skip if label contains extension UI keywords
+        if any(keyword in label for keyword in extension_keywords):
+            print(f"🧹 [VLM-filter] Skipping extension UI: {det.get('label')}")
+            continue
+        filtered.append(det)
+
+    return filtered
+
+
+def _run_vlm_detection_for_query(
+    image: Image.Image,
+    query: str,
+    viewport_width: int,
+    viewport_height: int,
+    session_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    result = detect_elements(
+        image=image,
+        query=query,
+        viewport_width=viewport_width,
+        viewport_height=viewport_height,
+        session_id=session_id,
+    )
+    raw_detections = result.get("detections", []) or []
+    # Filter out extension UI artifacts before ranking
+    clean_detections = _filter_extension_ui_detections(raw_detections)
+    detections = _rank_vlm_detections(clean_detections, query)
+    diagnostics = result.get("diagnostics", {}) or {}
+    if isinstance(diagnostics, dict):
+        raw_count = diagnostics.get("raw_detection_count")
+        filtered_count = diagnostics.get("filtered_detection_count")
+        parse_info = diagnostics.get("parse") if isinstance(diagnostics.get("parse"), dict) else {}
+        filter_info = diagnostics.get("filter") if isinstance(diagnostics.get("filter"), dict) else {}
+        drop_reasons = filter_info.get("drop_reasons") if isinstance(filter_info, dict) else {}
+        print(
+            f"🧪 [VLM-run] query={query!r} raw={raw_count} filtered={filtered_count} "
+            f"ranked={len(detections)} drop_reasons={drop_reasons}"
+        )
+        if parse_info:
+            print(f"🧪 [VLM-run] parse={parse_info}")
+        if len(detections) == 0:
+            preview = diagnostics.get("raw_response_preview")
+            if isinstance(preview, str) and preview:
+                print(f"🧪 [VLM-run] response_preview={preview[:260]}")
+            rejected = filter_info.get("rejected_samples", []) if isinstance(filter_info, dict) else []
+            if rejected:
+                print(f"🧪 [VLM-run] rejected_samples={rejected}")
+    for i, det in enumerate(detections[:5]):
+        print(
+            f"🧪 [VLM-run] kept[{i}] label={det.get('label')} conf={det.get('confidence')} "
+            f"bbox_abs={det.get('bbox_absolute')} source_query={det.get('source_query')}"
+        )
+    return {
+        "query": query,
+        "detections": detections,
+        "latency_ms": int(result.get("model_latency_ms", 0) or 0),
+        "diagnostics": diagnostics,
+    }
+
+
+def _merge_vlm_runs(runs: List[Dict[str, Any]], query: str) -> Tuple[List[Dict[str, Any]], int]:
+    dedup: Dict[str, Dict[str, Any]] = {}
+    total_latency = 0
+    for run in runs:
+        total_latency += int(run.get("latency_ms", 0) or 0)
+        run_query = str(run.get("query", "")).strip()
+        for det in run.get("detections", []) or []:
+            box = _safe_box_from_detection(det)
+            if not box:
+                continue
+            key = (
+                f"{str(det.get('label', '')).strip().lower()}|"
+                f"{int(box['x']//12)}|{int(box['y']//12)}|{int(box['width']//12)}|{int(box['height']//12)}"
+            )
+            candidate = dict(det)
+            candidate["source_query"] = run_query
+            conf = float(candidate.get("confidence", 0.0) or 0.0)
+            existing = dedup.get(key)
+            if not existing or conf > float(existing.get("confidence", 0.0) or 0.0):
+                dedup[key] = candidate
+    merged = _rank_vlm_detections(list(dedup.values()), query)
+    return merged, total_latency
+
+
+def _vlm_context_json_block(
+    endpoint_label: str,
+    query: str,
+    detections: List[Dict[str, Any]],
+    mapped: List[Dict[str, Any]],
+    total_latency_ms: int,
+    used_queries: Optional[List[str]] = None,
+    diagnostics: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    compact_detections = []
+    for det in detections[:5]:
+        compact_detections.append({
+            "label": det.get("label"),
+            "confidence": det.get("confidence"),
+            "bbox_absolute": det.get("bbox_absolute"),
+            "source_query": det.get("source_query"),
+        })
+
+    compact_mapped = []
+    for item in mapped[:5]:
+        compact_mapped.append({
+            "vlm_label": item.get("det_label"),
+            "elementIndex": item.get("dom_index"),
+            "dom_label": item.get("dom_label"),
+            "dom_bbox_source": item.get("dom_bbox_source"),
+            "score": item.get("score"),
+            "iou": item.get("iou"),
+            "method": item.get("method"),
+        })
+
+    best_conf = float(detections[0].get("confidence", 0.0) or 0.0) if detections else 0.0
+    payload = {
+        "query": query,
+        "usedQueries": used_queries or [query],
+        "latencyMs": total_latency_ms,
+        "detectionCount": len(detections),
+        "bestConfidence": round(best_conf, 4),
+        "abstainRecommended": bool(not mapped or best_conf < 0.65),
+        "bestElementIndex": mapped[0].get("dom_index") if mapped else None,
+        "detections": compact_detections,
+        "domSuggestions": compact_mapped,
+        "diagnostics": diagnostics or [],
+    }
+    print(
+        f"🤖 [{endpoint_label}] VLM detections={len(detections)} mapped={len(mapped)} "
+        f"latency_total={total_latency_ms}ms"
+    )
+    return (
+        "VLM_CONTEXT_JSON:\n"
+        + json.dumps(payload, ensure_ascii=True)
+        + "\n"
+        + "VLM_USAGE_RULES:\n"
+        + "- Each detection has bbox_absolute: {x, y, width, height} in pixels (position and size on the screenshot). Use these dimensions to pick the right DOM element when several match by text.\n"
+        + "- Use bestElementIndex if it aligns with visible DOM text and control type.\n"
+        + "- In your reasoning you MUST: (a) If you used a detection, cite its bbox_absolute numbers (e.g. 'VLM detection at x=420, y=50, width=190, height=16 -> elementIndex 4'). (b) If detections is empty or you did not use VLM, state 'No VLM detections' or 'Chose from DOM only (VLM returned 0 detections)'.\n"
+        + "- If abstainRecommended=true or evidence conflicts, ask a short clarification instead of guessing.\n"
+    )
+
+
 def _build_vlm_context_from_screenshot_bytes(
     screenshot_bytes: bytes,
     query: str,
     viewport_info: Optional[str],
-    endpoint_label: str
-) -> str:
-    """Run VLM on a screenshot and return prompt context for downstream LLM calls."""
+    endpoint_label: str,
+    dom_text: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Run VLM on a screenshot and return (context_str, detections, mapped_indices)."""
     if not screenshot_bytes:
         print(f"🤖 [{endpoint_label}] VLM influence: none (empty screenshot payload).")
-        return ""
+        return "", [], []
 
     if not VLM_AVAILABLE:
         print(f"🤖 [{endpoint_label}] VLM influence: none (VLM backend unavailable).")
-        return ""
+        return "", [], []
 
     try:
         image = Image.open(io.BytesIO(screenshot_bytes)).convert("RGB")
@@ -1119,58 +1802,243 @@ def _build_vlm_context_from_screenshot_bytes(
             f"| query='{query}' viewport={viewport_width}x{viewport_height} image={image.size[0]}x{image.size[1]}"
         )
 
-        vlm_result = detect_elements(
+        run = _run_vlm_detection_for_query(
             image=image,
             query=query,
             viewport_width=viewport_width,
             viewport_height=viewport_height,
+            session_id=session_id,
         )
-
-        detections = vlm_result.get("detections", []) or []
-        detections = _rank_vlm_detections(detections, query)
-        print(f"🤖 [{endpoint_label}] VLM detections={len(detections)} latency={vlm_result.get('model_latency_ms')}ms")
-
-        if not detections:
-            return """
-VLM VISUAL DETECTIONS:
-No confident visual detections were returned for this screenshot/query.
-"""
-
-        vlm_lines: List[str] = []
-        for i, det in enumerate(detections[:5]):
-            bbox_norm = det.get("bbox", {}) or {}
-            bbox_abs = det.get("bbox_absolute", {}) or {}
-            norm_w = bbox_norm.get("width")
-            norm_h = bbox_norm.get("height")
-            abs_w = bbox_abs.get("width")
-            abs_h = bbox_abs.get("height")
+        detections = run["detections"]
+        mapped = _map_vlm_detections_to_dom_indices(detections, dom_text, query)
+        for i, item in enumerate(mapped[:5]):
             print(
-                f"🤖 [{endpoint_label}]   [{i}] {det.get('label')} "
-                f"| conf={det.get('confidence')} "
-                f"| bbox_norm(w={norm_w}, h={norm_h}) "
-                f"| bbox_abs(w={abs_w}px, h={abs_h}px)"
+                f"🧪 [{endpoint_label}] map[{i}] det={item.get('det_label')} -> "
+                f"dom_index={item.get('dom_index')} dom_label={item.get('dom_label')} "
+                f"score={item.get('score')} iou={item.get('iou')} method={item.get('method')}"
             )
-            vlm_lines.append(
-                f"- label={det.get('label')}; conf={det.get('confidence')}; "
-                f"bbox_norm={bbox_norm}; bbox_abs={bbox_abs}"
-            )
-
-        best = detections[0] if detections else {}
-        return f"""
-VLM VISUAL DETECTIONS (derived from the screenshot):
-Use these detections as visual hints when selecting elementIndex values from the indexed DOM.
-Prioritize the highest-ranked candidate unless DOM evidence strongly contradicts it.
-BEST_VLM_CANDIDATE: label={best.get("label")}; conf={best.get("confidence")}; bbox_abs={best.get("bbox_absolute")}
-{chr(10).join(vlm_lines)}
-"""
+        context_str = _vlm_context_json_block(
+            endpoint_label=endpoint_label,
+            query=query,
+            detections=detections,
+            mapped=mapped,
+            total_latency_ms=int(run.get("latency_ms", 0) or 0),
+            diagnostics=[run.get("diagnostics", {}) or {}],
+        )
+        return context_str, detections, mapped
     except Exception as vlm_error:
         print(f"⚠️ [{endpoint_label}] VLM assist failed: {vlm_error}")
-        return """
-VLM VISUAL DETECTIONS:
-VLM was attempted but failed for this request. Fall back to DOM-guided reasoning.
-"""
+        err_str = (
+            "VLM_CONTEXT_JSON:\n"
+            + json.dumps(
+                {"query": query, "error": str(vlm_error), "abstainRecommended": True},
+                ensure_ascii=True,
+            )
+        )
+        return err_str, [], []
 
-app = FastAPI()
+
+def _build_vlm_context_from_screenshot_bytes_multi(
+    screenshot_bytes: bytes,
+    queries: List[str],
+    viewport_info: Optional[str],
+    endpoint_label: str,
+    dom_text: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
+    if not screenshot_bytes or not queries:
+        return "", [], []
+    if not VLM_AVAILABLE:
+        return "", [], []
+
+    try:
+        image = Image.open(io.BytesIO(screenshot_bytes)).convert("RGB")
+        viewport_width, viewport_height = _parse_viewport_dimensions(
+            viewport_info,
+            image.size[0],
+            image.size[1]
+        )
+        unique_queries = []
+        for q in queries:
+            cleaned = str(q or "").strip()
+            if cleaned and cleaned not in unique_queries:
+                unique_queries.append(cleaned)
+        if not unique_queries:
+            return "", [], []
+
+        runs: List[Dict[str, Any]] = []
+        for q in unique_queries[:2]:
+            print(f"🤖 [{endpoint_label}] VLM focused query: {q}")
+            runs.append(
+                _run_vlm_detection_for_query(
+                    image,
+                    q,
+                    viewport_width,
+                    viewport_height,
+                    session_id=session_id,
+                )
+            )
+
+        primary_query = unique_queries[0]
+        detections, total_latency = _merge_vlm_runs(runs, primary_query)
+        mapped = _map_vlm_detections_to_dom_indices(detections, dom_text, primary_query)
+        for i, item in enumerate(mapped[:5]):
+            print(
+                f"🧪 [{endpoint_label}] map[{i}] det={item.get('det_label')} -> "
+                f"dom_index={item.get('dom_index')} dom_label={item.get('dom_label')} "
+                f"score={item.get('score')} iou={item.get('iou')} method={item.get('method')}"
+            )
+        run_diags = [r.get("diagnostics", {}) or {} for r in runs]
+        context_str = _vlm_context_json_block(
+            endpoint_label=endpoint_label,
+            query=primary_query,
+            detections=detections,
+            mapped=mapped,
+            total_latency_ms=total_latency,
+            used_queries=unique_queries[:2],
+            diagnostics=run_diags,
+        )
+        return context_str, detections, mapped
+    except Exception as vlm_error:
+        print(f"⚠️ [{endpoint_label}] Multi-query VLM assist failed: {vlm_error}")
+        err_str = (
+            "VLM_CONTEXT_JSON:\n"
+            + json.dumps(
+                {"queries": queries[:2], "error": str(vlm_error), "abstainRecommended": True},
+                ensure_ascii=True,
+            )
+        )
+        return err_str, [], []
+
+cleanup_task_handle: Optional[asyncio.Task] = None
+
+
+def _select_fallback_element(
+    dom: str,
+    user_query: str,
+    vlm_mapped: List[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """
+    Select a fallback element when AI returns no highlights.
+    Intelligently picks the most relevant visible element from DOM.
+    """
+    if not dom:
+        return None
+
+    # Parse DOM to find visible elements
+    visible_elements = []
+    for line in dom.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        # Extract element index and check if visible
+        if line.startswith('[') and ']' in line and '[VISIBLE]' in line:
+            try:
+                # Extract index: [123] tagName "text" ...
+                idx_end = line.index(']')
+                element_index = int(line[1:idx_end])
+
+                # Extract tag and text
+                parts = line[idx_end+1:].strip().split('"', 2)
+                tag = parts[0].strip() if parts else ''
+                text = parts[1] if len(parts) > 1 else ''
+
+                visible_elements.append({
+                    'index': element_index,
+                    'tag': tag,
+                    'text': text,
+                    'line': line
+                })
+            except (ValueError, IndexError):
+                continue
+
+    if not visible_elements:
+        return None
+
+    # Score elements based on relevance to query
+    query_lower = user_query.lower()
+    query_words = set(query_lower.split())
+
+    scored_elements = []
+    for elem in visible_elements:
+        score = 0
+        text_lower = elem['text'].lower()
+        tag = elem['tag'].lower()
+
+        # Boost interactive elements
+        if tag in ['button', 'a', 'input']:
+            score += 10
+
+        # Boost if text matches query words
+        elem_words = set(text_lower.split())
+        common_words = query_words & elem_words
+        score += len(common_words) * 5
+
+        # Boost if query is substring of text
+        if query_lower in text_lower:
+            score += 15
+
+        # Boost if text is substring of query (exact match)
+        if text_lower and text_lower in query_lower:
+            score += 20
+
+        # Penalize very long or very short text
+        if len(elem['text']) < 3:
+            score -= 5
+        if len(elem['text']) > 100:
+            score -= 3
+
+        # Boost primary actions
+        action_words = ['buy', 'add', 'cart', 'shop', 'purchase', 'get', 'start', 'sign', 'login']
+        if any(word in text_lower for word in action_words):
+            score += 8
+
+        scored_elements.append((score, elem))
+
+    if not scored_elements:
+        return None
+
+    # Sort by score descending
+    scored_elements.sort(key=lambda x: x[0], reverse=True)
+
+    # Pick best element
+    best_score, best_elem = scored_elements[0]
+
+    # If score is too low, don't return anything
+    if best_score < 5:
+        return None
+
+    return {
+        'elementIndex': best_elem['index'],
+        'explanation': f"Best match: {best_elem['text'][:50]}",
+        'selectionReason': f"Fallback: Selected most relevant visible element (score: {best_score}). Text: '{best_elem['text'][:50]}'"
+    }
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Run periodic session cleanup in app lifespan (replaces deprecated startup event)."""
+    global cleanup_task_handle
+
+    async def cleanup_task():
+        while True:
+            await asyncio.sleep(300)  # Every 5 minutes
+            session_manager.cleanup_expired_sessions()
+
+    cleanup_task_handle = asyncio.create_task(cleanup_task())
+    try:
+        yield
+    finally:
+        if cleanup_task_handle:
+            cleanup_task_handle.cancel()
+            try:
+                await cleanup_task_handle
+            except asyncio.CancelledError:
+                pass
+
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -1201,19 +2069,11 @@ async def health_check():
         )
     }
 
-@app.on_event("startup")
-async def startup_event():
-    """Periodic cleanup of expired sessions"""
-    async def cleanup_task():
-        while True:
-            await asyncio.sleep(300)  # Every 5 minutes
-            session_manager.cleanup_expired_sessions()
-    asyncio.create_task(cleanup_task())
-
 class Highlight(BaseModel):
     selector: str = ""
     explanation: str
     elementIndex: Optional[int] = None
+    selectionReason: Optional[str] = None
 
 class AutomationAction(BaseModel):
     type: str  # "navigate", "click"
@@ -1228,6 +2088,21 @@ class ChatResponse(BaseModel):
     reasoning: Optional[str] = None  # AI's thought process for debugging
     tutorialPlan: Optional[dict] = None  # High-level plan for multi-page tutorials
 
+
+class NextStep(BaseModel):
+    instruction: str
+    actionType: str = "click"
+    isTerminal: bool = False
+
+
+class NextStepResponse(BaseModel):
+    text: str
+    step: Optional[NextStep] = None
+    highlights: List[Highlight]
+    sessionId: Optional[str] = None
+    reasoning: Optional[str] = None
+    done: bool = False
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(
     message: str = Form(...),
@@ -1239,10 +2114,14 @@ async def chat(
     viewportInfo: Optional[str] = Form(None),
     scrollPosition: Optional[str] = Form(None)
 ):
+    request_started = perf_counter()
+    phase_timings_ms: Dict[str, int] = {}
     print(f"📥 [/chat] Received message: {message}")
 
     # Get or create session
     session = session_manager.get_or_create_session(sessionId)
+    if VLM_AVAILABLE:
+        ensure_vlm_debug_dir(session.id)
     print(f"🧷 [/chat] Session ID: {session.id}")
     print(f"🧭 [/chat] URL context provided via tutorialContext? {'yes' if tutorialContext else 'no'}")
     print(f"🧠 [/chat] DOM attached? {'yes' if dom else 'no'} | viewportInfo? {'yes' if viewportInfo else 'no'}")
@@ -1259,16 +2138,60 @@ async def chat(
          )
 
     try:
+        phase_parse_started = perf_counter()
+        tutorial_context_obj: Dict[str, Any] = {}
+        if tutorialContext:
+            try:
+                parsed_tc = json.loads(tutorialContext) if isinstance(tutorialContext, str) else tutorialContext
+                if isinstance(parsed_tc, dict):
+                    tutorial_context_obj = parsed_tc
+            except (json.JSONDecodeError, TypeError):
+                tutorial_context_obj = {}
+
+        normalized_message = message.lower().strip()
+        is_active_recalc_request = bool(tutorial_context_obj) and (
+            "continue the active tutorial" in normalized_message
+            or bool(tutorial_context_obj.get("recalculationReason"))
+        )
+        phase_timings_ms["context_parse"] = int((perf_counter() - phase_parse_started) * 1000)
+
         vlm_context = ""
+        vlm_detections: List[Dict[str, Any]] = []
+        vlm_mapped: List[Dict[str, Any]] = []
         if screenshot:
             print(f"🖼️ [/chat] Screenshot received ({screenshot.filename}); preparing VLM assist.")
+            screenshot_read_started = perf_counter()
             screenshot_bytes = await screenshot.read()
-            vlm_context = _build_vlm_context_from_screenshot_bytes(
+            phase_timings_ms["screenshot_read"] = int((perf_counter() - screenshot_read_started) * 1000)
+
+            # Build step-specific VLM query when in tutorial mode
+            vlm_query = message
+            if tutorial_context_obj:
+                current_step_text = str(tutorial_context_obj.get("currentStep", "")).strip()
+                current_action_type = str(tutorial_context_obj.get("currentActionType", "")).strip().lower()
+                if current_step_text:
+                    if current_action_type == "input":
+                        expected_control = "input"
+                    elif current_action_type in {"navigate"}:
+                        expected_control = "link"
+                    elif current_action_type in {"click"}:
+                        expected_control = "button"
+                    else:
+                        expected_control = _infer_expected_control_from_instruction(current_step_text)
+                    step_literal = json.dumps(current_step_text, ensure_ascii=True)
+                    vlm_query = f"action={current_action_type or 'click'}; expected_control={expected_control}; target_instruction={step_literal}"
+                    print(f"🤖 [/chat] Using step-specific VLM query: {vlm_query}")
+
+            vlm_started = perf_counter()
+            vlm_context, vlm_detections, vlm_mapped = _build_vlm_context_from_screenshot_bytes(
                 screenshot_bytes=screenshot_bytes,
-                query=message,
+                query=vlm_query,
                 viewport_info=viewportInfo,
-                endpoint_label="/chat"
+                endpoint_label="/chat",
+                dom_text=dom,
+                session_id=session.id,
             )
+            phase_timings_ms["vlm_pipeline"] = int((perf_counter() - vlm_started) * 1000)
         else:
             print("🖼️ [/chat] No screenshot provided.")
             print("🤖 [/chat] VLM influence: none (no screenshot in /chat request).")
@@ -1276,109 +2199,50 @@ async def chat(
         # Store user message in session
         session.add_message('user', message)
 
-        prompt_text = ""
-        # Detect if this is a "select" or "highlight" instruction
-        is_selection_request = any(keyword in message.lower() for keyword in [
+        # ====================================================================
+        # PROMPT CONSTRUCTION - MODULAR APPROACH
+        # ====================================================================
+
+        # Detect request type
+        is_selection_request = any(keyword in normalized_message for keyword in [
             'select', 'highlight', 'show me', 'point to', 'find', 'where is',
             'click on', 'identify', 'mark', 'circle'
         ])
 
-        selection_instructions = ""
-        if is_selection_request:
-            selection_instructions = """
-IMPORTANT: The user wants you to SELECT/HIGHLIGHT a specific element on the page.
-- You MUST return at least one highlight with the element's numeric index from the indexed element list below.
-- Cross-reference the screenshot with the indexed element list to find the correct element index.
-"""
+        is_multiple_elements = any(keyword in normalized_message for keyword in [
+            'all', 'every', 'each'
+        ])
 
-        # Enhanced instructions for finding multiple elements (like "all buttons")
-        multiple_elements_instruction = ""
-        if any(keyword in message.lower() for keyword in ['all', 'every', 'each']):
-            multiple_elements_instruction = """
-CRITICAL: The user wants to find MULTIPLE elements. Generate a SEPARATE highlight entry for EACH distinct element you can identify from the indexed list.
-"""
-
-        # Include indexed DOM if provided
-        dom_context = ""
-        if dom:
-            dom_context = f"""
-INDEXED ELEMENTS ON THIS PAGE:
-Each interactive element has been assigned a numeric index. Reference elements by their index number.
-
-ANNOTATIONS:
-- [VISIBLE]: Element is in current viewport - best to highlight
-- [BELOW-SCROLL]: Element is below scroll fold - not visible until scrolling
-- [TOP/MID/BOTTOM-SECTION]: Page position (top third, middle third, bottom third)
-- in-TAGNAME: Parent element context (e.g., "in-div", "in-form#search")
-
-SELECTION PRIORITY:
-1. Find the element whose text MOST PRECISELY matches the instruction - fewest extra words wins
-2. Among matching elements, prefer those marked [VISIBLE]
-3. When multiple similar elements exist, choose the one whose text most closely matches the instruction WITHOUT extra qualifiers (e.g., for "Buy", prefer "Buy" over "Buy Now" over "Buy Now and Save")
-4. When uncertain, make your best educated guess - never return empty highlights
-
-The list below shows: [index] tagName "visible text" key-attributes in-PARENT [POSITION] [VISIBLE/BELOW-SCROLL]
-
-{dom}
-"""
-
-        # Include viewport information if provided
-        viewport_context = ""
-        if viewportInfo:
-            viewport_context = f"""
-VIEWPORT INFORMATION:
-{viewportInfo}
-
-CRITICAL RULES FOR ELEMENT SELECTION:
-1. ONLY return elementIndex for elements marked [VISIBLE]
-2. Never highlight elements marked [BELOW-SCROLL] - user can't see them until scrolling
-3. If the next step requires a [BELOW-SCROLL] element, include scroll instructions in your response
-4. Always make your best guess - don't return empty highlights
-"""
-
-        # Include completion history if provided
-        history_context = ""
-        if completionHistory:
-            history_context = f"""
-PRIOR LEARNING HISTORY:
-The user has previously completed these tutorials on this site:
-{completionHistory}
-You can skip basics they already know and build on prior knowledge.
-"""
-
-        # Include tutorial context if provided
-        tutorial_context = ""
-        if tutorialContext:
-            tutorial_context = f"""
-CURRENT TUTORIAL CONTEXT:
-The user is currently in a step-by-step tutorial. Use this to avoid restarting from step 1.
-{tutorialContext}
-If the user asks a question while mid-tutorial, continue from the current step and reference the next best action.
-"""
-
-        # Start tutorial mode only when user intent is explicit, or when continuing an active tutorial.
-        normalized_message = message.lower().strip()
         tutorial_intent_patterns = [
-            "tutorial",
-            "step by step",
-            "step-by-step",
-            "walk me through",
-            "guide me",
-            "show me how",
-            "teach me how",
-            "how to ",
-            "how do i ",
-            "help me do",
-            "what should i click",
+            "tutorial", "step by step", "step-by-step", "walk me through",
+            "guide me", "show me how", "teach me how", "how to ", "how do i ",
+            "help me do", "what should i click",
         ]
         is_tutorial_request = bool(tutorialContext) or any(
             pattern in normalized_message for pattern in tutorial_intent_patterns
         )
 
-        tutorial_instruction = ""
+        # ====================================================================
+        # BUILD CENTRAL PROMPT - MODULAR SECTIONS
+        # ====================================================================
+
+        prompt_sections = []
+
+        # Section 1: System Role & User Question
+        prompt_sections.append(f"""You are a Site Tutor, an expert web developer and UI guide.
+Your goal is to answer the user's question and identify specific HTML elements to highlight.
+
+User Question: "{message}"
+""")
+
+        # Section 2: Mode Instructions (Tutorial vs. Normal)
         if is_tutorial_request:
-            tutorial_instruction = """
-CRITICAL: The user is asking for a TUTORIAL or STEP-BY-STEP GUIDE.
+            prompt_sections.append("""
+══════════════════════════════════════════════════════════════
+                    TUTORIAL MODE - ACTIVE
+══════════════════════════════════════════════════════════════
+
+CORE TASK: Create a complete multi-step tutorial
 
 You must generate a TWO-TIER response:
 1. A HIGH-LEVEL PLAN of ALL steps needed to complete the task (across ALL pages)
@@ -1395,6 +2259,7 @@ REQUIREMENTS:
    - prefer exact topic label first (e.g., "iPhone")
    - otherwise choose the latest visible numbered model (e.g., "iPhone 17")
    - otherwise choose the first visible relevant option
+8. For phone purchase intents (buy/purchase/order a phone): include a step that explicitly clicks the visible "Buy" control for the selected phone model, then end the tutorial once the buy portal/configurator page is open. Do NOT continue into checkout, payment, shipping, or order submission.
 
 ELEMENT SELECTION RULES (CRITICAL - follow strictly):
 1. SPECIFICITY FIRST: Choose the element whose visible text MOST PRECISELY matches the target, with the FEWEST extra words.
@@ -1405,6 +2270,8 @@ ELEMENT SELECTION RULES (CRITICAL - follow strictly):
 2. EXACT > NEAR-EXACT > PARTIAL: Prefer exact text matches over partial ones. If no exact match, prefer the element with the LEAST surplus text beyond the query words.
 3. VISIBLE PREFERENCE: Among equally specific matches, prefer [VISIBLE] elements.
 4. ALWAYS GUESS: If no good match exists, still return your best guess from available elements - never return empty highlights.
+5. CUSTOMER POV: Prefer the primary in-page control a normal customer is intended to click next.
+6. AVOID STICKY DUPLICATES: De-prioritize sticky/fixed/global navigation bars (including top bars that appear after scrolling past hero sections) unless the user explicitly asks for nav/header/menu controls or no better in-page control exists.
 
 GOOD RESPONSE EXAMPLE:
 {{
@@ -1427,10 +2294,10 @@ Include a "tutorialPlan" object in your response:
     "title": "Tutorial title here",
     "totalSteps": 4,
     "planSteps": [
-      {{"stepNumber": 1, "instruction": "Click the New button", "actionType": "click", "expectedResult": "The repository creation page opens.", "expectsPageChange": true, "pageDescription": "GitHub main page", "isTerminal": false}},
-      {{"stepNumber": 2, "instruction": "Enter repository name", "actionType": "input", "expectedResult": "The repository name field contains your typed name.", "expectsPageChange": false, "pageDescription": "Repository creation form", "isTerminal": false}},
-      {{"stepNumber": 3, "instruction": "Choose visibility", "actionType": "click", "expectedResult": "The selected visibility option is active.", "expectsPageChange": false, "pageDescription": "Repository creation form", "isTerminal": false}},
-      {{"stepNumber": 4, "instruction": "Click Create repository", "actionType": "click", "expectedResult": "The new repository page is open.", "expectsPageChange": true, "pageDescription": "Repository creation form", "isTerminal": true}}
+      {{"stepNumber": 1, "instruction": "Click the New button", "actionType": "click", "expectsPageChange": true, "pageDescription": "GitHub main page", "isTerminal": false}},
+      {{"stepNumber": 2, "instruction": "Enter repository name", "actionType": "input", "expectsPageChange": false, "pageDescription": "Repository creation form", "isTerminal": false}},
+      {{"stepNumber": 3, "instruction": "Choose visibility", "actionType": "click", "expectsPageChange": false, "pageDescription": "Repository creation form", "isTerminal": false}},
+      {{"stepNumber": 4, "instruction": "Click Create repository", "actionType": "click", "expectsPageChange": true, "pageDescription": "Repository creation form", "isTerminal": true}}
     ],
     "currentPageHighlights": [
       {{"elementIndex": 5, "explanation": "Click the New button"}}
@@ -1451,8 +2318,8 @@ CRITICAL RULES:
 - "expectsPageChange" should be true if clicking/completing that step will navigate to a new URL
 - "actionType" must be one of: "click", "input", "navigate", "wait", "observe"
 - Use "observe" for steps where the user should read/wait without clicking anything (e.g., "Wait for the page to load", "Read the confirmation message"). Observe steps should have elementIndex: null.
-- Every step MUST include "expectedResult" with a concrete, checkable outcome visible in URL, page text, heading, or field state.
 - Include exactly one terminal step: set "isTerminal": true only on the final step.
+- For phone purchase intents, the final step must be "buy portal is open" (observe/wait), not checkout/payment.
 - Use the indexed element list to find EXACT element indices for current-page steps only
 - If no exact match exists, make your best guess from available [VISIBLE] elements
 - Match control type to instruction:
@@ -1460,102 +2327,216 @@ CRITICAL RULES:
   - "click/buy/continue/submit" -> select a button-like or clickable control
   - "open/go to/navigate" -> select a link-like control
 - Never target generic containers (`div`, `section`, `ul`, `li`, `main`, `article`) when a clickable/input control exists.
-"""
+""")
         else:
-            tutorial_instruction = """
-The user is asking a normal question, not explicitly requesting a tutorial.
-- Do NOT force a numbered tutorial.
-- Answer directly and conversationally.
-- Return highlights only if they are useful for what the user asked right now.
-"""
+            prompt_sections.append("""
+NORMAL MODE: Answer conversationally.
+- Do NOT force a numbered tutorial
+- Answer directly and helpfully
+- Return highlights only if useful for the question
+""")
 
-        prompt_text = f"""
-You are a Site Tutor, an expert web developer and UI guide.
-Your goal is to answer the user's question about the website screenshot provided.
-You must also identify specific HTML elements on the screen that are relevant to your answer so we can highlight them.
+        # Section 3: Request-Specific Instructions
+        if is_selection_request:
+            prompt_sections.append("""
+⚠️ SELECTION REQUEST: User wants to SELECT/HIGHLIGHT a specific element.
+- MUST return at least one highlight with valid elementIndex
+- Cross-reference screenshot and indexed DOM
+""")
 
-User Question: "{message}"
+        if is_multiple_elements:
+            prompt_sections.append("""
+⚠️ MULTIPLE ELEMENTS: Generate SEPARATE highlight for EACH matching element.
+""")
 
-{tutorial_instruction}
+        # Section 4: DOM Context (if provided)
+        if dom:
+            prompt_sections.append(f"""
+══════════════════════════════════════════════════════════════
+            INDEXED ELEMENTS ON THIS PAGE
+══════════════════════════════════════════════════════════════
 
-{selection_instructions}
+Format: [index] tagName "text" attributes in-PARENT [POSITION] [VISIBLE|BELOW-SCROLL]
 
-{multiple_elements_instruction}
+ANNOTATIONS:
+- [VISIBLE]: In viewport - PREFER THESE
+- [BELOW-SCROLL]: Below fold - don't highlight (add scroll instruction instead)
+- [TOP/MID/BOTTOM-SECTION]: Vertical position
+- in-TAGNAME: Parent context
 
-{dom_context}
+{dom}
+""")
+
+        # Section 5: VLM Context (if provided)
+        if vlm_context:
+            prompt_sections.append(f"""
+══════════════════════════════════════════════════════════════
+              VLM VISUAL DETECTION RESULTS
+══════════════════════════════════════════════════════════════
 
 {vlm_context}
 
-{viewport_context}
+🚨 VLM USAGE RULES (MANDATORY):
+1. If detections > 0: USE VLM AS PRIMARY SOURCE
+2. Use `domSuggestions[].elementIndex` from VLM results
+3. Cite bbox_absolute in reasoning: "VLM at x=420, y=50, w=190, h=16 → elementIndex=4"
+4. IGNORE extension UI artifacts: "Site Tutor", "Tutorial step", "Verify Step"
+5. If bestElementIndex provided: verify DOM text match, then use it
 
-{history_context}
+❌ WRONG: "Chose from DOM only" when VLM detections exist
+✅ CORRECT: "VLM bbox x=420, y=50 → elementIndex=4"
 
-{tutorial_context}
+If no VLM OR all are UI artifacts: state "No usable VLM", fall back to DOM matching
+""")
 
-AUTOMATION CAPABILITY:
-You have the ability to automate actions for the user. When the user expresses frustration, gives up, or asks you to do something for them, you can take control and automate the task.
+        # Section 6: Viewport Info (if provided)
+        if viewportInfo:
+            prompt_sections.append(f"""
+══════════════════════════════════════════════════════════════
+                   VIEWPORT INFORMATION
+══════════════════════════════════════════════════════════════
 
-Detect phrases like "I give up", "Just do it for me", "Can you do it", "You do it", "Help me do this", or any expression of wanting you to take over.
+{viewportInfo}
 
-When automation is appropriate, analyze what the user is trying to do and generate the correct automation action:
-1. **Navigate to a URL** - Use when user wants to go to a specific page
-2. **Click an element** - Use when user wants to click something on the current page
+VIEWPORT RULES:
+- ONLY highlight [VISIBLE] elements
+- NEVER highlight [BELOW-SCROLL] (add scroll instruction if needed)
+""")
 
-IMPORTANT: Only provide automation when the user clearly wants you to take over.
+        # Section 7: User History (if provided)
+        if completionHistory:
+            prompt_sections.append(f"""
+══════════════════════════════════════════════════════════════
+                PRIOR LEARNING HISTORY
+══════════════════════════════════════════════════════════════
 
-ELEMENT REFERENCING:
-- Each element in the indexed list has a numeric index (e.g. [0], [1], [2]).
-- When identifying elements, use the "elementIndex" field with the numeric index from the list.
-- Cross-reference the screenshot with the indexed element list to pick the correct index.
-- If the indexed list is not available, fall back to a CSS selector in the "selector" field.
+{completionHistory}
 
-SPECIFICITY MATCHING EXAMPLES:
-- DOM has: [5] a "iPhone" [VISIBLE], [6] a "iPhone Pro" [VISIBLE], [7] a "iPhone Pro Max" [VISIBLE]
-  - User says "iPhone" → elementIndex: 5 (exact match, NOT 6 or 7)
-  - User says "iPhone Pro" → elementIndex: 6 (exact match, NOT 5 or 7)
-  - User says "iPhone Pro Max" → elementIndex: 7 (exact match, NOT 5 or 6)
-- DOM has: [10] button "Add to Bag" [VISIBLE], [11] button "Add to Bag - Express" [VISIBLE]
-  - User says "Add to Bag" → elementIndex: 10 (NOT 11)
-- DOM has: [20] a "Settings" [VISIBLE], [21] a "Settings and Privacy" [VISIBLE]
-  - User says "Settings" → elementIndex: 20 (NOT 21)
+→ Skip basics user already knows
+→ Build on prior knowledge
+""")
 
-Return your response strictly as a JSON object with this format:
-{{
-  "text": "Your conversational answer here...",
-  "highlights": [
-    {{ "elementIndex": 5, "explanation": "Brief label for the highlight" }}
-  ],
+        # Section 8: Current Tutorial State (if provided)
+        if tutorialContext:
+            prompt_sections.append(f"""
+══════════════════════════════════════════════════════════════
+              CURRENT TUTORIAL CONTEXT
+══════════════════════════════════════════════════════════════
+
+{tutorialContext}
+
+→ User is mid-tutorial - continue from current step
+→ Reference next best action if user asks questions
+""")
+
+        # Section 9: Selection Priority Rules (Universal)
+        prompt_sections.append("""
+══════════════════════════════════════════════════════════════
+            ELEMENT SELECTION PRIORITY
+══════════════════════════════════════════════════════════════
+
+🎯 PRIORITY ORDER (Most → Least Important):
+1. SPECIFICITY: Exact text match with fewest extra words
+   • "iPhone" → [5] "iPhone" NOT [6] "iPhone Pro"
+   • "Add to Bag" → [10] "Add to Bag" NOT [11] "Add to Bag - Express"
+2. CONTENT > NAVIGATION: Main content over header/footer/sidebar
+3. SPECIFIC > GENERIC: "iPhone 17" > "All iPhones" > "Shop iPhone"
+4. VISIBLE ONLY: [VISIBLE] over [BELOW-SCROLL]
+5. PRIMARY ACTIONS: Main CTA buttons over secondary actions
+
+⚠️ AVOID (unless requested):
+- Nav menus when main content has same link
+- Generic "Browse"/"Explore" when specific items visible
+- Containers (<div>, <section>) when controls (<button>, <a>) exist
+
+✅ SPECIFICITY EXAMPLES:
+[5] "iPhone" [6] "iPhone Pro" [7] "iPhone Pro Max"
+  • Query "iPhone" → elementIndex: 5 (exact)
+  • Query "iPhone Pro" → elementIndex: 6 (exact)
+""")
+
+        # Section 10: Automation Capability
+        prompt_sections.append("""
+══════════════════════════════════════════════════════════════
+                AUTOMATION CAPABILITY
+══════════════════════════════════════════════════════════════
+
+When user wants you to take over:
+  Triggers: "I give up", "Just do it", "You do it", "Can you do it"
+
+Actions:
+  • Navigate: {"type": "navigate", "url": "..."}
+  • Click: {"type": "click", "elementIndex": X}
+
+ONLY automate when user CLEARLY requests it.
+""")
+
+        # Section 11: Response Format
+        prompt_sections.append("""
+══════════════════════════════════════════════════════════════
+                   RESPONSE FORMAT
+══════════════════════════════════════════════════════════════
+
+STANDARD:
+{
+  "text": "Answer or numbered steps",
+  "highlights": [{"elementIndex": 5, "explanation": "Label"}],
   "automation": null,
-  "reasoning": "Explain your thought process: What elements did you see? Why did you pick these specific element indices? How did you match them to each step? This helps debug element selection."
-}}
+  "reasoning": "REQUIRED: Cite VLM bbox if used, else 'No VLM'. Explain element selection."
+}
 
-OR for automation:
-{{
-  "text": "Your conversational answer here...",
+AUTOMATION:
+{
+  "text": "Confirmation",
   "highlights": [],
-  "automation": {{
-    "type": "navigate",
-    "url": "https://example.com/path"
-  }},
-  "reasoning": "Your thought process here..."
-}}
+  "automation": {"type": "navigate|click", ...},
+  "reasoning": "Why automation is appropriate"
+}
 
-IMPORTANT: Always include the "reasoning" field with your thought process for debugging.
-If no automation is needed, set "automation": null.
-If you cannot find an element index, you may include a "selector" field as a CSS selector fallback.
-"""
+🚨 CRITICAL REQUIREMENTS:
+1. ALWAYS include "reasoning" field (for debugging)
+2. ALWAYS return at least ONE highlight when visible elements exist
+   - If uncertain, pick your BEST GUESS from [VISIBLE] elements
+   - NEVER return empty highlights array: []
+   - NEVER say "I cannot determine which element"
+3. Tutorial responses MUST include "tutorialPlan" object
+4. In highlights, set "explanation" to tell user what they should click/select
 
+❌ NEVER DO THIS:
+{
+  "text": "I cannot find the element",
+  "highlights": [],
+  "reasoning": "No matching elements found"
+}
+
+✅ ALWAYS DO THIS:
+{
+  "text": "Click on the best matching element I found",
+  "highlights": [{"elementIndex": 12, "explanation": "This button seems most relevant"}],
+  "reasoning": "No exact match, but element 12 has similar text. Making best guess."
+}
+
+**REMEMBER:** Users need to see SOMETHING highlighted. An educated guess is better than nothing!
+""")
+
+        # Section 12: Screenshot Note
         if screenshot:
-            prompt_text += "\n(Screenshot provided but omitted; current Cerebras models are text-only.)"
+            prompt_sections.append("\n(Screenshot provided but omitted; Cerebras is text-only)")
         else:
-            prompt_text += "\n(No screenshot provided, answer based on general web knowledge if possible)"
+            prompt_sections.append("\n(No screenshot; answer from DOM and general knowledge)")
 
+        # Assemble final prompt
+        prompt_text = "\n".join(prompt_sections)
+
+        # Call Cerebras API
+        cerebras_started = perf_counter()
         response = cerebras_chat(
             [{"role": "user", "content": prompt_text}],
             max_tokens=max_output_tokens,
             temperature=0.0,
             stream=False,
         )
+        phase_timings_ms["cerebras_call"] = int((perf_counter() - cerebras_started) * 1000)
 
         raw_text = extract_cerebras_message(response)
         print(f"Cerebras raw response: {raw_text}")
@@ -1601,10 +2582,13 @@ If you cannot find an element index, you may include a "selector" field as a CSS
             if isinstance(fallback_highlights, list) and fallback_highlights:
                 parsed["highlights"] = fallback_highlights
 
+        # Only run model-specificity refinement when there's no VLM data AND no tutorial plan.
+        # Tutorial plans already have specific step instructions; overriding them corrupts the flow.
+        has_tutorial_plan = isinstance(tutorial_plan_data, dict) and tutorial_plan_data
         topic_context = f"{message} {tutorialContext or ''}"
         topic = _infer_topic_from_message(topic_context)
         raw_highlights = parsed.get("highlights", [])
-        if isinstance(raw_highlights, list) and raw_highlights:
+        if isinstance(raw_highlights, list) and raw_highlights and not vlm_mapped and not has_tutorial_plan:
             refined_highlights, chosen_label = _refine_highlights_to_specific_model(
                 raw_highlights,
                 dom,
@@ -1613,7 +2597,6 @@ If you cannot find an element index, you may include a "selector" field as a CSS
             )
             parsed["highlights"] = refined_highlights
             if chosen_label:
-                parsed["text"] = _rewrite_first_generic_model_line(str(parsed.get("text", "")), chosen_label)
                 if isinstance(tutorial_plan_data, dict):
                     cph = tutorial_plan_data.get("currentPageHighlights")
                     if isinstance(cph, list) and len(cph) > 0 and isinstance(cph[0], dict):
@@ -1634,36 +2617,123 @@ If you cannot find an element index, you may include a "selector" field as a CSS
                         if plan_i < len(plan_steps) and isinstance(plan_steps[plan_i], dict):
                             action_hints.append(str(plan_steps[plan_i].get("actionType", "")).strip().lower())
 
-            control_refined_highlights, control_refined_steps, controls_changed = _refine_highlights_to_control_type(
-                raw_highlights,
-                dom,
-                instruction_hints,
-                action_hints
+            if vlm_mapped:
+                vlm_first_highlights, vlm_first_changed = _apply_vlm_first_highlight_selection(
+                    raw_highlights,
+                    vlm_mapped,
+                    dom,
+                    instruction_hints,
+                    action_hints,
+                )
+                if vlm_first_changed:
+                    print("🎯 [/chat] applied VLM-first highlight selection (heuristic control-refine skipped)")
+                    parsed["highlights"] = vlm_first_highlights
+                    if isinstance(tutorial_plan_data, dict):
+                        cph = tutorial_plan_data.get("currentPageHighlights")
+                        if isinstance(cph, list):
+                            for i, h in enumerate(vlm_first_highlights):
+                                if i < len(cph) and isinstance(cph[i], dict) and isinstance(h, dict):
+                                    cph[i]["elementIndex"] = h.get("elementIndex")
+                                    cph[i]["explanation"] = h.get("explanation")
+                                    cph[i]["selectionReason"] = h.get("selectionReason") or h.get("explanation")
+            else:
+                control_refined_highlights, control_refined_steps, controls_changed = _refine_highlights_to_control_type(
+                    raw_highlights,
+                    dom,
+                    instruction_hints,
+                    action_hints
+                )
+                if controls_changed:
+                    parsed["highlights"] = control_refined_highlights
+                    if control_refined_steps:
+                        parsed["text"] = _render_numbered_steps(control_refined_steps)
+                    if isinstance(tutorial_plan_data, dict):
+                        cph = tutorial_plan_data.get("currentPageHighlights")
+                        if isinstance(cph, list):
+                            for i, h in enumerate(control_refined_highlights):
+                                if i < len(cph) and isinstance(cph[i], dict) and isinstance(h, dict):
+                                    cph[i]["elementIndex"] = h.get("elementIndex")
+                                    cph[i]["explanation"] = h.get("explanation")
+                                    cph[i]["selectionReason"] = h.get("explanation")  # Also set selectionReason for frontend
+
+        # Constrain highlights to VLM bounding boxes when VLM data is available
+        raw_highlights_pre_vlm = parsed.get("highlights", [])
+        if vlm_mapped and isinstance(raw_highlights_pre_vlm, list) and raw_highlights_pre_vlm:
+            constrained = _constrain_highlights_to_vlm_bounds(
+                raw_highlights_pre_vlm, dom, vlm_detections, vlm_mapped
             )
-            if controls_changed:
-                parsed["highlights"] = control_refined_highlights
-                if control_refined_steps:
-                    parsed["text"] = _render_numbered_steps(control_refined_steps)
-                if isinstance(tutorial_plan_data, dict):
-                    cph = tutorial_plan_data.get("currentPageHighlights")
-                    if isinstance(cph, list):
-                        for i, h in enumerate(control_refined_highlights):
-                            if i < len(cph) and isinstance(cph[i], dict) and isinstance(h, dict):
-                                cph[i]["elementIndex"] = h.get("elementIndex")
-                                cph[i]["explanation"] = h.get("explanation")
-                    current_range = tutorial_plan_data.get("currentPageRange", {})
-                    start_idx = int(current_range.get("startIndex", 0)) if isinstance(current_range, dict) else 0
-                    plan_steps = tutorial_plan_data.get("planSteps")
-                    if isinstance(plan_steps, list):
-                        for i, step_text in enumerate(control_refined_steps):
-                            plan_i = start_idx + i
-                            if plan_i < len(plan_steps) and isinstance(plan_steps[plan_i], dict):
-                                plan_steps[plan_i]["instruction"] = step_text
-                                inferred = _infer_expected_control_from_instruction(step_text)
-                                if inferred == "input":
-                                    plan_steps[plan_i]["actionType"] = "input"
-                                elif inferred in {"button", "link", "select"}:
-                                    plan_steps[plan_i]["actionType"] = "click"
+            parsed["highlights"] = constrained
+            # Also update tutorialPlan.currentPageHighlights
+            if isinstance(tutorial_plan_data, dict):
+                cph = tutorial_plan_data.get("currentPageHighlights")
+                if isinstance(cph, list):
+                    for i, h in enumerate(constrained):
+                        if i < len(cph) and isinstance(cph[i], dict) and isinstance(h, dict):
+                            cph[i]["elementIndex"] = h.get("elementIndex")
+                            cph[i]["explanation"] = h.get("explanation")
+                            cph[i]["selectionReason"] = h.get("explanation")  # Also set selectionReason for frontend
+
+        # Dynamic recalculation should keep the original stored plan, not regenerate one.
+        if is_active_recalc_request and session.tutorial_plan:
+            plan_state = session.tutorial_plan
+            raw_idx = tutorial_context_obj.get("currentGlobalStepIndex")
+            if not isinstance(raw_idx, int):
+                raw_idx = tutorial_context_obj.get("currentStepIndex")
+            try:
+                start_idx = int(raw_idx if raw_idx is not None else plan_state.current_page_start_index)
+            except (TypeError, ValueError):
+                start_idx = int(plan_state.current_page_start_index)
+            if start_idx < 0:
+                start_idx = 0
+            plan_steps = plan_state.plan_steps if isinstance(plan_state.plan_steps, list) else []
+            if plan_steps:
+                start_idx = min(start_idx, len(plan_steps) - 1)
+            current_highlights = parsed.get("highlights", [])
+            if not isinstance(current_highlights, list):
+                current_highlights = []
+            tutorial_plan_data = {
+                "title": plan_state.title,
+                "totalSteps": plan_state.total_steps,
+                "planSteps": plan_steps,
+                "currentPageHighlights": current_highlights,
+                "currentPageRange": {"startIndex": start_idx, "endIndex": start_idx},
+            }
+            parsed["tutorialPlan"] = tutorial_plan_data
+
+        parsed["highlights"] = _annotate_highlights_with_vlm_trace(
+            parsed.get("highlights", []),
+            vlm_mapped,
+            vlm_detections,
+            screenshot_provided=bool(screenshot),
+            vlm_context=vlm_context,
+        )
+        # CRITICAL: Ensure selectionReason is ALWAYS set for regular highlights
+        for i, h in enumerate(parsed.get("highlights", [])):
+            if isinstance(h, dict):
+                if not h.get("selectionReason"):
+                    fallback_reason = h.get("explanation", "Element selected for this step")
+                    h["selectionReason"] = fallback_reason
+                    print(f"⚠️ [/chat] Highlight {i} missing selectionReason, using fallback: {fallback_reason[:50]}")
+                if not h.get("explanation"):
+                    h["explanation"] = h.get("selectionReason", "Selected element")
+
+        if isinstance(tutorial_plan_data, dict):
+            cph = tutorial_plan_data.get("currentPageHighlights")
+            if isinstance(cph, list):
+                tutorial_plan_data["currentPageHighlights"] = _annotate_highlights_with_vlm_trace(
+                    cph,
+                    vlm_mapped,
+                    vlm_detections,
+                    screenshot_provided=bool(screenshot),
+                    vlm_context=vlm_context,
+                )
+                # Ensure selectionReason is always set for frontend
+                for h in tutorial_plan_data["currentPageHighlights"]:
+                    if isinstance(h, dict):
+                        if not h.get("selectionReason"):
+                            h["selectionReason"] = h.get("explanation", "Element selected for this step")
+                        if not h.get("explanation"):
+                            h["explanation"] = h.get("selectionReason", "Selected element")
 
         bot_response_text = parsed.get("text", "I analyzed the page but couldn't formulate a response.")
         reasoning = parsed.get("reasoning", "")
@@ -1678,7 +2748,20 @@ If you cannot find an element index, you may include a "selector" field as a CSS
         print(f"Total highlights returned: {len(highlights)}")
         if highlights:
             for i, h in enumerate(highlights):
-                print(f"  Step {i+1} → elementIndex={h.get('elementIndex', 'none')}, explanation=\"{h.get('explanation', '')}\"")
+                reason = h.get('selectionReason', h.get('explanation', 'none'))
+                vlm_used = 'VLM' in reason
+                print(f"  Step {i+1} → elementIndex={h.get('elementIndex', 'none')}, VLM={'✓' if vlm_used else '✗'}, reason=\"{reason[:100]}...\"")
+
+        # Also log tutorial plan highlights if present
+        if isinstance(tutorial_plan_data, dict):
+            cph = tutorial_plan_data.get("currentPageHighlights", [])
+            if cph:
+                print(f"\nTutorial Plan Highlights: {len(cph)}")
+                for i, h in enumerate(cph):
+                    if isinstance(h, dict):
+                        reason = h.get('selectionReason', h.get('explanation', 'none'))
+                        vlm_used = 'VLM' in reason
+                        print(f"  Plan Step {i+1} → elementIndex={h.get('elementIndex', 'none')}, VLM={'✓' if vlm_used else '✗'}, reason=\"{reason[:100]}...\"")
         print("========================\n")
 
         # Store bot message in session
@@ -1686,13 +2769,16 @@ If you cannot find an element index, you may include a "selector" field as a CSS
 
         # Store tutorial plan in session if present
         if tutorial_plan_data and isinstance(tutorial_plan_data, dict):
+            prior_completed = []
+            if session.tutorial_plan and isinstance(session.tutorial_plan.completed_step_indices, list):
+                prior_completed = list(session.tutorial_plan.completed_step_indices)
             plan_steps = tutorial_plan_data.get("planSteps", [])
             session.tutorial_plan = TutorialPlanState(
                 plan_steps=plan_steps,
-                completed_step_indices=[],
+                completed_step_indices=prior_completed,
                 current_page_start_index=tutorial_plan_data.get("currentPageRange", {}).get("startIndex", 0),
-                original_query=message,
-                title=tutorial_plan_data.get("title", "Tutorial"),
+                original_query=(session.tutorial_plan.original_query if (session.tutorial_plan and is_active_recalc_request) else message),
+                title=tutorial_plan_data.get("title", session.tutorial_plan.title if session.tutorial_plan else "Tutorial"),
                 total_steps=tutorial_plan_data.get("totalSteps", len(plan_steps)),
             )
             print(f"\n=== TUTORIAL PLAN STORED ===")
@@ -1709,9 +2795,37 @@ If you cannot find an element index, you may include a "selector" field as a CSS
         if automation_data and isinstance(automation_data, dict):
             automation = AutomationAction(**automation_data)
 
+        # ====================================================================
+        # CRITICAL VALIDATION: NEVER RETURN EMPTY HIGHLIGHTS
+        # ====================================================================
+        # If AI returned no highlights but DOM has visible elements, pick the best one
+        final_highlights = parsed.get("highlights", [])
+
+        if not final_highlights or not isinstance(final_highlights, list) or len(final_highlights) == 0:
+            print("⚠️ [/chat] AI returned empty highlights - applying fallback selection")
+
+            # Try to find a relevant element from DOM
+            if dom:
+                fallback_highlight = _select_fallback_element(dom, message, vlm_mapped)
+                if fallback_highlight:
+                    final_highlights = [fallback_highlight]
+                    bot_response_text = f"{bot_response_text}\n\n💡 I've highlighted the most relevant element I could find on this page."
+                    print(f"✅ [/chat] Fallback selection applied: elementIndex={fallback_highlight.get('elementIndex')}")
+                else:
+                    print("⚠️ [/chat] No suitable fallback element found in DOM")
+
+        # Double-check: if still empty in tutorial mode, that's an error
+        if is_tutorial_request and (not final_highlights or len(final_highlights) == 0):
+            print("🚨 [/chat] CRITICAL: Tutorial mode with no highlights - this should never happen!")
+            # Add warning to response text
+            bot_response_text = f"{bot_response_text}\n\n⚠️ I couldn't identify a specific element to highlight. Please try rephrasing your request or refresh the page."
+
+        phase_timings_ms["total_request"] = int((perf_counter() - request_started) * 1000)
+        print(f"⏱️ [/chat] timings_ms={phase_timings_ms}")
+
         return ChatResponse(
             text=bot_response_text,
-            highlights=parsed.get("highlights", []),
+            highlights=final_highlights,
             automation=automation,
             sessionId=session.id,
             reasoning=reasoning,
@@ -1729,11 +2843,296 @@ If you cannot find an element index, you may include a "selector" field as a CSS
 
     except Exception as e:
         print(f"Error calling Cerebras: {e}")
+        phase_timings_ms["total_request"] = int((perf_counter() - request_started) * 1000)
+        print(f"⏱️ [/chat] timings_ms={phase_timings_ms}")
         return ChatResponse(
             text=f"I encountered an error analyzing the page: {str(e)}",
             highlights=[],
             automation=None,
             sessionId=session.id
+        )
+
+
+@app.post("/next-step", response_model=NextStepResponse)
+@app.post("/next-step/", response_model=NextStepResponse, include_in_schema=False)
+async def next_step(
+    goal: str = Form(...),
+    screenshot: Optional[UploadFile] = File(None),
+    sessionId: Optional[str] = Form(None),
+    dom: Optional[str] = Form(None),
+    viewportInfo: Optional[str] = Form(None),
+    currentUrl: Optional[str] = Form(None),
+    completedStepInstruction: Optional[str] = Form(None),
+    tutorialContext: Optional[str] = Form(None),
+):
+    """
+    Return exactly one adaptive next step for the user's current screen.
+    This endpoint is designed for screen-by-screen tutorials and should not
+    return full multi-page plans.
+    """
+    request_started = perf_counter()
+    phase_timings_ms: Dict[str, int] = {}
+    cleaned_goal = str(goal or "").strip()
+    session = session_manager.get_or_create_session(sessionId)
+    if VLM_AVAILABLE:
+        ensure_vlm_debug_dir(session.id)
+
+    print(f"📥 [/next-step] goal={cleaned_goal}")
+    print(f"🧷 [/next-step] Session ID: {session.id}")
+    print(f"🧠 [/next-step] DOM attached? {'yes' if dom else 'no'} | viewportInfo? {'yes' if viewportInfo else 'no'}")
+
+    if not cleaned_goal:
+        return NextStepResponse(
+            text="Please share what you want to do on this page.",
+            highlights=[],
+            sessionId=session.id,
+            done=False,
+        )
+
+    if not api_key:
+        return NextStepResponse(
+            text="Please set your CEREBRAS_API_KEY in backend/.env.",
+            highlights=[],
+            sessionId=session.id,
+            done=False,
+        )
+
+    try:
+        tutorial_context_obj: Dict[str, Any] = {}
+        if tutorialContext:
+            try:
+                parsed_tc = json.loads(tutorialContext) if isinstance(tutorialContext, str) else tutorialContext
+                if isinstance(parsed_tc, dict):
+                    tutorial_context_obj = parsed_tc
+            except (json.JSONDecodeError, TypeError):
+                tutorial_context_obj = {}
+
+        vlm_context = ""
+        vlm_detections: List[Dict[str, Any]] = []
+        vlm_mapped: List[Dict[str, Any]] = []
+        if screenshot:
+            screenshot_read_started = perf_counter()
+            screenshot_bytes = await screenshot.read()
+            phase_timings_ms["screenshot_read"] = int((perf_counter() - screenshot_read_started) * 1000)
+            vlm_query = cleaned_goal
+            if completedStepInstruction:
+                vlm_query = (
+                    f'goal="{cleaned_goal}"; previous_step="{completedStepInstruction}"; '
+                    f'current_url="{currentUrl or ""}"'
+                )
+            vlm_started = perf_counter()
+            vlm_context, vlm_detections, vlm_mapped = _build_vlm_context_from_screenshot_bytes(
+                screenshot_bytes=screenshot_bytes,
+                query=vlm_query,
+                viewport_info=viewportInfo,
+                endpoint_label="/next-step",
+                dom_text=dom,
+                session_id=session.id,
+            )
+            phase_timings_ms["vlm_pipeline"] = int((perf_counter() - vlm_started) * 1000)
+        else:
+            print("🖼️ [/next-step] No screenshot provided.")
+
+        dom_context = ""
+        if dom:
+            dom_context = f"""
+INDEXED ELEMENTS ON THIS PAGE:
+{dom}
+"""
+
+        viewport_context = ""
+        if viewportInfo:
+            viewport_context = f"""
+VIEWPORT INFORMATION:
+{viewportInfo}
+"""
+
+        progress_context = ""
+        if completedStepInstruction:
+            progress_context += f'Previous verified step: "{completedStepInstruction}"\n'
+        if currentUrl:
+            progress_context += f"Current URL: {currentUrl}\n"
+
+        prompt_text = f"""
+You are an adaptive UI tutorial agent.
+Goal: "{cleaned_goal}"
+
+{progress_context}
+{dom_context}
+{vlm_context}
+{viewport_context}
+
+Return EXACTLY ONE actionable next step for the CURRENT screen.
+Do NOT return a 10-step plan or any multi-step list.
+Do NOT include future-page subtasks.
+
+Rules:
+1. Give one immediate step only.
+2. If the current screen already indicates the previous navigation succeeded, continue from this screen.
+3. Prefer a [VISIBLE] interactive element from indexed DOM.
+4. Use VLM mapped elementIndex when available and relevant.
+5. For "observe"/"wait" steps, highlights may be empty.
+6. If the goal is to buy/purchase/order a phone, the next action should be clicking the visible "Buy" control for the chosen model; once the buy portal/configurator is open, return a terminal observe/wait step and stop (no checkout/payment steps).
+
+Respond ONLY as JSON with this exact shape:
+{{
+  "text": "short instruction for the user",
+  "step": {{
+    "instruction": "single next action",
+    "actionType": "click|input|navigate|wait|observe",
+    "isTerminal": false
+  }},
+  "highlights": [
+    {{ "elementIndex": 0, "explanation": "why this element" }}
+  ],
+  "done": false,
+  "reasoning": "brief explanation"
+}}
+"""
+
+        cerebras_started = perf_counter()
+        response = cerebras_chat(
+            [{"role": "user", "content": prompt_text}],
+            max_tokens=max_output_tokens,
+            temperature=0.0,
+            stream=False,
+        )
+        phase_timings_ms["cerebras_call"] = int((perf_counter() - cerebras_started) * 1000)
+
+        raw_text = extract_cerebras_message(response)
+        print(f"Cerebras raw response (/next-step): {raw_text}")
+
+        if raw_text.startswith("```json"):
+            raw_text = raw_text[7:]
+        if raw_text.startswith("```"):
+            raw_text = raw_text[3:]
+        if raw_text.endswith("```"):
+            raw_text = raw_text[:-3]
+
+        try:
+            parsed = json.loads(raw_text.strip())
+        except json.JSONDecodeError:
+            extracted = extract_json_object(raw_text)
+            if extracted:
+                parsed = json.loads(extracted.strip())
+            else:
+                raise
+
+        step_payload = parsed.get("step")
+        step_instruction = ""
+        step_action_type = "click"
+        step_is_terminal = False
+        if isinstance(step_payload, dict):
+            step_instruction = str(step_payload.get("instruction", "")).strip()
+            step_action_type = _normalize_action_type(str(step_payload.get("actionType", "")).strip(), step_instruction)
+            step_is_terminal = bool(step_payload.get("isTerminal", False))
+
+        text_value = str(parsed.get("text", "")).strip()
+        if not step_instruction:
+            step_candidates = _extract_numbered_steps_from_text(text_value)
+            if step_candidates:
+                step_instruction = step_candidates[0]
+            elif text_value:
+                step_instruction = text_value.splitlines()[0].strip()
+            else:
+                step_instruction = "Continue with the next visible action on this page."
+            step_action_type = _normalize_action_type(step_action_type, step_instruction)
+
+        expected_control = _infer_expected_control_from_instruction(step_instruction)
+        highlights = parsed.get("highlights", [])
+        if not isinstance(highlights, list):
+            highlights = []
+        highlights = highlights[:1]
+
+        candidates = _extract_visible_dom_candidates(dom)
+        if highlights:
+            first = highlights[0] if isinstance(highlights[0], dict) else {}
+            if not isinstance(first.get("elementIndex"), int) and candidates and step_action_type not in {"observe", "wait"}:
+                ranked = sorted(
+                    [(_score_candidate_for_instruction(c, step_instruction, expected_control), c) for c in candidates],
+                    key=lambda item: item[0],
+                    reverse=True,
+                )
+                best = ranked[0][1]
+                first["elementIndex"] = int(best["index"])
+                chosen_label = str(best.get("label") or f'Element {best.get("index")}')
+                first["explanation"] = _explanation_for_expected_control(expected_control, chosen_label)
+                highlights[0] = first
+        elif candidates and step_action_type not in {"observe", "wait"}:
+            ranked = sorted(
+                [(_score_candidate_for_instruction(c, step_instruction, expected_control), c) for c in candidates],
+                key=lambda item: item[0],
+                reverse=True,
+            )
+            best = ranked[0][1]
+            chosen_label = str(best.get("label") or f'Element {best.get("index")}')
+            highlights = [{
+                "elementIndex": int(best["index"]),
+                "explanation": _explanation_for_expected_control(expected_control, chosen_label),
+            }]
+
+        if vlm_mapped and highlights:
+            highlights, _ = _apply_vlm_first_highlight_selection(
+                highlights=highlights,
+                vlm_mapped=vlm_mapped,
+                dom=dom,
+                instruction_hints=[step_instruction],
+                action_hints=[step_action_type],
+            )
+            highlights = _constrain_highlights_to_vlm_bounds(highlights, dom, vlm_detections, vlm_mapped)
+
+        highlights = _annotate_highlights_with_vlm_trace(
+            highlights,
+            vlm_mapped,
+            vlm_detections,
+            screenshot_provided=bool(screenshot),
+            vlm_context=vlm_context,
+        )
+        for i, h in enumerate(highlights):
+            if isinstance(h, dict):
+                if not h.get("selectionReason"):
+                    h["selectionReason"] = h.get("explanation", "Selected element")
+                if not h.get("explanation"):
+                    h["explanation"] = h.get("selectionReason", "Selected element")
+            else:
+                print(f"⚠️ [/next-step] highlight {i} ignored (not an object)")
+
+        if step_action_type in {"observe", "wait"}:
+            highlights = []
+
+        reasoning = str(parsed.get("reasoning", "")).strip()
+        done = bool(parsed.get("done", False))
+        bot_text = text_value or step_instruction
+        if _extract_numbered_steps_from_text(bot_text):
+            bot_text = step_instruction
+
+        session.add_message("user", f"[next-step] {cleaned_goal}")
+        session.add_message("bot", bot_text)
+
+        phase_timings_ms["total_request"] = int((perf_counter() - request_started) * 1000)
+        print(f"⏱️ [/next-step] timings_ms={phase_timings_ms}")
+
+        return NextStepResponse(
+            text=bot_text,
+            step=NextStep(
+                instruction=step_instruction,
+                actionType=step_action_type,
+                isTerminal=step_is_terminal,
+            ),
+            highlights=highlights,
+            sessionId=session.id,
+            reasoning=reasoning,
+            done=done,
+        )
+    except Exception as e:
+        print(f"Error calling /next-step: {e}")
+        phase_timings_ms["total_request"] = int((perf_counter() - request_started) * 1000)
+        print(f"⏱️ [/next-step] timings_ms={phase_timings_ms}")
+        return NextStepResponse(
+            text=f"I hit an error while generating the next step: {str(e)}",
+            highlights=[],
+            sessionId=session.id,
+            done=False,
         )
 
 
@@ -1746,6 +3145,7 @@ class ContinueTutorialResponse(BaseModel):
 
 
 @app.post("/continue-tutorial", response_model=ContinueTutorialResponse)
+@app.post("/continue-tutorial/", response_model=ContinueTutorialResponse, include_in_schema=False)
 async def continue_tutorial(
     sessionId: str = Form(...),
     screenshot: Optional[UploadFile] = File(None),
@@ -1774,11 +3174,29 @@ async def continue_tutorial(
         print(f"✅ Completed step: {completedStepInstruction}")
 
     session = session_manager.get_session(sessionId)
-    if not session or not session.tutorial_plan:
-        raise HTTPException(status_code=404, detail="Session or tutorial plan not found")
+    if not session:
+        print(f"❌ [/continue-tutorial] Missing session for sessionId={sessionId}")
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "SESSION_NOT_FOUND",
+                "message": "Session not found. Start or resume via /chat first to create a tutorial session."
+            },
+        )
+    if not session.tutorial_plan:
+        print(f"❌ [/continue-tutorial] Session has no tutorial plan for sessionId={sessionId}")
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "TUTORIAL_PLAN_NOT_FOUND",
+                "message": "Tutorial plan missing for this session. Re-run /chat tutorial generation first."
+            },
+        )
 
     if not api_key:
         raise HTTPException(status_code=500, detail="API key not configured")
+    if VLM_AVAILABLE:
+        ensure_vlm_debug_dir(session.id)
 
     plan = session.tutorial_plan
 
@@ -1831,24 +3249,31 @@ CRITICAL: Only highlight elements marked [VISIBLE]. Never highlight [BELOW-SCROL
 """
 
     vlm_context = ""
+    vlm_detections_ct: List[Dict[str, Any]] = []
+    vlm_mapped_ct: List[Dict[str, Any]] = []
     if screenshot:
-        # Use next few remaining step instructions to focus VLM on immediate actions.
-        remaining_instructions: List[str] = []
-        for step in remaining_steps[:3]:
-            if isinstance(step, dict):
-                instruction = str(step.get("instruction", "")).strip()
-                if instruction:
-                    remaining_instructions.append(instruction)
-        vlm_query = " ; ".join(remaining_instructions) if remaining_instructions else "find the next actionable UI element for this tutorial"
+        print(f"📸 [/continue-tutorial] Screenshot received! filename={screenshot.filename}, content_type={screenshot.content_type}")
+        # Focus VLM with the next two actionable step queries, then merge detections.
+        focused_queries: List[str] = []
+        for step in remaining_steps[:2]:
+            query_for_step = _build_vlm_query_for_step(step) if isinstance(step, dict) else None
+            if query_for_step:
+                focused_queries.append(query_for_step)
+        if not focused_queries:
+            focused_queries = ["find the next actionable visible UI element for this tutorial"]
         screenshot_bytes = await screenshot.read()
-        vlm_context = _build_vlm_context_from_screenshot_bytes(
+        print(f"📸 [/continue-tutorial] Screenshot bytes read: {len(screenshot_bytes)} bytes, queries={focused_queries}")
+        vlm_context, vlm_detections_ct, vlm_mapped_ct = _build_vlm_context_from_screenshot_bytes_multi(
             screenshot_bytes=screenshot_bytes,
-            query=vlm_query,
+            queries=focused_queries,
             viewport_info=viewportInfo,
-            endpoint_label="/continue-tutorial"
+            endpoint_label="/continue-tutorial",
+            dom_text=dom,
+            session_id=session.id,
         )
+        print(f"🎯 [/continue-tutorial] VLM processing complete: detections={len(vlm_detections_ct)}, mapped={len(vlm_mapped_ct)}")
     else:
-        print("🤖 [/continue-tutorial] VLM influence: none (no screenshot in request).")
+        print("⚠️ [/continue-tutorial] VLM influence: none (no screenshot in request).")
 
     # Build verification context
     verification_context = ""
@@ -1879,6 +3304,27 @@ The user has navigated to a NEW PAGE. Below is the fresh screenshot and indexed 
 
 {vlm_context}
 
+🚨 CRITICAL: VLM VISUAL DETECTION USAGE (MANDATORY) 🚨
+If `VLM_CONTEXT_JSON` exists with detections > 0:
+1. **YOU MUST USE VLM DETECTIONS AS PRIMARY SOURCE** - Do NOT choose from DOM only
+2. **ALWAYS use `domSuggestions[].elementIndex`** - This is the VLM-to-DOM mapped result
+3. **Cite bbox_absolute** in reasoning: "Used VLM detection bbox_absolute x=420, y=50, width=190, height=16 → elementIndex=4"
+4. **IGNORE these VLM labels** (extension UI artifacts):
+   - "Site Tutor chat message"
+   - "Tutorial step"
+   - "Verify Step button"
+   - Any text mentioning "Site Tutor" or extension UI
+5. **If bestElementIndex is provided** - START with that element, verify it matches visible DOM text, then use it
+
+Flow: Screenshot → VLM detects visual elements → Maps to DOM indices → YOU USE THE MAPPED INDEX
+
+❌ WRONG: "Chose from DOM only (VLM returned 0 detections)" when detections exist
+✅ CORRECT: "Used VLM detection bbox_absolute x=420, y=50 → elementIndex=4"
+
+If no VLM detections OR all detections are extension UI artifacts:
+- State: "No usable VLM detections (extension UI only)" or "VLM returned 0 detections"
+- Then choose from DOM using text matching
+
 {viewport_context}
 
 YOUR TASK:
@@ -1887,6 +3333,7 @@ YOUR TASK:
 3. ALWAYS return at least one highlight when visible elements exist - never return empty highlights
 4. Make your best guess when multiple similar elements exist
 5. Do NOT regenerate the plan -- use the existing plan step instructions
+6. For phone purchase flows, prioritize the visible "Buy" control for the selected model and treat arrival at the buy portal/configurator as terminal for this tutorial (do not add checkout/payment actions).
 
 ELEMENT SELECTION RULES (CRITICAL):
 - SPECIFICITY FIRST: Choose the element whose text MOST PRECISELY matches the plan step instruction, with the FEWEST extra/surplus words.
@@ -1900,6 +3347,8 @@ ELEMENT SELECTION RULES (CRITICAL):
   - click/buy/continue/submit -> button/link controls only
   - open/go to/navigate -> link controls only
 - Do NOT highlight container wrappers (`div`, `section`, `ul`, `li`, `main`) when a real control is available.
+- CUSTOMER POV: prioritize controls an end-user customer is meant to use in the main page flow.
+- Avoid sticky/fixed/global nav bars (top scroll-triggered bars) when the same action exists in-page, unless the instruction explicitly asks for nav/header/menu.
 
 Return your response as JSON:
 {{{{
@@ -1956,18 +3405,8 @@ CRITICAL:
         page_range = parsed.get("currentPageRange", {"startIndex": currentPlanStepIndex, "endIndex": currentPlanStepIndex})
         reasoning = parsed.get("reasoning", "")
 
-        topic_source = f"{session.tutorial_plan.original_query if session and session.tutorial_plan else ''} {completedStepInstruction or ''}"
-        topic = _infer_topic_from_message(topic_source)
-        if isinstance(highlights, list) and highlights:
-            refined, chosen_label = _refine_highlights_to_specific_model(
-                highlights,
-                dom,
-                topic,
-                json.dumps(remaining_steps)
-            )
-            highlights = refined
-            if chosen_label:
-                print(f'🎯 [/continue-tutorial] refined to specific model target "{chosen_label}"')
+        # Skip model-specificity refinement in continue-tutorial — plan instructions are already specific.
+        # Only VLM constraint (applied below) should override highlights.
 
         if isinstance(highlights, list) and highlights:
             remaining_instruction_hints: List[str] = []
@@ -1979,20 +3418,59 @@ CRITICAL:
                         remaining_instruction_hints.append(ins)
                         remaining_action_hints.append(str(step.get("actionType", "")).strip().lower())
 
-            control_refined_highlights, _, controls_changed = _refine_highlights_to_control_type(
-                highlights,
-                dom,
-                remaining_instruction_hints,
-                remaining_action_hints
+            if vlm_mapped_ct:
+                vlm_first_highlights, vlm_first_changed = _apply_vlm_first_highlight_selection(
+                    highlights,
+                    vlm_mapped_ct,
+                    dom,
+                    remaining_instruction_hints,
+                    remaining_action_hints,
+                )
+                if vlm_first_changed:
+                    highlights = vlm_first_highlights
+                    print("🎯 [/continue-tutorial] applied VLM-first highlight selection (heuristic control-refine skipped)")
+            else:
+                control_refined_highlights, _, controls_changed = _refine_highlights_to_control_type(
+                    highlights,
+                    dom,
+                    remaining_instruction_hints,
+                    remaining_action_hints
+                )
+                if controls_changed:
+                    highlights = control_refined_highlights
+                    print("🎯 [/continue-tutorial] refined highlights by control type (input/button/link)")
+
+        # Constrain highlights to VLM bounding boxes
+        if vlm_mapped_ct and isinstance(highlights, list) and highlights:
+            highlights = _constrain_highlights_to_vlm_bounds(
+                highlights, dom, vlm_detections_ct, vlm_mapped_ct
             )
-            if controls_changed:
-                highlights = control_refined_highlights
-                print("🎯 [/continue-tutorial] refined highlights by control type (input/button/link)")
+        highlights = _annotate_highlights_with_vlm_trace(
+            highlights if isinstance(highlights, list) else [],
+            vlm_mapped_ct,
+            vlm_detections_ct,
+            screenshot_provided=bool(screenshot),
+            vlm_context=vlm_context,
+        )
+
+        # CRITICAL: Ensure selectionReason is ALWAYS set for frontend
+        # _annotate_highlights_with_vlm_trace should have set it, but verify
+        if isinstance(highlights, list):
+            for i, h in enumerate(highlights):
+                if isinstance(h, dict):
+                    # If no selectionReason (shouldn't happen), use explanation as fallback
+                    if not h.get("selectionReason"):
+                        fallback_reason = h.get("explanation", "Element selected for this step")
+                        h["selectionReason"] = fallback_reason
+                        print(f"⚠️ [/continue-tutorial] Highlight {i} missing selectionReason, using fallback: {fallback_reason[:50]}")
+                    # Always ensure explanation field exists for backward compatibility
+                    if not h.get("explanation"):
+                        h["explanation"] = h.get("selectionReason", "Selected element")
 
         print(f"New page highlights: {len(highlights)}")
         print(f"Page range: {page_range}")
         for i, h in enumerate(highlights):
-            print(f"  Highlight {i+1} → elementIndex={h.get('elementIndex', 'none')}, planStep={h.get('planStepNumber', '?')}")
+            print(f"  Highlight {i+1} → elementIndex={h.get('elementIndex', 'none')}, planStep={h.get('planStepNumber', '?')}, reason={h.get('selectionReason', 'none')[:50]}")
         print("========================\n")
 
         # Update session plan state
@@ -2016,21 +3494,67 @@ CRITICAL:
 
 class VerifyStepRequest(BaseModel):
     stepInstruction: str
-    expectedResult: str
     screenshot: Optional[str] = None  # base64 encoded
     dom: Optional[str] = None
     clickedElement: str = ""
+    currentUrl: Optional[str] = None  # Current URL so AI knows where user is
+    sessionId: Optional[str] = None  # Session ID for context
 
 class VerifyStepResponse(BaseModel):
     isCorrect: bool
     confidence: float
     reason: str
 
+def _normalize_url_route(url: Optional[str]) -> str:
+    if not url:
+        return ""
+    try:
+        parsed = urlparse(url)
+        path = parsed.path or "/"
+        return f"{parsed.scheme}://{parsed.netloc}{path}".rstrip("/")
+    except Exception:
+        return str(url).strip().rstrip("/")
+
+def _instruction_is_input_like(instruction: str) -> bool:
+    lower = (instruction or "").lower()
+    input_terms = (
+        "type",
+        "enter",
+        "fill",
+        "input",
+        "password",
+        "email",
+        "address",
+        "shipping",
+        "payment",
+        "card",
+    )
+    return any(term in lower for term in input_terms)
+
+def _instruction_is_navigation_like(instruction: str) -> bool:
+    lower = (instruction or "").lower()
+    nav_terms = (
+        "open",
+        "go to",
+        "navigate",
+        "visit",
+        "click",
+        "tap",
+        "press",
+        "select",
+        "choose",
+        "pick",
+        "model",
+        "link",
+        "page",
+    )
+    return any(term in lower for term in nav_terms)
+
 @app.post("/verify", response_model=VerifyStepResponse)
 async def verify_step(request: VerifyStepRequest):
     """
     Verify if a tutorial step was completed correctly.
-    Uses fresh screenshot and DOM for better element identification.
+    Uses VLM (Claude) with screenshot when available, falls back to Cerebras text-only.
     """
     if not api_key:
         return VerifyStepResponse(
@@ -2040,34 +3564,97 @@ async def verify_step(request: VerifyStepRequest):
         )
 
     try:
-        # Build verification prompt
-        verify_prompt = f"""You are a tutorial verification assistant. Determine if the user correctly completed the following step.
+        # Session-aware URL transition guardrail:
+        # if user navigated to a different route and step is navigation-like,
+        # count the step as complete without requiring extra in-page interaction.
+        session = session_manager.get_session(request.sessionId) if request.sessionId else None
+        prev_route = _normalize_url_route(session.last_verified_url) if session else ""
+        current_route = _normalize_url_route(request.currentUrl)
+        route_changed = bool(prev_route and current_route and prev_route != current_route)
+
+        if route_changed and _instruction_is_navigation_like(request.stepInstruction) and not _instruction_is_input_like(request.stepInstruction):
+            if session:
+                session.last_verified_url = request.currentUrl
+            reason = (
+                f"Accepted as completed because the route changed from '{prev_route}' to '{current_route}' "
+                f"after this navigation step."
+            )
+            print(f"✅ [/verify] URL-change completion accepted | {reason}")
+            return VerifyStepResponse(
+                isCorrect=True,
+                confidence=0.93,
+                reason=reason
+            )
+
+        # Include current URL context if provided
+        url_context = ""
+        if request.currentUrl:
+            url_context = f"\nCurrent Page URL: {request.currentUrl}"
+            if prev_route:
+                url_context += f"\nPrevious Verified URL: {prev_route}"
+            url_context += f"\nRoute Changed Since Last Verify: {'yes' if route_changed else 'no'}"
+
+        verify_text_prompt = f"""You are a tutorial verification assistant. Determine if the user correctly completed the following step.
 
 Step Instruction: {request.stepInstruction}
-Expected Result: {request.expectedResult}
-User clicked on: {request.clickedElement}
+User clicked on: {request.clickedElement}{url_context}
 
-Page Context:
+Page Context (DOM):
 {request.dom if request.dom else "(No DOM provided)"}
 
-Based on the screenshot and page context, did the user successfully complete this step? Respond with:
+Based on what you see, did the user successfully complete this step? Consider the current URL and page context to determine if the user is on the expected page after completing the step.
+
+Respond ONLY with valid JSON:
 {{
   "isCorrect": true/false,
   "confidence": 0.0-1.0,
   "reason": "brief explanation"
 }}"""
 
-        if request.screenshot:
-            verify_prompt += "\n(Note: Screenshot provided but omitted; current Cerebras models are text-only.)"
+        raw_text = None
 
-        response = cerebras_chat(
-            [{"role": "user", "content": verify_prompt}],
-            max_tokens=200,
-            temperature=0.0,
-            stream=False,
-        )
+        # Try VLM (Claude) with screenshot first
+        if request.screenshot and VLM_AVAILABLE:
+            try:
+                claude_client = initialize_claude()
+                if claude_client:
+                    print(f"🔍 [/verify] Using VLM (Claude) for step verification with screenshot")
+                    # Build multimodal message with screenshot
+                    content = [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": request.screenshot,
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": verify_text_prompt,
+                        },
+                    ]
+                    vlm_response = claude_client.messages.create(
+                        model="claude-sonnet-4-5-20250929",
+                        max_tokens=300,
+                        messages=[{"role": "user", "content": content}],
+                    )
+                    raw_text = vlm_response.content[0].text
+                    print(f"✅ [/verify] VLM verification response received")
+            except Exception as vlm_err:
+                print(f"⚠️ [/verify] VLM verification failed, falling back to Cerebras: {vlm_err}")
+                raw_text = None
 
-        raw_text = extract_cerebras_message(response)
+        # Fallback to Cerebras text-only
+        if raw_text is None:
+            print(f"🔍 [/verify] Using Cerebras (text-only) for step verification")
+            response = cerebras_chat(
+                [{"role": "user", "content": verify_text_prompt}],
+                max_tokens=200,
+                temperature=0.0,
+                stream=False,
+            )
+            raw_text = extract_cerebras_message(response)
 
         # Parse JSON response
         try:
@@ -2079,11 +3666,14 @@ Based on the screenshot and page context, did the user successfully complete thi
             else:
                 raise
 
-        return VerifyStepResponse(
+        response_payload = VerifyStepResponse(
             isCorrect=result.get("isCorrect", False),
             confidence=float(result.get("confidence", 0.5)),
             reason=result.get("reason", "")
         )
+        if session and request.currentUrl:
+            session.last_verified_url = request.currentUrl
+        return response_payload
 
     except Exception as e:
         print(f"Verification error: {e}")
@@ -2093,31 +3683,9 @@ Based on the screenshot and page context, did the user successfully complete thi
             reason=f"Verification failed: {str(e)}"
         )
 
-class DesktopScreenshotResponse(BaseModel):
-    screenshot: str  # base64 encoded PNG
-
-@app.get("/capture-desktop", response_model=DesktopScreenshotResponse)
-async def capture_desktop():
-    """
-    Capture a desktop screenshot and return as base64 PNG.
-    This is used when a desktop-level capture is needed instead of a tab-only capture.
-    """
-    try:
-        # Capture the entire desktop
-        screenshot = ImageGrab.grab()
-
-        # Convert to PNG bytes
-        img_byte_arr = io.BytesIO()
-        screenshot.save(img_byte_arr, format='PNG')
-        img_byte_arr.seek(0)
-
-        # Encode as base64
-        img_base64 = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
-
-        return DesktopScreenshotResponse(screenshot=img_base64)
-    except Exception as e:
-        print(f"Error capturing desktop: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to capture desktop: {str(e)}")
+## /capture-desktop endpoint REMOVED — desktop-level screenshots include non-browser
+## content (IDE, terminal, OS UI) which confuses the VLM. The extension now only uses
+## chrome.tabs.captureVisibleTab() which captures browser tab content exclusively.
 
 
 class VLMDetectRequest(BaseModel):
@@ -2139,6 +3707,7 @@ class VLMDetectResponse(BaseModel):
     model_latency_ms: int
     reasoning: str
     error: Optional[str] = None
+    diagnostics: Optional[Dict[str, Any]] = None
 
 
 @app.post("/vlm-detect", response_model=VLMDetectResponse)
@@ -2203,7 +3772,8 @@ async def vlm_detect(request: VLMDetectRequest):
             image=image,
             query=request.query,
             viewport_width=request.viewport_width,
-            viewport_height=request.viewport_height
+            viewport_height=request.viewport_height,
+            session_id=None,
         )
 
         print(f"   Detections: {len(result['detections'])}")
@@ -2229,7 +3799,8 @@ async def vlm_detect(request: VLMDetectRequest):
             detections=result["detections"],
             model_latency_ms=result["model_latency_ms"],
             reasoning=result["reasoning"],
-            error=result.get("error")
+            error=result.get("error"),
+            diagnostics=result.get("diagnostics"),
         )
 
     except Exception as e:
@@ -2241,7 +3812,8 @@ async def vlm_detect(request: VLMDetectRequest):
             detections=[],
             model_latency_ms=0,
             reasoning=f"VLM detection failed: {str(e)}",
-            error=str(e)
+            error=str(e),
+            diagnostics={"error": str(e)},
         )
 
 
@@ -2254,7 +3826,7 @@ async def vlm_health():
     {
       "vlm_available": true/false,
       "provider": "claude-api",
-      "model_name": "claude-3-5-sonnet-20241022",
+      "model_name": "claude-sonnet-4-5-20250929",
       "api_key_configured": true/false,
       "error": "error message if failed"
     }
@@ -2280,7 +3852,7 @@ async def vlm_health():
         return {
             "vlm_available": True,
             "provider": "claude-api",
-            "model_name": os.getenv("CLAUDE_MODEL", "claude-3-5-sonnet-20241022"),
+            "model_name": os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5-20250929"),
             "api_key_configured": True,
             "error": None
         }

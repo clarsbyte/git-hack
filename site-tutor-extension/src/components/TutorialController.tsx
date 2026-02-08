@@ -1,10 +1,10 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react'
-import { CheckCircle2, Loader2, Sparkles, X, AlertTriangle } from 'lucide-react'
+import { CheckCircle2, Loader2, X, AlertTriangle, ScanSearch } from 'lucide-react'
 import type { TutorialPayload, TutorialStep, TutorialActionType, StepError } from '../types/tutorial'
 import { ActionVerifier } from '../utils/actionVerifier'
 import type { ElementIndexer } from '../utils/elementIndexer'
 import { saveStepError } from '../utils/tutorialMemory'
-import { findBestElementByInstructionSync } from '../utils/stepElementResolver'
+// import { findBestElementByInstructionSync } from '../utils/stepElementResolver' // Disabled in manual-only mode
 import type { LLMVerifier } from '../utils/llmVerifier'
 import type { RouteTracker } from '../utils/routeTracker'
 
@@ -14,6 +14,7 @@ interface TutorialControllerProps {
     onClose: () => void
     onStepChange?: (index: number) => void
     onComplete?: () => void
+    onAdaptiveRecalculate?: () => Promise<boolean> | boolean
     onPageTransitionSteps?: (newSteps: TutorialStep[], newPlanOffset: number) => void
     initialStepIndex?: number
     tutorialFingerprint?: string
@@ -28,11 +29,12 @@ const PAGE_TRANSITION_TIMEOUT_MS = 12000
 const DOM_READY_TIMEOUT_MS = 8000
 const DOM_QUIET_TIMEOUT_MS = 5000
 const DOM_QUIET_WINDOW_MS = 450
-const HARD_RELOAD_ROUTE_KEY = 'siteTutor:lastHardReloadRoute'
+// const HARD_RELOAD_ROUTE_KEY = 'siteTutor:lastHardReloadRoute' // Disabled in manual-only mode
 const INACTIVITY_TIMEOUT_MS = 60000 // 60s inactivity timeout for page transitions
+const MANUAL_VERIFY_ONLY = true
 
 const statusCopy: Record<string, string> = {
-    waiting: 'Waiting for you to complete this step...',
+    waiting: MANUAL_VERIFY_ONLY ? 'Click Verify Step when ready.' : 'Waiting for you to complete this step...',
     matched: 'Great! Moving to the next step...',
     error: 'Something went wrong. Review the error below and retry when ready.',
 }
@@ -79,14 +81,15 @@ const extractInstructionKeywords = (instruction: string): string[] => {
     return Array.from(new Set(filtered)).slice(0, 6)
 }
 
-const routeSignature = (url: string): string => {
-    try {
-        const parsed = new URL(url)
-        return `${parsed.origin}${parsed.pathname}${parsed.search}`
-    } catch {
-        return url.split('#')[0]
-    }
-}
+// Disabled in manual-only mode
+// const routeSignature = (url: string): string => {
+//     try {
+//         const parsed = new URL(url)
+//         return `${parsed.origin}${parsed.pathname}${parsed.search}`
+//     } catch {
+//         return url.split('#')[0]
+//     }
+// }
 
 const waitForDocumentComplete = async (timeoutMs: number = DOM_READY_TIMEOUT_MS): Promise<void> => {
     if (document.readyState === 'complete') return
@@ -158,21 +161,6 @@ const waitForDomQuiet = async (
     })
 }
 
-const scrollToElement = (elementIndex: number): boolean => {
-    const indexer = getIndexer()
-    if (!indexer) return false
-
-    const el = indexer.getElement(elementIndex)
-    if (!el) return false
-
-    try {
-        el.scrollIntoView({ behavior: 'smooth', block: 'center' })
-        return true
-    } catch (err) {
-        console.warn('Failed to scroll to element:', err)
-        return false
-    }
-}
 
 const describeTargetElement = (step: TutorialStep): string => {
     if (step.elementIndex == null) return ''
@@ -220,52 +208,64 @@ const compressScreenshot = async (dataUrl: string): Promise<Blob> => {
 }
 
 const captureScreenshot = async (): Promise<Blob | null> => {
-    // Try desktop capture first
-    try {
-        const resp = await fetch('http://localhost:8000/capture-desktop')
-        if (resp.ok) {
-            const data = await resp.json()
-            const dataUrl = `data:image/png;base64,${data.screenshot}`
-            return await compressScreenshot(dataUrl)
-        }
-    } catch { /* fall through */ }
+    // Import the screenshot helper (dynamic import to avoid circular deps)
+    const { hideSiteTutorUI, restoreSiteTutorUI } = await import('../utils/screenshotHelper')
 
-    // Fallback to Chrome tab capture
-    return new Promise((resolve) => {
-        try {
-            chrome.runtime.sendMessage({ action: 'captureScreen' }, (response) => {
-                if (chrome.runtime.lastError || !response?.dataUrl) {
-                    resolve(null)
-                    return
-                }
-                compressScreenshot(response.dataUrl).then(resolve).catch(() => resolve(null))
-            })
-        } catch {
-            resolve(null)
-        }
-    })
+    // Hide Site Tutor UI before capture
+    const hiddenState = hideSiteTutorUI()
+
+    try {
+        // Wait a frame to ensure UI is hidden
+        await new Promise(resolve => requestAnimationFrame(resolve))
+
+        // Try fast Chrome tab capture first (minimizes visible hide duration).
+        const tabCapture = await new Promise<Blob | null>((resolve) => {
+            try {
+                chrome.runtime.sendMessage({ action: 'captureScreen' }, (response) => {
+                    if (chrome.runtime.lastError || !response?.dataUrl) {
+                        resolve(null)
+                        return
+                    }
+                    compressScreenshot(response.dataUrl).then(resolve).catch(() => resolve(null))
+                })
+            } catch {
+                resolve(null)
+            }
+        })
+        if (tabCapture) return tabCapture
+
+        // No fallback to desktop capture — desktop screenshots include non-browser
+        // content (IDE, terminal, etc.) which confuses the VLM. If captureVisibleTab
+        // failed (e.g. tab not focused), skip VLM for this request.
+        console.warn('📸 [Site Tutor] captureVisibleTab failed; skipping screenshot (no desktop fallback)')
+        return null
+    } finally {
+        // Always restore UI
+        restoreSiteTutorUI(hiddenState)
+    }
 }
 
 /**
+ * DISABLED in manual-only mode
  * Try to resolve the next step's target element on the current page
  * using fuzzy text matching (no backend call needed).
  */
-const tryLocalResolution = (step: TutorialStep): boolean => {
-    const indexer = getIndexer()
-    if (!indexer) return false
-    indexer.indexPage(document)
+// const tryLocalResolution = (step: TutorialStep): boolean => {
+//     const indexer = getIndexer()
+//     if (!indexer) return false
+//     indexer.indexPage(document)
 
-    // Try CSS selector
-    if (step.selector) {
-        try {
-            if (document.querySelector(step.selector)) return true
-        } catch { /* invalid selector */ }
-    }
+//     // Try CSS selector
+//     if (step.selector) {
+//         try {
+//             if (document.querySelector(step.selector)) return true
+//         } catch { /* invalid selector */ }
+//     }
 
-    // Use shared resolver with specificity scoring
-    const resolved = findBestElementByInstructionSync(step.instruction)
-    return resolved !== null
-}
+//     // Use shared resolver with specificity scoring
+//     const resolved = findBestElementByInstructionSync(step.instruction)
+//     return resolved !== null
+// }
 
 
 const TutorialController: React.FC<TutorialControllerProps> = ({
@@ -274,6 +274,7 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
     onClose,
     onStepChange,
     onComplete,
+    onAdaptiveRecalculate,
     onPageTransitionSteps,
     initialStepIndex = 0,
     tutorialFingerprint,
@@ -291,16 +292,18 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
         routeTracker: routeTracker || null
     }))
     const autoAdvanceTimeoutRef = useRef<ReturnType<typeof window.setTimeout> | null>(null)
-    const stepAdvanceTimeoutRef = useRef<ReturnType<typeof window.setTimeout> | null>(null)
     const previousStepIndexRef = useRef(initialStepIndex)
-    const [showStepAdvance, setShowStepAdvance] = useState(false)
 
     // Page transition tracking
     const lastKnownUrlRef = useRef(window.location.href)
-    const transitionInProgressRef = useRef(false)
+    // const transitionInProgressRef = useRef(false) // Disabled in manual-only mode
     const inactivityTimerRef = useRef<ReturnType<typeof window.setTimeout> | null>(null)
     const [showInactivityPrompt, setShowInactivityPrompt] = useState(false)
     const [pollStatus, setPollStatus] = useState<string | null>(null)
+    const [isVerifying, setIsVerifying] = useState(false)
+    const [verifyResult, setVerifyResult] = useState<{ isCorrect: boolean; reason: string } | null>(null)
+    const lastContinueFetchKeyRef = useRef('')
+    const lastContinueFetchAtRef = useRef(0)
 
     const steps = tutorial.steps
     const activeStep: TutorialStep | undefined = steps[currentStepIndex]
@@ -347,36 +350,8 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
         }
     }
 
-    const clearStepAdvanceFlash = () => {
-        if (stepAdvanceTimeoutRef.current) {
-            window.clearTimeout(stepAdvanceTimeoutRef.current)
-            stepAdvanceTimeoutRef.current = null
-        }
-    }
-
     useEffect(() => {
-        let cancelled = false
-
-        queueMicrotask(() => {
-            if (cancelled) return
-            if (currentStepIndex > previousStepIndexRef.current) {
-                setShowStepAdvance(true)
-                clearStepAdvanceFlash()
-                stepAdvanceTimeoutRef.current = window.setTimeout(() => {
-                    setShowStepAdvance(false)
-                    stepAdvanceTimeoutRef.current = null
-                }, 2000)
-            } else if (currentStepIndex < previousStepIndexRef.current) {
-                setShowStepAdvance(false)
-                clearStepAdvanceFlash()
-            }
-
-            previousStepIndexRef.current = currentStepIndex
-        })
-
-        return () => {
-            cancelled = true
-        }
+        previousStepIndexRef.current = currentStepIndex
     }, [currentStepIndex])
 
     // ──────────────────────────────────────────────
@@ -401,7 +376,6 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
                 selector: '',
                 instruction: ps.instruction,
                 actionType: normalizeActionType(ps.actionType, ps.instruction),
-                expectedResult: ps.expectedResult,
                 selectionReason: `Using plan step #${ps.stepNumber} while real targets load for this page.`,
                 isTerminal: Boolean(ps.isTerminal),
                 // No elementIndex yet - will be filled in by backend
@@ -430,6 +404,18 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
         if (!sessionId || !plan || !onPageTransitionSteps) return
 
         try {
+            const fetchKey = `${window.location.href}::${nextGlobalStepIndex}`
+            const now = Date.now()
+            if (
+                lastContinueFetchKeyRef.current === fetchKey &&
+                (now - lastContinueFetchAtRef.current) < 2500
+            ) {
+                console.log(`⏱️ [Site Tutor] Skip duplicate /continue-tutorial fetch | key=${fetchKey}`)
+                return
+            }
+            lastContinueFetchKeyRef.current = fetchKey
+            lastContinueFetchAtRef.current = now
+
             console.log(`🚦 [Site Tutor] Transition fetch start | stepIndex=${nextGlobalStepIndex} | url=${window.location.href}`)
             // Wait for full load and post-load DOM settling before indexing.
             await waitForDocumentComplete()
@@ -441,9 +427,6 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
             if (indexer) {
                 indexer.indexPage(document)
             }
-
-            // Capture fresh screenshot
-            const screenshotBlob = await captureScreenshot()
 
             // Get fresh DOM text with viewport information
             const domText = indexer?.toTextRepresentation(true) ?? ''
@@ -466,8 +449,17 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
                 formData.append('completedStepInstruction', completedStepInstruction)
             }
 
-            if (screenshotBlob) {
-                formData.append('screenshot', screenshotBlob, 'screenshot.jpg')
+            // Capture screenshot for VLM analysis - ensures accurate element targeting
+            try {
+                const screenshotBlob = await captureScreenshot()
+                if (screenshotBlob) {
+                    formData.append('screenshot', screenshotBlob, 'screenshot.png')
+                    console.log('📸 [Site Tutor] Screenshot captured for VLM analysis')
+                } else {
+                    console.warn('📸 [Site Tutor] Screenshot capture failed, proceeding without VLM')
+                }
+            } catch (screenshotError) {
+                console.warn('📸 [Site Tutor] Screenshot error:', screenshotError)
             }
 
             const fetchWithTimeout = async (body: FormData) => {
@@ -488,7 +480,9 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
             console.log(`📡 [Site Tutor] POST /continue-tutorial -> status=${response.status}`)
 
             if (!response.ok) {
-                throw new Error(`Server error: ${response.status}`)
+                const errorText = await response.text().catch(() => '')
+                console.warn(`❌ [Site Tutor] /continue-tutorial error ${response.status}: ${errorText}`)
+                throw new Error(`Server error: ${response.status} ${errorText}`)
             }
 
             const data = await response.json()
@@ -509,8 +503,16 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
                 ))
                 retryForm.append('dom', retryDom)
                 retryForm.append('currentUrl', window.location.href)
-                const retryScreenshot = await captureScreenshot()
-                if (retryScreenshot) retryForm.append('screenshot', retryScreenshot, 'screenshot.jpg')
+                // Capture screenshot for VLM analysis on retry
+                try {
+                    const retryScreenshotBlob = await captureScreenshot()
+                    if (retryScreenshotBlob) {
+                        retryForm.append('screenshot', retryScreenshotBlob, 'screenshot.png')
+                        console.log('📸 [Site Tutor] Screenshot captured for retry VLM analysis')
+                    }
+                } catch (screenshotError) {
+                    console.warn('📸 [Site Tutor] Screenshot error on retry:', screenshotError)
+                }
 
                 const retryResp = await fetchWithTimeout(retryForm)
                 console.log(`📡 [Site Tutor] RETRY /continue-tutorial -> status=${retryResp.status}`)
@@ -521,6 +523,9 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
                         handleNewPageSteps(retryData, nextGlobalStepIndex)
                         return
                     }
+                } else {
+                    const retryError = await retryResp.text().catch(() => '')
+                    console.warn(`❌ [Site Tutor] RETRY /continue-tutorial error ${retryResp.status}: ${retryError}`)
                 }
 
                 // Final fallback: force a full reanalysis cycle and try one last time.
@@ -554,9 +559,15 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
                 if (completedStepInstruction) {
                     finalForm.append('completedStepInstruction', completedStepInstruction)
                 }
-                const finalScreenshot = await captureScreenshot()
-                if (finalScreenshot) {
-                    finalForm.append('screenshot', finalScreenshot, 'screenshot.jpg')
+                // Capture screenshot for VLM analysis on final retry
+                try {
+                    const finalScreenshotBlob = await captureScreenshot()
+                    if (finalScreenshotBlob) {
+                        finalForm.append('screenshot', finalScreenshotBlob, 'screenshot.png')
+                        console.log('📸 [Site Tutor] Screenshot captured for final retry VLM analysis')
+                    }
+                } catch (screenshotError) {
+                    console.warn('📸 [Site Tutor] Screenshot error on final retry:', screenshotError)
                 }
 
                 const finalResp = await fetchWithTimeout(finalForm)
@@ -568,6 +579,9 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
                         handleNewPageSteps(finalData, nextGlobalStepIndex)
                         return
                     }
+                } else {
+                    const finalError = await finalResp.text().catch(() => '')
+                    console.warn(`❌ [Site Tutor] FINAL RETRY /continue-tutorial error ${finalResp.status}: ${finalError}`)
                 }
 
                 // Still nothing - pseudo-steps are already showing, just log.
@@ -603,25 +617,64 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
             .finally(() => setIsLoadingNewPage(false))
     }, [sessionId, plan, onPageTransitionSteps, showPseudoSteps, fetchRealStepsInBackground])
 
-    const handleNewPageSteps = useCallback((data: { currentPageHighlights: Array<{ elementIndex?: number; explanation: string; selector?: string; planStepNumber?: number }>; currentPageRange: { startIndex: number; endIndex: number } }, nextGlobalStepIndex: number) => {
+    const handleNewPageSteps = useCallback((data: { currentPageHighlights: Array<{ elementIndex?: number; explanation: string; selector?: string; planStepNumber?: number; selectionReason?: string }>; currentPageRange: { startIndex: number; endIndex: number } }, nextGlobalStepIndex: number) => {
         const newHighlights = data.currentPageHighlights ?? []
         const pageRange = data.currentPageRange ?? { startIndex: nextGlobalStepIndex, endIndex: nextGlobalStepIndex }
+        const pagePlanSteps = plan?.planSteps.slice(pageRange.startIndex, pageRange.endIndex + 1) ?? []
 
-        // Build new TutorialStep[] from the response
-        const newSteps: TutorialStep[] = newHighlights.map((h, idx) => {
-            const planStepIdx = pageRange.startIndex + idx
-            const planStep = plan?.planSteps[planStepIdx]
-            return {
-                stepNumber: planStep?.stepNumber ?? (planStepIdx + 1),
-                selector: h.selector ?? '',
-                instruction: planStep?.instruction ?? h.explanation,
-                actionType: normalizeActionType(planStep?.actionType, planStep?.instruction ?? h.explanation),
-                expectedResult: planStep?.expectedResult,
-                selectionReason: h.explanation,
-                isTerminal: Boolean(planStep?.isTerminal),
-                elementIndex: h.elementIndex,
+        // Align highlights to plan step numbers first to avoid carrying targets across steps.
+        const normalizedHighlights = newHighlights.map((h) => ({
+            elementIndex: typeof h.elementIndex === 'number' ? h.elementIndex : undefined,
+            explanation: h.explanation ?? '',
+            selector: h.selector ?? '',
+            planStepNumber: typeof h.planStepNumber === 'number' ? h.planStepNumber : undefined,
+            selectionReason: h.selectionReason ?? '',
+        }))
+
+        let newSteps: TutorialStep[] = []
+        if (pagePlanSteps.length > 0) {
+            const validStepNumbers = new Set(pagePlanSteps.map((step) => step.stepNumber))
+            const byStepNumber = new Map<number, typeof normalizedHighlights[number]>()
+            const sequential: typeof normalizedHighlights = []
+
+            for (const highlight of normalizedHighlights) {
+                const stepNumber = highlight.planStepNumber
+                if (typeof stepNumber === 'number' && validStepNumbers.has(stepNumber) && !byStepNumber.has(stepNumber)) {
+                    byStepNumber.set(stepNumber, highlight)
+                } else {
+                    sequential.push(highlight)
+                }
             }
-        })
+
+            let sequentialCursor = 0
+            newSteps = pagePlanSteps.map((planStep) => {
+                const alignedHighlight = byStepNumber.get(planStep.stepNumber) ?? sequential[sequentialCursor++]
+                return {
+                    stepNumber: planStep.stepNumber,
+                    selector: alignedHighlight?.selector ?? '',
+                    instruction: planStep.instruction,
+                    actionType: normalizeActionType(planStep.actionType, planStep.instruction),
+                    selectionReason: alignedHighlight?.selectionReason || alignedHighlight?.explanation || '',
+                    isTerminal: Boolean(planStep.isTerminal),
+                    elementIndex: alignedHighlight?.elementIndex,
+                }
+            })
+        } else {
+            // Fallback if plan context is unavailable.
+            newSteps = normalizedHighlights.map((h, idx) => {
+                const planStepIdx = pageRange.startIndex + idx
+                const planStep = plan?.planSteps[planStepIdx]
+                return {
+                    stepNumber: planStep?.stepNumber ?? (planStepIdx + 1),
+                    selector: h.selector ?? '',
+                    instruction: planStep?.instruction ?? h.explanation,
+                    actionType: normalizeActionType(planStep?.actionType, planStep?.instruction ?? h.explanation),
+                    selectionReason: h.selectionReason || h.explanation,
+                    isTerminal: Boolean(planStep?.isTerminal),
+                    elementIndex: h.elementIndex,
+                }
+            })
+        }
 
         console.log(`[Site Tutor] Page transition: ${newSteps.length} steps for new page (range ${pageRange.startIndex}-${pageRange.endIndex})`)
 
@@ -632,9 +685,16 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
     }, [plan, onPageTransitionSteps])
 
     // ──────────────────────────────────────────────
-    // URL change detection for multi-page plans (polls + popstate)
+    // URL change detection DISABLED - Everything is manual via "Verify Step" button
+    // Track current URL for AI context but don't auto-trigger transitions
     // ──────────────────────────────────────────────
     useEffect(() => {
+        // Update the tracked URL but don't trigger any automatic actions
+        lastKnownUrlRef.current = window.location.href
+
+        // DISABLED: Automatic page transition detection - everything is manual now
+        // The code below is commented out to prevent automatic URL change handling
+        /*
         if (!plan || !sessionId || !onPageTransitionSteps) return
 
         const parseUrl = (value: string): URL | null => {
@@ -742,6 +802,7 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
             window.removeEventListener('siteTutor:pageChanged', handleNavEvent)
             document.removeEventListener('siteTutor:historyChange', handleNavEvent)
         }
+        */
     }, [plan, sessionId, onPageTransitionSteps, planOffset, currentStepIndex, activeStep, steps, isLoadingNewPage, handlePageTransition])
 
     // ──────────────────────────────────────────────
@@ -753,6 +814,29 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
         const isTerminalByPlan = Boolean(plan && completedGlobalIndex >= Math.max(plan.totalSteps - 1, 0))
         const shouldCompleteNow = Boolean(completedStep?.isTerminal || isTerminalByPlan)
         const hasMorePlanSteps = Boolean(plan && (planOffset + totalSteps) < plan.totalSteps)
+        const hasAdaptiveRecalculate = Boolean(!plan && onAdaptiveRecalculate)
+
+        if (currentStepIndex === totalSteps - 1 && hasAdaptiveRecalculate) {
+            clearAutoAdvance()
+            if (isLoadingNewPage) return
+            setIsLoadingNewPage(true)
+            setStatus('waiting')
+            Promise.resolve(onAdaptiveRecalculate?.())
+                .then((updated) => {
+                    if (!updated) {
+                        setStatus('matched')
+                        onComplete?.()
+                    }
+                })
+                .catch((error) => {
+                    console.warn('[Site Tutor] Adaptive recalculation failed:', error)
+                    setStatus('error')
+                })
+                .finally(() => {
+                    setIsLoadingNewPage(false)
+                })
+            return
+        }
 
         if (shouldCompleteNow) {
             clearAutoAdvance()
@@ -761,8 +845,8 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
             return
         }
 
-        // If we exhausted local steps but still have remaining plan steps on the same page,
-        // fetch the next segment immediately instead of waiting for a URL transition.
+        // DISABLED: Automatic page transition handling - everything is manual via "Verify Step"
+        // User must manually verify each step to progress through the tutorial
         if (currentStepIndex === totalSteps - 1 && hasMorePlanSteps && plan) {
             const currentPlanStep = plan.planSteps[completedGlobalIndex]
             if (currentPlanStep?.expectsPageChange) {
@@ -771,9 +855,9 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
                 return
             }
 
+            // Don't automatically fetch next steps - user must verify manually
             clearAutoAdvance()
-            setStatus('matched')
-            void handlePageTransition(completedGlobalIndex + 1, completedStep?.instruction)
+            setStatus('waiting')
             return
         }
 
@@ -791,7 +875,7 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
             }
             return nextIndex
         })
-    }, [currentStepIndex, handlePageTransition, onComplete, plan, planOffset, steps, totalSteps])
+    }, [currentStepIndex, handlePageTransition, isLoadingNewPage, onAdaptiveRecalculate, onComplete, plan, planOffset, steps, totalSteps])
 
     const cancelTutorial = useCallback(() => {
         setError(null)
@@ -825,7 +909,9 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
         setError(null)
         setIsPaused(false)
         setStatus('waiting')
+        setVerifyResult(null)
         clearAutoAdvance()
+        verifierRef.current?.stopWatching()
 
         // Re-index the page to handle DOM changes between steps
         const indexer = getIndexer()
@@ -833,31 +919,8 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
             indexer.indexPage(document)
         }
 
-        // Auto-scroll if step requires it or if element is below fold
-        if (activeStep.actionType === 'scroll' && activeStep.scrollTarget != null) {
-            scrollToElement(activeStep.scrollTarget)
-            // Wait for scroll to complete before watching
-            setTimeout(() => {
-                verifierRef.current?.watchStep(activeStep, getWatchStepOptions())
-            }, 500)
+        if (MANUAL_VERIFY_ONLY) {
             return
-        }
-
-        // Check if target element is below scroll and auto-scroll if needed
-        if (activeStep.elementIndex != null) {
-            const targetEl = indexer?.getElement(activeStep.elementIndex)
-            if (targetEl) {
-                const rect = targetEl.getBoundingClientRect()
-                if (rect.bottom > window.innerHeight) {
-                    // Element is below fold, scroll to it
-                    scrollToElement(activeStep.elementIndex)
-                    // Wait for scroll to complete before watching
-                    setTimeout(() => {
-                        verifierRef.current?.watchStep(activeStep, getWatchStepOptions())
-                    }, 500)
-                    return
-                }
-            }
         }
 
         verifierRef.current?.watchStep(activeStep, getWatchStepOptions())
@@ -913,12 +976,18 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
     // Page/DOM change detection (works for ALL tutorials, even without a plan)
     // When the page shifts, re-index the DOM and restart the step watcher
     // so the verifier can find target elements on the new page.
+    // NOTE: We ONLY listen to 'siteTutor:historyChange' here to avoid conflicting
+    // with the URL change detection handler above (which listens to 'siteTutor:pageChanged').
+    // This prevents duplicate event handling and glitching.
     // ──────────────────────────────────────────────
     useEffect(() => {
         if (!activeStep) return
+        if (MANUAL_VERIFY_ONLY) return
+        // Skip this handler when we have a plan - the URL change handler above handles it
+        if (plan && sessionId && onPageTransitionSteps) return
 
         const handlePageShift = () => {
-            console.log('[Site Tutor] Page shift detected, re-indexing and restarting watcher')
+            console.log('[Site Tutor] Page shift detected (no plan), re-indexing and restarting watcher')
             const indexer = getIndexer()
             if (indexer) {
                 indexer.indexPage(document)
@@ -931,20 +1000,102 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
             }, 400)
         }
 
-        window.addEventListener('siteTutor:pageChanged', handlePageShift)
+        // Only listen to history changes, not the comprehensive pageChanged event
+        // to avoid conflicts with the URL transition handler
         document.addEventListener('siteTutor:historyChange', handlePageShift)
 
         return () => {
-            window.removeEventListener('siteTutor:pageChanged', handlePageShift)
             document.removeEventListener('siteTutor:historyChange', handlePageShift)
         }
-    }, [activeStep, startWatchingStep])
+    }, [activeStep, startWatchingStep, plan, sessionId, onPageTransitionSteps])
 
     const retryStep = useCallback(() => {
         setError(null)
         setIsPaused(false)
         startWatchingStep()
     }, [startWatchingStep])
+
+    const verifyCurrentStep = useCallback(async () => {
+        if (!activeStep || isVerifying) return
+
+        setIsVerifying(true)
+        setVerifyResult(null)
+        verifierRef.current?.stopWatching()
+
+        try {
+            // Check if URL has changed - if so, re-index the NEW page's DOM
+            const currentUrl = window.location.href
+            const urlChanged = currentUrl !== lastKnownUrlRef.current
+
+            if (urlChanged) {
+                console.log(`🔄 [Site Tutor] URL changed: ${lastKnownUrlRef.current} → ${currentUrl}`)
+                console.log('📋 [Site Tutor] Re-indexing DOM for new page...')
+
+                // Update tracked URL
+                lastKnownUrlRef.current = currentUrl
+
+                // Re-index the new page to clear old DOM and get fresh elements
+                const indexer = getIndexer()
+                if (indexer) {
+                    indexer.indexPage(document)
+                    console.log('✅ [Site Tutor] DOM re-indexed for new page')
+                }
+            }
+
+            // Capture screenshot
+            const screenshotBlob = await captureScreenshot()
+            let screenshotBase64: string | undefined
+            if (screenshotBlob) {
+                screenshotBase64 = await new Promise<string>((resolve) => {
+                    const reader = new FileReader()
+                    reader.onloadend = () => {
+                        const dataUrl = reader.result as string
+                        resolve(dataUrl.split(',')[1]) // strip data:...;base64, prefix
+                    }
+                    reader.readAsDataURL(screenshotBlob)
+                })
+            }
+
+            // Get current DOM (fresh from new page if URL changed)
+            const indexer = getIndexer()
+            const domText = indexer?.toTextRepresentation(true) ?? ''
+
+            if (urlChanged) {
+                console.log(`📤 [Site Tutor] Sending fresh DOM (${domText.length} chars) from new page`)
+            }
+
+            const response = await fetch('http://localhost:8000/verify', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    stepInstruction: activeStep.instruction,
+                    screenshot: screenshotBase64,
+                    dom: domText,
+                    clickedElement: '',
+                    currentUrl: window.location.href,  // Send current URL so AI knows where user is
+                    sessionId: sessionId ?? undefined,
+                }),
+            })
+
+            const data = await response.json()
+            setVerifyResult({ isCorrect: data.isCorrect, reason: data.reason })
+
+            if (data.isCorrect) {
+                // Step verified — auto-advance after a short delay
+                setStatus('matched')
+                clearAutoAdvance()
+                autoAdvanceTimeoutRef.current = window.setTimeout(() => {
+                    setVerifyResult(null)
+                    goToNextStep()
+                }, 1500)
+            }
+        } catch (err) {
+            console.error('[Site Tutor] Verify step failed:', err)
+            setVerifyResult({ isCorrect: false, reason: 'Verification request failed. Is the backend running?' })
+        } finally {
+            setIsVerifying(false)
+        }
+    }, [activeStep, isVerifying, goToNextStep])
 
     useEffect(() => {
         let cancelled = false
@@ -965,7 +1116,6 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
     useEffect(() => () => {
         verifierRef.current?.stopWatching()
         clearAutoAdvance()
-        clearStepAdvanceFlash()
         if (inactivityTimerRef.current) window.clearTimeout(inactivityTimerRef.current)
     }, [])
 
@@ -990,13 +1140,6 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
                     <X size={18} />
                 </button>
             </div>
-
-            {showStepAdvance && !isLoadingNewPage && (
-                <div className="step-advance-notification" aria-live="polite">
-                    <Sparkles size={16} />
-                    <span>Next step ready! Follow the on-page highlight.</span>
-                </div>
-            )}
 
             {activeStep ? (
                 <>
@@ -1024,36 +1167,79 @@ const TutorialController: React.FC<TutorialControllerProps> = ({
                             )}
                         </div>
                         <p className="step-instruction">{activeStep.instruction}</p>
-                        {activeStep.expectedResult && (
-                            <p className="step-expected">
-                                Expected result: <span className="step-expected-value">{activeStep.expectedResult}</span>
-                            </p>
-                        )}
                         {activeStep.elementIndex != null && (
                             <div className="step-selector">
                                 Target: <code>{describeTargetElement(activeStep)}</code>
                             </div>
                         )}
-                        <div className="step-selector" style={{ marginTop: '10px', opacity: 0.9 }}>
-                            <strong>Selection logic:</strong>{' '}
-                            {activeStep.selectionReason || 'No backend explanation provided for this step.'}
-                            <br />
-                            <span>
-                                Keywords: {extractInstructionKeywords(activeStep.instruction).join(', ') || 'none'}
-                            </span>
-                            <br />
-                            <span>
-                                Control type: {activeStep.actionType}
-                            </span>
-                            {activeStep.selector && (
-                                <>
-                                    <br />
-                                    <span>
-                                        Fallback selector: <code>{activeStep.selector}</code>
-                                    </span>
-                                </>
+                        <details className="step-selector" style={{ marginTop: '10px', opacity: 0.92 }}>
+                            <summary style={{ cursor: 'pointer', fontWeight: 600 }}>
+                                Why this target?
+                            </summary>
+                            <div style={{ marginTop: '6px' }}>
+                                {activeStep.selectionReason || 'No backend explanation provided for this step.'}
+                                <br />
+                                <span>
+                                    Keywords: {extractInstructionKeywords(activeStep.instruction).join(', ') || 'none'}
+                                </span>
+                                <br />
+                                <span>
+                                    Control type: {activeStep.actionType}
+                                </span>
+                                {activeStep.selector && (
+                                    <>
+                                        <br />
+                                        <span>
+                                            Fallback selector: <code>{activeStep.selector}</code>
+                                        </span>
+                                    </>
+                                )}
+                            </div>
+                        </details>
+                    </div>
+
+                    {/* Verify Step button + result */}
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                        <button
+                            onClick={verifyCurrentStep}
+                            disabled={isVerifying}
+                            style={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'center',
+                                gap: '6px',
+                                padding: '8px 16px',
+                                borderRadius: '8px',
+                                border: '1px solid #3b82f6',
+                                background: isVerifying ? '#1e3a5f' : '#2563eb',
+                                color: '#fff',
+                                fontWeight: 600,
+                                fontSize: '13px',
+                                cursor: isVerifying ? 'not-allowed' : 'pointer',
+                                opacity: isVerifying ? 0.7 : 1,
+                                transition: 'all 0.15s ease',
+                            }}
+                        >
+                            {isVerifying ? (
+                                <><Loader2 size={14} className="animate-spin" /> Verifying...</>
+                            ) : (
+                                <><ScanSearch size={14} /> Verify Step</>
                             )}
-                        </div>
+                        </button>
+
+                        {verifyResult && (
+                            <div style={{
+                                padding: '8px 12px',
+                                borderRadius: '8px',
+                                border: `1px solid ${verifyResult.isCorrect ? '#22c55e' : '#ef4444'}`,
+                                background: verifyResult.isCorrect ? 'rgba(34,197,94,0.1)' : 'rgba(239,68,68,0.1)',
+                                fontSize: '12px',
+                                color: verifyResult.isCorrect ? '#86efac' : '#fca5a5',
+                            }}>
+                                <strong>{verifyResult.isCorrect ? '✓ Step completed!' : '✗ Not yet complete'}</strong>
+                                {verifyResult.reason && <p style={{ margin: '4px 0 0', opacity: 0.85 }}>{verifyResult.reason}</p>}
+                            </div>
+                        )}
                     </div>
 
                     {showInactivityPrompt && (
