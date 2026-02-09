@@ -33,6 +33,7 @@ class Session:
     created_at: datetime = field(default_factory=datetime.now)
     last_activity: datetime = field(default_factory=datetime.now)
     tutorial_plan: Optional[TutorialPlanState] = None
+    last_verified_url: Optional[str] = None
 
     def add_message(self, role: str, text: str, screenshot: Optional[Image.Image] = None):
         """Add a message to the session history"""

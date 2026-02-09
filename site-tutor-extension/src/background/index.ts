@@ -130,6 +130,9 @@ const requestDomReanalysis = async (
 // Background service worker
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     // Screenshot capture for VLM integration
+    // NOTE: captureVisibleTab automatically captures ONLY the viewport content,
+    // excluding browser chrome (tab bar, address bar, bookmarks, etc.)
+    // The content script hides Site Tutor UI before requesting the screenshot
     if (request.type === 'CAPTURE_SCREENSHOT' || request.action === 'captureScreen') {
         chrome.tabs.captureVisibleTab(
             { format: 'png' },

@@ -20,7 +20,7 @@ const buildCompactLabel = (explanation: string): string => {
 
     const quoted = raw.match(/"([^"]+)"/)?.[1] || raw.match(/'([^']+)'/)?.[1]
     if (quoted && quoted.trim()) {
-        return quoted.trim().slice(0, 72)
+        return quoted.trim().slice(0, 56)
     }
 
     const cleaned = raw
@@ -30,7 +30,7 @@ const buildCompactLabel = (explanation: string): string => {
         .trim()
 
     const candidate = cleaned || raw
-    return candidate.slice(0, 72)
+    return candidate.slice(0, 56)
 }
 
 const findButtonLikeElements = (explanation: string): Element[] => {
@@ -689,9 +689,11 @@ const Overlay: React.FC<OverlayProps> = ({ highlights, currentStepIndex }) => {
                                     top: labelTop,
                                     left: labelLeft - rect.left,
                                     maxWidth: labelMaxWidth,
-                                    whiteSpace: 'normal',
-                                    overflowWrap: 'anywhere',
-                                    wordBreak: 'break-word',
+                                    minWidth: isGuidedStep ? 140 : 110,
+                                    width: 'max-content',
+                                    whiteSpace: 'nowrap',
+                                    overflow: 'hidden',
+                                    textOverflow: 'ellipsis',
                                     transform: placeAbove ? 'translateY(-100%)' : 'none',
                                 }}
                             >

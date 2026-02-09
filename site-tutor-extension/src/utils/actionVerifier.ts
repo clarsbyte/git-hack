@@ -732,9 +732,6 @@ export class ActionVerifier {
         }
 
         try {
-            // Capture fresh screenshot for verification
-            const screenshotData = await this.captureScreenshot()
-
             // Get current DOM index
             const indexer = getIndexer()
             let domText = ""
@@ -750,9 +747,6 @@ export class ActionVerifier {
             formData.append('clickedElement', clickedElement.textContent?.trim() || clickedElement.tagName)
             if (domText) {
                 formData.append('dom', domText)
-            }
-            if (screenshotData) {
-                formData.append('screenshot', screenshotData)
             }
 
             const response = await fetch('http://localhost:8000/verify', {
@@ -774,27 +768,6 @@ export class ActionVerifier {
                 confidence: 0.5,
                 reason: 'Verification unavailable, accepting action'
             }
-        }
-    }
-
-    private async captureScreenshot(): Promise<Blob | null> {
-        try {
-            // Use Chrome API to capture current tab
-            return new Promise((resolve) => {
-                chrome.runtime.sendMessage({ action: 'captureScreen' }, (response) => {
-                    if (response?.dataUrl) {
-                        // Convert data URL to blob
-                        fetch(response.dataUrl)
-                            .then(res => res.blob())
-                            .then(blob => resolve(blob))
-                            .catch(() => resolve(null))
-                    } else {
-                        resolve(null)
-                    }
-                })
-            })
-        } catch {
-            return null
         }
     }
 

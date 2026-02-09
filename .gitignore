@@ -18,3 +18,5 @@ node_modules/
 
 backend/.env
 backend/.env.*
+
+# backend/debug/vlm_detections/

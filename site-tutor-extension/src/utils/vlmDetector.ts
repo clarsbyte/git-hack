@@ -60,25 +60,39 @@ interface CacheEntry {
 const vlmCache = new Map<string, CacheEntry>()
 
 /**
- * Capture screenshot of current viewport
+ * Capture screenshot of current viewport (with Site Tutor UI hidden)
  */
 async function captureScreenshot(): Promise<string> {
-    return new Promise((resolve, reject) => {
-        chrome.runtime.sendMessage(
-            { type: 'CAPTURE_SCREENSHOT' },
-            (response) => {
-                if (chrome.runtime.lastError) {
-                    reject(chrome.runtime.lastError)
-                    return
+    // Import the screenshot helper (dynamic import to avoid circular deps)
+    const { hideSiteTutorUI, restoreSiteTutorUI } = await import('./screenshotHelper')
+
+    // Hide Site Tutor UI before capture
+    const hiddenState = hideSiteTutorUI()
+
+    try {
+        // Wait a frame to ensure UI is hidden
+        await new Promise(resolve => requestAnimationFrame(resolve))
+
+        return new Promise((resolve, reject) => {
+            chrome.runtime.sendMessage(
+                { type: 'CAPTURE_SCREENSHOT' },
+                (response) => {
+                    if (chrome.runtime.lastError) {
+                        reject(chrome.runtime.lastError)
+                        return
+                    }
+                    if (response && response.screenshot) {
+                        resolve(response.screenshot)
+                    } else {
+                        reject(new Error('Failed to capture screenshot'))
+                    }
                 }
-                if (response && response.screenshot) {
-                    resolve(response.screenshot)
-                } else {
-                    reject(new Error('Failed to capture screenshot'))
-                }
-            }
-        )
-    })
+            )
+        })
+    } finally {
+        // Always restore UI
+        restoreSiteTutorUI(hiddenState)
+    }
 }
 
 /**

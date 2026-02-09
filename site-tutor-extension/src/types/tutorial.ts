@@ -37,6 +37,7 @@ export interface PlanHighlight {
     explanation: string
     selector?: string
     planStepNumber?: number
+    selectionReason?: string
 }
 
 // Full high-level plan returned by the backend

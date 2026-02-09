@@ -118,6 +118,26 @@ export class ElementIndexer {
         return rect.width > 0 && rect.height > 0
     }
 
+    private getViewportOriginInScreenCssPx(): { x: number; y: number } {
+        // Approximate the top-left of the content viewport in screen CSS pixels.
+        // This lets us project DOM rects into full-screen desktop capture space.
+        const horizontalChrome = Math.max(0, window.outerWidth - window.innerWidth)
+        const verticalChrome = Math.max(0, window.outerHeight - window.innerHeight)
+        const viewportScreenX = window.screenX + (horizontalChrome / 2)
+        const viewportScreenY = window.screenY + verticalChrome
+        return { x: viewportScreenX, y: viewportScreenY }
+    }
+
+    private getScreenBBox(rect: DOMRect): { x: number; y: number; width: number; height: number } {
+        const dpr = Math.max(1, window.devicePixelRatio || 1)
+        const origin = this.getViewportOriginInScreenCssPx()
+        const x = Math.round((origin.x + rect.left) * dpr)
+        const y = Math.round((origin.y + rect.top) * dpr)
+        const width = Math.max(0, Math.round(rect.width * dpr))
+        const height = Math.max(0, Math.round(rect.height * dpr))
+        return { x, y, width, height }
+    }
+
     getElement(index: number): HTMLElement | null {
         const el = this.elementMap.get(index)
         if (!el) return null
@@ -196,6 +216,20 @@ export class ElementIndexer {
             const rolePath = this.getRolePath(el)
             if (rolePath) {
                 parts.push(`role-path="${rolePath}"`)
+            }
+
+            // Add viewport-relative bounding box to support VLM->DOM IoU matching.
+            if (this.metadata.has(index)) {
+                const meta = this.metadata.get(index)!
+                const x = Math.max(0, Math.round(meta.rect.left))
+                const y = Math.max(0, Math.round(meta.rect.top))
+                const width = Math.max(0, Math.round(meta.rect.width))
+                const height = Math.max(0, Math.round(meta.rect.height))
+                parts.push(`bbox="${x},${y},${width},${height}"`)
+
+                // Desktop/screen-space box in physical pixels for full-screen captures.
+                const screenBox = this.getScreenBBox(meta.rect)
+                parts.push(`screen-bbox="${screenBox.x},${screenBox.y},${screenBox.width},${screenBox.height}"`)
             }
 
             // Add position hint (page location)
