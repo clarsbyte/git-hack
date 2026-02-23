@@ -1,7 +1,7 @@
 {
   "name": "site-tutor-extension",
   "private": true,
-  "version": "0.0.130",
+  "version": "0.0.132",
   "type": "module",
   "scripts": {
     "dev": "vite",

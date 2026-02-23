@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react'
+import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import type { ElementIndexer } from '../utils/elementIndexer'
 import { elementMatchesInstruction, findBestElementByInstructionSync } from '../utils/stepElementResolver'
@@ -500,17 +500,21 @@ const findContainerElement = (el: Element): Element => {
 const Overlay: React.FC<OverlayProps> = ({ highlights, currentStepIndex }) => {
     const [expandedHighlights, setExpandedHighlights] = useState<Array<{ highlight: Highlight; rect: DOMRect }>>([])
 
-    const updateRects = useCallback(() => {
-        const newExpandedHighlights: Array<{ highlight: Highlight; rect: DOMRect }> = []
+    // Cache resolved elements so DOM mutations only update positions, not re-resolve targets
+    const resolvedElementsRef = useRef<Array<{ highlight: Highlight; element: Element }>>([])
+    // Track which step+highlights combo we last resolved for
+    const resolvedKeyRef = useRef<string>('')
 
+    // Resolve which elements to highlight — only runs when step or highlights change
+    const resolveElements = useCallback(() => {
         const relevantHighlights = typeof currentStepIndex === 'number'
             ? highlights[currentStepIndex]
                 ? [highlights[currentStepIndex]]
                 : []
             : highlights
 
-        // Get shared element indexer
         const indexer = (window as typeof window & { __siteTutorElementIndexer?: ElementIndexer }).__siteTutorElementIndexer
+        const resolved: Array<{ highlight: Highlight; element: Element }> = []
 
         relevantHighlights.forEach(h => {
             try {
@@ -539,24 +543,17 @@ const Overlay: React.FC<OverlayProps> = ({ highlights, currentStepIndex }) => {
                         const elements = isGuidedStep ? [matches[0]] : Array.from(matches)
                         elements.forEach((matchEl, idx) => {
                             const targetElement = findContainerElement(matchEl)
-                            const rect = targetElement.getBoundingClientRect()
-                            const style = window.getComputedStyle(targetElement)
-                            if (rect.width > 0 && rect.height > 0 &&
-                                style.display !== 'none' &&
-                                style.visibility !== 'hidden' &&
-                                style.opacity !== '0') {
-                                newExpandedHighlights.push({
-                                    highlight: {
-                                        ...h,
-                                        explanation: (!isGuidedStep && matches.length > 1)
-                                            ? `${h.explanation} (${idx + 1})`
-                                            : h.explanation
-                                    },
-                                    rect
-                                })
-                            }
+                            resolved.push({
+                                highlight: {
+                                    ...h,
+                                    explanation: (!isGuidedStep && matches.length > 1)
+                                        ? `${h.explanation} (${idx + 1})`
+                                        : h.explanation
+                                },
+                                element: targetElement
+                            })
                         })
-                        return // Already added highlights via selector
+                        return // Already added via selector
                     }
 
                     // Simplified selector fallback
@@ -580,8 +577,8 @@ const Overlay: React.FC<OverlayProps> = ({ highlights, currentStepIndex }) => {
                 }
 
                 if (!el) {
-                    const resolved = findBestElementByInstructionSync(h.explanation)
-                    if (resolved) el = resolved
+                    const found = findBestElementByInstructionSync(h.explanation)
+                    if (found) el = found
                 }
 
                 if (!el) {
@@ -590,14 +587,7 @@ const Overlay: React.FC<OverlayProps> = ({ highlights, currentStepIndex }) => {
                 }
 
                 if (el) {
-                    const targetElement = findContainerElement(el)
-                    const rect = targetElement.getBoundingClientRect()
-                    const style = window.getComputedStyle(targetElement)
-                    if (rect.width > 0 && rect.height > 0 &&
-                        style.display !== 'none' &&
-                        style.visibility !== 'hidden') {
-                        newExpandedHighlights.push({ highlight: h, rect })
-                    }
+                    resolved.push({ highlight: h, element: findContainerElement(el) })
                 } else {
                     console.warn(`Site Tutor: Could not find element`, {
                         explanation: h.explanation,
@@ -612,8 +602,48 @@ const Overlay: React.FC<OverlayProps> = ({ highlights, currentStepIndex }) => {
             }
         })
 
-        setExpandedHighlights(newExpandedHighlights)
+        resolvedElementsRef.current = resolved
     }, [highlights, currentStepIndex])
+
+    // Update rects from cached resolved elements — runs on scroll/resize/mutation
+    const updateRects = useCallback(() => {
+        const newExpandedHighlights: Array<{ highlight: Highlight; rect: DOMRect }> = []
+
+        resolvedElementsRef.current.forEach(({ highlight, element }) => {
+            // Skip elements that have been removed from the DOM
+            if (!element.isConnected) return
+
+            const rect = element.getBoundingClientRect()
+            const style = window.getComputedStyle(element)
+            if (rect.width > 0 && rect.height > 0 &&
+                style.display !== 'none' &&
+                style.visibility !== 'hidden' &&
+                style.opacity !== '0') {
+                newExpandedHighlights.push({ highlight, rect })
+            }
+        })
+
+        setExpandedHighlights(newExpandedHighlights)
+    }, [])
+
+    // Re-resolve elements when step or highlights change
+    useEffect(() => {
+        const key = `${currentStepIndex}-${highlights.map(h => `${h.elementIndex}:${h.selector}`).join(',')}`
+        if (key === resolvedKeyRef.current) return
+        resolvedKeyRef.current = key
+
+        // Clear stale highlights immediately to prevent wrong element flash
+        resolvedElementsRef.current = []
+        setExpandedHighlights([])
+
+        // Give DOM a moment to settle after user action before resolving new step
+        const timeoutId = setTimeout(() => {
+            resolveElements()
+            updateRects()
+        }, 150)
+
+        return () => clearTimeout(timeoutId)
+    }, [highlights, currentStepIndex, resolveElements, updateRects])
 
     useEffect(() => {
         const timeoutId = setTimeout(updateRects, 100)
@@ -630,6 +660,7 @@ const Overlay: React.FC<OverlayProps> = ({ highlights, currentStepIndex }) => {
         window.addEventListener('resize', handleResize)
         window.addEventListener('scroll', handleScroll, { capture: true, passive: true })
 
+        // MutationObserver only updates positions of already-resolved elements
         const observer = new MutationObserver(() => {
             setTimeout(updateRects, 50)
         })

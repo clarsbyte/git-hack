@@ -1139,7 +1139,7 @@ api_key = os.getenv("CEREBRAS_API_KEY")
 if not api_key:
     print("WARNING: CEREBRAS_API_KEY not found in environment variables.")
 
-model_name = "llama-3.3-70b";
+model_name = "gpt-oss-120b"
 max_output_tokens = int(os.getenv("CEREBRAS_MAX_TOKENS", "4096"))
 request_timeout = float(os.getenv("CEREBRAS_TIMEOUT", "60"))
 
@@ -3655,6 +3655,9 @@ Respond ONLY with valid JSON:
                 stream=False,
             )
             raw_text = extract_cerebras_message(response)
+
+        if not raw_text or not raw_text.strip():
+            raise ValueError("Empty response from LLM during verification")
 
         # Parse JSON response
         try:

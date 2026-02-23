@@ -1,0 +1,79 @@
+{
+  "timestamp": "20260223_032207_514",
+  "session_id": "c8549949-aa03-4536-ba34-167bb0de9f93",
+  "query": "how to integrate google sheets api",
+  "raw_detections": [
+    {
+      "label": "APIs and services quick access card",
+      "confidence": 0.85,
+      "bbox": {
+        "x": 0.1547,
+        "y": 0.6813,
+        "width": 0.1306,
+        "height": 0.0773
+      },
+      "bbox_absolute": {
+        "x": 264,
+        "y": 634,
+        "width": 222,
+        "height": 72
+      }
+    }
+  ],
+  "filtered_detections": [
+    {
+      "label": "APIs and services quick access card",
+      "confidence": 0.85,
+      "bbox": {
+        "x": 0.1547,
+        "y": 0.6813,
+        "width": 0.1306,
+        "height": 0.0773
+      },
+      "bbox_absolute": {
+        "x": 264,
+        "y": 634,
+        "width": 222,
+        "height": 72
+      }
+    }
+  ],
+  "diagnostics": {
+    "query": "how to integrate google sheets api",
+    "raw_detection_count": 1,
+    "filtered_detection_count": 1,
+    "parse": {
+      "mode": "fenced_json",
+      "json_candidate_count": 3,
+      "json_error": null
+    },
+    "filter": {
+      "raw_count": 1,
+      "kept_count": 1,
+      "dropped_count": 0,
+      "dropped_by_limit": 0,
+      "drop_reasons": {
+        "empty_label": 0,
+        "generic_label": 0,
+        "ui_artifact_label": 0,
+        "invalid_confidence": 0,
+        "out_of_range_confidence": 0,
+        "low_confidence": 0,
+        "invalid_box_size": 0,
+        "negative_coords": 0,
+        "out_of_bounds_box": 0,
+        "area_out_of_range": 0
+      },
+      "rejected_samples": [],
+      "intent_generic_label_fallback": true
+    },
+    "thresholds": {
+      "min_confidence": 0.55,
+      "min_relative_area": 0.0002,
+      "max_relative_area": 0.8,
+      "max_detections": 8
+    },
+    "raw_response_preview": "```json\n{\n  \"detections\": [\n    {\n      \"label\": \"APIs and services quick access card\",\n      \"bbox\": [264, 635, 487, 707],\n      \"confidence\": 0.85\n    }\n  ]\n}\n```"
+  },
+  "vlm_response": "```json\n{\n  \"detections\": [\n    {\n      \"label\": \"APIs and services quick access card\",\n      \"bbox\": [264, 635, 487, 707],\n      \"confidence\": 0.85\n    }\n  ]\n}\n```"
+}

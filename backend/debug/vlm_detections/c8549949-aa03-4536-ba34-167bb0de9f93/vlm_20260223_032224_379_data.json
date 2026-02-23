@@ -1,0 +1,79 @@
+{
+  "timestamp": "20260223_032224_379",
+  "session_id": "c8549949-aa03-4536-ba34-167bb0de9f93",
+  "query": "goal=\"how to integrate google sheets api\"; previous_step=\"Click the navigation menu button\"; current_url=\"https://console.cloud.google.com/welcome?project=helixdbhack\"",
+  "raw_detections": [
+    {
+      "label": "APIs and services menu item",
+      "confidence": 0.95,
+      "bbox": {
+        "x": 0.0,
+        "y": 0.4367,
+        "width": 0.1324,
+        "height": 0.0322
+      },
+      "bbox_absolute": {
+        "x": 0,
+        "y": 407,
+        "width": 226,
+        "height": 30
+      }
+    }
+  ],
+  "filtered_detections": [
+    {
+      "label": "APIs and services menu item",
+      "confidence": 0.95,
+      "bbox": {
+        "x": 0.0,
+        "y": 0.4367,
+        "width": 0.1324,
+        "height": 0.0322
+      },
+      "bbox_absolute": {
+        "x": 0,
+        "y": 407,
+        "width": 226,
+        "height": 30
+      }
+    }
+  ],
+  "diagnostics": {
+    "query": "goal=\"how to integrate google sheets api\"; previous_step=\"Click the navigation menu button\"; current_url=\"https://console.cloud.google.com/welcome?project=helixdbhack\"",
+    "raw_detection_count": 1,
+    "filtered_detection_count": 1,
+    "parse": {
+      "mode": "fenced_json",
+      "json_candidate_count": 3,
+      "json_error": null
+    },
+    "filter": {
+      "raw_count": 1,
+      "kept_count": 1,
+      "dropped_count": 0,
+      "dropped_by_limit": 0,
+      "drop_reasons": {
+        "empty_label": 0,
+        "generic_label": 0,
+        "ui_artifact_label": 0,
+        "invalid_confidence": 0,
+        "out_of_range_confidence": 0,
+        "low_confidence": 0,
+        "invalid_box_size": 0,
+        "negative_coords": 0,
+        "out_of_bounds_box": 0,
+        "area_out_of_range": 0
+      },
+      "rejected_samples": [],
+      "intent_generic_label_fallback": true
+    },
+    "thresholds": {
+      "min_confidence": 0.55,
+      "min_relative_area": 0.0002,
+      "max_relative_area": 0.8,
+      "max_detections": 8
+    },
+    "raw_response_preview": "```json\n{\n  \"detections\": [\n    {\n      \"label\": \"APIs and services menu item\",\n      \"bbox\": [0, 407, 226, 437],\n      \"confidence\": 0.95\n    }\n  ]\n}\n```"
+  },
+  "vlm_response": "```json\n{\n  \"detections\": [\n    {\n      \"label\": \"APIs and services menu item\",\n      \"bbox\": [0, 407, 226, 437],\n      \"confidence\": 0.95\n    }\n  ]\n}\n```"
+}

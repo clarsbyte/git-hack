@@ -1,0 +1,79 @@
+{
+  "timestamp": "20260223_032123_243",
+  "session_id": "50663da9-d062-4eca-8794-b25d45b93c9a",
+  "query": "goal=\"how to make git repo\"; previous_step=\"Click the \"Create new...\" button in the top navigation bar\"; current_url=\"https://github.com/mjpost/sacrebleu/\"",
+  "raw_detections": [
+    {
+      "label": "Create new... dropdown button in navigation",
+      "confidence": 0.95,
+      "bbox": {
+        "x": 0.01,
+        "y": 0.0579,
+        "width": 0.0762,
+        "height": 0.0258
+      },
+      "bbox_absolute": {
+        "x": 17,
+        "y": 53,
+        "width": 130,
+        "height": 24
+      }
+    }
+  ],
+  "filtered_detections": [
+    {
+      "label": "Create new... dropdown button in navigation",
+      "confidence": 0.95,
+      "bbox": {
+        "x": 0.01,
+        "y": 0.0579,
+        "width": 0.0762,
+        "height": 0.0258
+      },
+      "bbox_absolute": {
+        "x": 17,
+        "y": 53,
+        "width": 130,
+        "height": 24
+      }
+    }
+  ],
+  "diagnostics": {
+    "query": "goal=\"how to make git repo\"; previous_step=\"Click the \"Create new...\" button in the top navigation bar\"; current_url=\"https://github.com/mjpost/sacrebleu/\"",
+    "raw_detection_count": 1,
+    "filtered_detection_count": 1,
+    "parse": {
+      "mode": "fenced_json",
+      "json_candidate_count": 3,
+      "json_error": null
+    },
+    "filter": {
+      "raw_count": 1,
+      "kept_count": 1,
+      "dropped_count": 0,
+      "dropped_by_limit": 0,
+      "drop_reasons": {
+        "empty_label": 0,
+        "generic_label": 0,
+        "ui_artifact_label": 0,
+        "invalid_confidence": 0,
+        "out_of_range_confidence": 0,
+        "low_confidence": 0,
+        "invalid_box_size": 0,
+        "negative_coords": 0,
+        "out_of_bounds_box": 0,
+        "area_out_of_range": 0
+      },
+      "rejected_samples": [],
+      "intent_generic_label_fallback": true
+    },
+    "thresholds": {
+      "min_confidence": 0.55,
+      "min_relative_area": 0.0002,
+      "max_relative_area": 0.8,
+      "max_detections": 8
+    },
+    "raw_response_preview": "```json\n{\n  \"detections\": [\n    {\n      \"label\": \"Create new... dropdown button in navigation\",\n      \"bbox\": [17, 54, 147, 78],\n      \"confidence\": 0.95\n    }\n  ]\n}\n```"
+  },
+  "vlm_response": "```json\n{\n  \"detections\": [\n    {\n      \"label\": \"Create new... dropdown button in navigation\",\n      \"bbox\": [17, 54, 147, 78],\n      \"confidence\": 0.95\n    }\n  ]\n}\n```"
+}

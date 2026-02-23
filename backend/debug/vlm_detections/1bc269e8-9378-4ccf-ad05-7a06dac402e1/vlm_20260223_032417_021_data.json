@@ -1,0 +1,79 @@
+{
+  "timestamp": "20260223_032417_021",
+  "session_id": "1bc269e8-9378-4ccf-ad05-7a06dac402e1",
+  "query": "how do i make a desktop frame on figma",
+  "raw_detections": [
+    {
+      "label": "Frame tool button in toolbar",
+      "confidence": 0.95,
+      "bbox": {
+        "x": 0.3169,
+        "y": 0.8219,
+        "width": 0.0223,
+        "height": 0.0311
+      },
+      "bbox_absolute": {
+        "x": 540,
+        "y": 766,
+        "width": 38,
+        "height": 28
+      }
+    }
+  ],
+  "filtered_detections": [
+    {
+      "label": "Frame tool button in toolbar",
+      "confidence": 0.95,
+      "bbox": {
+        "x": 0.3169,
+        "y": 0.8219,
+        "width": 0.0223,
+        "height": 0.0311
+      },
+      "bbox_absolute": {
+        "x": 540,
+        "y": 766,
+        "width": 38,
+        "height": 28
+      }
+    }
+  ],
+  "diagnostics": {
+    "query": "how do i make a desktop frame on figma",
+    "raw_detection_count": 1,
+    "filtered_detection_count": 1,
+    "parse": {
+      "mode": "fenced_json",
+      "json_candidate_count": 3,
+      "json_error": null
+    },
+    "filter": {
+      "raw_count": 1,
+      "kept_count": 1,
+      "dropped_count": 0,
+      "dropped_by_limit": 0,
+      "drop_reasons": {
+        "empty_label": 0,
+        "generic_label": 0,
+        "ui_artifact_label": 0,
+        "invalid_confidence": 0,
+        "out_of_range_confidence": 0,
+        "low_confidence": 0,
+        "invalid_box_size": 0,
+        "negative_coords": 0,
+        "out_of_bounds_box": 0,
+        "area_out_of_range": 0
+      },
+      "rejected_samples": [],
+      "intent_generic_label_fallback": true
+    },
+    "thresholds": {
+      "min_confidence": 0.55,
+      "min_relative_area": 0.0002,
+      "max_relative_area": 0.8,
+      "max_detections": 8
+    },
+    "raw_response_preview": "```json\n{\n  \"detections\": [\n    {\n      \"label\": \"Frame tool button in toolbar\",\n      \"bbox\": [541, 766, 579, 795],\n      \"confidence\": 0.95\n    }\n  ]\n}\n```"
+  },
+  "vlm_response": "```json\n{\n  \"detections\": [\n    {\n      \"label\": \"Frame tool button in toolbar\",\n      \"bbox\": [541, 766, 579, 795],\n      \"confidence\": 0.95\n    }\n  ]\n}\n```"
+}

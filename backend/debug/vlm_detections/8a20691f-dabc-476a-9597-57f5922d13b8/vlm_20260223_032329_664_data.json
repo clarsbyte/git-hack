@@ -1,0 +1,79 @@
+{
+  "timestamp": "20260223_032329_664",
+  "session_id": "8a20691f-dabc-476a-9597-57f5922d13b8",
+  "query": "how do i make a figma design",
+  "raw_detections": [
+    {
+      "label": "Design tab navigation button",
+      "confidence": 0.95,
+      "bbox": {
+        "x": 0.5495,
+        "y": 0.0097,
+        "width": 0.0404,
+        "height": 0.0236
+      },
+      "bbox_absolute": {
+        "x": 937,
+        "y": 9,
+        "width": 68,
+        "height": 21
+      }
+    }
+  ],
+  "filtered_detections": [
+    {
+      "label": "Design tab navigation button",
+      "confidence": 0.95,
+      "bbox": {
+        "x": 0.5495,
+        "y": 0.0097,
+        "width": 0.0404,
+        "height": 0.0236
+      },
+      "bbox_absolute": {
+        "x": 937,
+        "y": 9,
+        "width": 68,
+        "height": 21
+      }
+    }
+  ],
+  "diagnostics": {
+    "query": "how do i make a figma design",
+    "raw_detection_count": 1,
+    "filtered_detection_count": 1,
+    "parse": {
+      "mode": "fenced_json",
+      "json_candidate_count": 3,
+      "json_error": null
+    },
+    "filter": {
+      "raw_count": 1,
+      "kept_count": 1,
+      "dropped_count": 0,
+      "dropped_by_limit": 0,
+      "drop_reasons": {
+        "empty_label": 0,
+        "generic_label": 0,
+        "ui_artifact_label": 0,
+        "invalid_confidence": 0,
+        "out_of_range_confidence": 0,
+        "low_confidence": 0,
+        "invalid_box_size": 0,
+        "negative_coords": 0,
+        "out_of_bounds_box": 0,
+        "area_out_of_range": 0
+      },
+      "rejected_samples": [],
+      "intent_generic_label_fallback": true
+    },
+    "thresholds": {
+      "min_confidence": 0.55,
+      "min_relative_area": 0.0002,
+      "max_relative_area": 0.8,
+      "max_detections": 8
+    },
+    "raw_response_preview": "```json\n{\n  \"detections\": [\n    {\n      \"label\": \"Design tab navigation button\",\n      \"bbox\": [938, 9, 1007, 31],\n      \"confidence\": 0.95\n    }\n  ]\n}\n```"
+  },
+  "vlm_response": "```json\n{\n  \"detections\": [\n    {\n      \"label\": \"Design tab navigation button\",\n      \"bbox\": [938, 9, 1007, 31],\n      \"confidence\": 0.95\n    }\n  ]\n}\n```"
+}

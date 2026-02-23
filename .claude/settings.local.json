@@ -8,7 +8,10 @@
       "Bash(ls:*)",
       "Bash(python:*)",
       "mcp__ide__getDiagnostics",
-      "WebSearch"
+      "WebSearch",
+      "Bash(head:*)",
+      "WebFetch(domain:inference-docs.cerebras.ai)",
+      "WebFetch(domain:www.cerebras.ai)"
     ]
   },
   "disabledMcpjsonServers": [
